@@ -1,0 +1,12 @@
+# Core dependencies
+genesis-world>=0.3.3
+numpy>=1.24
+PyYAML>=6.0
+
+# Optional: install PyTorch manually per your backend (CUDA/MPS/CPU)
+# torch
+
+# Optional planning and Qt GUI extras
+# ompl>=1.6
+# PySide6>=6.6
+

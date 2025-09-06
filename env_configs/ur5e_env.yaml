@@ -1,0 +1,29 @@
+scene:
+  dt: 0.01
+  gravity: [0, 0, -9.81]
+  backend: "gpu"  # "gpu" (auto), "cpu", or "cuda"
+  show_viewer: true
+
+robots:
+  - name: "UR5e_1"
+    urdf: "assets/ur5e/ur5e.urdf"
+    base_position: [0.0, 0.0, 0.0]
+    base_orientation: [0, 0, 0]
+    fixed_base: true
+    initial_joint_positions: [0, -90, 0, -90, 0, 0]  # degrees
+    end_effector_link: wrist_3_link
+    # Optional: PD gains to increase stiffness and damping (arrays per joint)
+    # Tune by increasing kp for stiffness and kv for damping to reduce oscillations.
+    # kp: [150, 150, 150, 120, 100, 80]
+    # kv: [30, 30, 30, 24, 20, 16]
+
+objects:
+  - type: "plane"
+    position: [0, 0, 0]
+    size: [5, 5]
+
+control:
+  joint_speed_limit: 0.5
+  cartesian_speed_limit: 0.1
+  default_tcp: [0, 0, 0, 1, 0, 0, 0]
+  strict_cartesian: true

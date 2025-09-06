@@ -1,0 +1,57 @@
+scene:
+  dt: 0.01
+  gravity: [0, 0, -9.81]
+  backend: "gpu"
+  show_viewer: true
+
+robots:
+  - name: "TX2_60_1"
+    urdf: "assets/tx2_60/tx2_60.urdf"
+    base_position: [0.0, 0.0, 0.0]
+    base_orientation: [0, 0, 0]
+    fixed_base: true
+    initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
+    # Optional PD gains (stiffness/damping)
+    # kp: [180, 180, 180, 140, 120, 100]
+    # kv: [36, 36, 36, 28, 24, 20]
+
+  - name: "TX2_60_2"
+    urdf: "assets/tx2_60/tx2_60.urdf"
+    base_position: [1.0, 0.0, 0.0]
+    base_orientation: [0, 0, 0]
+    fixed_base: true
+    initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
+    # Optional PD gains (stiffness/damping)
+    # kp: [180, 180, 180, 140, 120, 100]
+    # kv: [36, 36, 36, 28, 24, 20]
+
+  - name: "Meca500_1"
+    urdf: "assets/meca500/meca.urdf"
+    base_position: [0.0, 1.0, 0.0]
+    base_orientation: [0, 0, 0]
+    fixed_base: true
+    initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
+    # Optional PD gains (stiffness/damping)
+    # kp: [120, 120, 120, 100, 80, 60]
+    # kv: [24, 24, 24, 20, 16, 12]
+
+  - name: "UR5e_1"
+    urdf: "assets/ur5e/ur5e.urdf"
+    base_position: [1.0, 1.0, 0.0]
+    base_orientation: [0, 0, 0]
+    fixed_base: true
+    initial_joint_positions: [0, -90, 0, -90, 0, 0]  # degrees
+    # Optional: PD gains to increase stiffness and damping (arrays per joint)
+    # Tune by increasing kp for stiffness and kv for damping to reduce oscillations.
+    # kp: [150, 150, 150, 120, 100, 80]
+    # kv: [30, 30, 30, 24, 20, 16]
+
+objects:
+  - type: "plane"
+    position: [0, 0, 0]
+    size: [5, 5]
+
+control:
+  joint_speed_limit: 0.5
+  cartesian_speed_limit: 0.1
+  default_tcp: [0, 0, 0, 1, 0, 0, 0]

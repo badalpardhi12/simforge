@@ -1,0 +1,29 @@
+scene:
+  dt: 0.01
+  gravity: [0, 0, -9.81]
+  backend: "gpu"
+  show_viewer: true
+
+robots:
+  - name: "TX2_60_1"
+    urdf: "assets/tx2_60/tx2_60.urdf"
+    base_position: [0.0, 0.0, 0.0]
+    base_orientation: [0, 0, 0]
+    fixed_base: true
+    initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
+    end_effector_link: link_6
+    # Optional PD gains (stiffness/damping)
+    # kp: [180, 180, 180, 140, 120, 100]
+    # kv: [36, 36, 36, 28, 24, 20]
+
+
+objects:
+  - type: "plane"
+    position: [0, 0, 0]
+    size: [5, 5]
+
+control:
+  joint_speed_limit: 0.5
+  cartesian_speed_limit: 0.1
+  default_tcp: [0, 0, 0, 1, 0, 0, 0]
+  strict_cartesian: true

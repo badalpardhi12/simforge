@@ -1,0 +1,27 @@
+scene:
+  dt: 0.01
+  gravity: [0, 0, -9.81]
+  backend: "gpu"
+  show_viewer: true
+
+robots:
+  - name: "Meca500_1"
+    urdf: "assets/meca500/meca.urdf"
+    base_position: [0.0, 0.0, 0.0]
+    base_orientation: [0, 0, 0]
+    fixed_base: true
+    initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
+    end_effector_link: meca_axis_6_link
+    # Optional PD gains (stiffness/damping)
+    # kp: [120, 120, 120, 100, 80, 60]
+    # kv: [24, 24, 24, 20, 16, 12]
+
+objects:
+  - type: "plane"
+    position: [0, 0, 0]
+    size: [5, 5]
+
+control:
+  joint_speed_limit: 0.5
+  cartesian_speed_limit: 0.1
+  default_tcp: [0, 0, 0, 1, 0, 0, 0]
