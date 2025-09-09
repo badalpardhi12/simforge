@@ -7,6 +7,6 @@ PyYAML>=6.0
 # torch
 
 # Optional planning and Qt GUI extras
-# ompl>=1.6
-# PySide6>=6.6
+ompl>=1.6
+PySide6>=6.6
 

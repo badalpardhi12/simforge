@@ -27,8 +27,7 @@ def cmd_run(config_path: str, headless: bool, debug: bool):
     cfg = SimforgeConfig.from_yaml(config_path)
     if headless:
         sim = Simulator(cfg, debug=debug)
-        sim.build_scene()
-        sim.start()
+        sim.start()  # <-- don't call build_scene() here
         logger.info("Running headless. Press Ctrl+C to stop.")
         try:
             while True:

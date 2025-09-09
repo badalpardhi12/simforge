@@ -27,3 +27,15 @@ control:
   cartesian_speed_limit: 0.1
   default_tcp: [0, 0, 0, 1, 0, 0, 0]
   strict_cartesian: true
+  collision_check: true
+  ccd_substeps: 6
+  ground_plane_z: 0.0
+  # Slightly shrink all collision meshes to reduce false-positive self-collisions
+  collision_mesh_shrink: 0.97
+  allowed_collision_links:
+  - [base_link, shoulder_link]
+  - [shoulder_link, upper_arm_link]
+  - [upper_arm_link, forearm_link]
+  - [forearm_link, wrist_1_link]
+  - [wrist_1_link, wrist_2_link]
+  - [wrist_2_link, wrist_3_link]

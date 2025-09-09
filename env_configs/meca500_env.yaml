@@ -25,3 +25,20 @@ control:
   joint_speed_limit: 0.5
   cartesian_speed_limit: 0.1
   default_tcp: [0, 0, 0, 1, 0, 0, 0]
+  strict_cartesian: true
+  collision_check: true
+  ccd_substeps: 6
+  ground_plane_z: 0.0
+  # Slightly shrink all collision meshes to reduce false-positive self-collisions
+  collision_mesh_shrink: 0.97
+  # Parent-child adjacency pairs to ignore in self-collision (URDF link names)
+  allowed_collision_links:
+    - [meca_base_link, meca_axis_1_link]
+    - [meca_axis_1_link, meca_axis_2_link]
+    - [meca_axis_2_link, meca_axis_3_link]
+    - [meca_axis_3_link, meca_axis_4_link]
+    - [meca_axis_4_link, meca_axis_5_link]
+    - [meca_axis_5_link, meca_axis_6_link]
+    - [meca_axis_6_link, meca_gripper_link]
+    - [meca_gripper_link, meca_gripper_finger1]
+    - [meca_gripper_link, meca_gripper_finger2]

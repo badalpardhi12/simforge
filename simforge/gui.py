@@ -21,10 +21,18 @@ class SimforgeApp:
         self.root.title("Simforge")
         self.root.geometry("720x540")
 
+        # 1) start simulation thread immediately
+        self.controller.start()
+        # 2) block until the scene is built, so the viewer pops first
+        #    (wait up to ~10s; adjust if needed)
+        self.controller.sim.wait_until_built(timeout=10.0)
+        # 3) now build the UI
         self._build_widgets()
         # Provide a UI-thread executor to simulator for main-thread-only Genesis calls
         self.controller.sim.set_ui_executor(self._run_on_ui_thread_sync)
-        self._start_background()
+        # Start UI update loop
+        self._ui_updater_running = True
+        self.root.after(100, self._ui_update_loop)
 
     def _run_on_ui_thread_sync(self, fn):
         """Run a callable on the Tk main thread and wait for result."""
@@ -188,10 +196,6 @@ class SimforgeApp:
         self.controller.cancel_cartesian(robot)
         self.status.configure(text="Stopped active motion")
 
-    def _start_background(self):
-        self.controller.start()
-        self._ui_updater_running = True
-        self.root.after(100, self._ui_update_loop)
 
     def _ui_update_loop(self):
         if not self._ui_updater_running:

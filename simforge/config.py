@@ -46,6 +46,24 @@ class ControlConfig:
         0, 0, 0, 1, 0, 0, 0
     )
     strict_cartesian: bool = True
+    # --- NEW: collision control ---
+    collision_check: bool = True
+    ccd_substeps: int = 5
+    allowed_collision_links: List[Tuple[str, str]] = field(default_factory=list)
+    ground_plane_z: float = 0.0
+    # Uniform shrink factor for all collision meshes (1.0 = no change)
+    collision_mesh_shrink: float = 1.0
+    # Auto-allow any self-collision pairs present at the home pose
+    auto_allow_home_collisions: bool = True
+    # Show collision meshes in the viewer for debugging (if supported by backend)
+    visualize_collision_meshes: bool = False
+    # --- NEW: planning control ---
+    planner: str = "RRTConnect"
+    planner_timeout: float = 3.0
+    planner_resolution: float = 0.02
+    planner_max_retry: int = 1
+    cartesian_waypoints: int = 100
+    postcheck_time_s: float = 0.2
 
 
 @dataclass

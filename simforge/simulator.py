@@ -12,6 +12,7 @@ import numpy as np
 from .config import SimforgeConfig, RobotConfig
 from .logging_utils import setup_logging
 from .urdf_utils import parse_joint_limits, select_end_effector_link
+from .collision import CollisionChecker
 
 
 class Simulator:
@@ -38,6 +39,12 @@ class Simulator:
         self._ui_exec = None
         # Planning guard to avoid stepping during heavy kernels on UI thread
         self._planning = False
+        self._colliders: Dict[str, CollisionChecker] = {}
+        # Cache for EE poses (updated on sim thread, read from UI thread)
+        self._ee_pose_cache: Dict[str, tuple] = {}
+        # Built event for startup synchronization
+        self._built_evt = threading.Event()
+
         # Command queue to run IK/planning on the sim thread
         self._cmd_q: "queue.Queue[tuple]" = queue.Queue()
         self._last_enq_time: float = 0.0
@@ -135,23 +142,91 @@ class Simulator:
                 self.logger.info("%s: Using EE link '%s' for Cartesian planning", r.name, ee_name)
             else:
                 self.logger.warning("%s: No EE link resolved; Cartesian IK will fail", r.name)
+
+        # Build collision checkers (per robot) using URDF collision meshes
+        for r in self.config.robots:
+            try:
+                ent = self._robots[r.name]
+                self._colliders[r.name] = CollisionChecker(
+                    robot_name=r.name,
+                    urdf_path=r.urdf,
+                    entity=ent,
+                    logger=self.logger,
+                    plane_z=getattr(self.config.control, "ground_plane_z", 0.0),
+                    allowed_pairs=getattr(self.config.control, "allowed_collision_links", []),
+                    mesh_shrink=getattr(self.config.control, "collision_mesh_shrink", 1.0),
+                )
+            except Exception as e:
+                self.logger.warning("Failed to build CollisionChecker for %s: %s", r.name, e)
+
+        # Optionally auto-allow any self-collision pairs present at the home pose (URDF artifacts)
+        if getattr(self.config.control, "collision_check", True) and getattr(self.config.control, "auto_allow_home_collisions", True):
+            for r in self.config.robots:
+                coll = self._colliders.get(r.name)
+                if not coll:
+                    continue
+                try:
+                    hits = coll.list_self_collisions_now()
+                except Exception as e:
+                    hits = []
+                    self.logger.debug("list_self_collisions_now failed for %s: %s", r.name, e)
+                if hits:
+                    coll.add_allowed_pairs(hits)
+                    pairs = ", ".join([f"{a}-{b}" for (a, b) in hits])
+                    self.logger.warning(
+                        "%s: Auto-allowed %d self-collision pair(s) at home pose: %s",
+                        r.name, len(hits), pairs
+                    )
+
+        # Apply initial joint targets (degrees from config) and step a few frames
+        try:
+            for r in self.config.robots:
+                q_deg = self._targets_deg.get(r.name)
+                if not q_deg:
+                    q_deg = r.initial_joint_positions if r.initial_joint_positions else []
+                    self._targets_deg[r.name] = q_deg
+                if q_deg:
+                    entity = self._robots[r.name]
+                    dofs_idx = self._robot_dofs_idx[r.name]
+                    q_rad = np.array([np.deg2rad(v) for v in q_deg], dtype=np.float32)
+                    try:
+                        entity.set_dofs_position(q_rad, dofs_idx_local=dofs_idx)
+                    except Exception:
+                        entity.set_dofs_position(q_rad, dofs_idx)
+            # let Genesis propagate state to links before user commands
+            for _ in range(3):
+                scene.step()
+        except Exception as e:
+            self.logger.debug("Failed to apply & settle home pose: %s", e)
+
         self._scene = scene
         self._built = True
         self.logger.info("Scene built (viewer=%s)", self.config.scene.show_viewer)
+        # publish "scene ready" and let GUI unblock
+        self._built_evt.set()
+        if self._evt_cb:
+            self._evt_cb("scene_built", "", "")
 
     def _add_robot(self, scene, robot_cfg: RobotConfig):
         gs = self._import_genesis()
         self.logger.info(
             "Loading robot %s from %s", robot_cfg.name, robot_cfg.urdf
         )
-        entity = scene.add_entity(
-            gs.morphs.URDF(
-                file=robot_cfg.urdf,
-                pos=tuple(robot_cfg.base_position),
-                euler=tuple(robot_cfg.base_orientation),
-                fixed=robot_cfg.fixed_base,
-            )
+        # Optionally render collision meshes for debugging if supported by backend
+        urdf_kwargs = dict(
+            file=robot_cfg.urdf,
+            pos=tuple(robot_cfg.base_position),
+            euler=tuple(robot_cfg.base_orientation),
+            fixed=robot_cfg.fixed_base,
         )
+        if getattr(self.config.control, "visualize_collision_meshes", False):
+            urdf_kwargs["vis_mode"] = "collision"
+        try:
+            entity = scene.add_entity(gs.morphs.URDF(**urdf_kwargs))
+        except TypeError:
+            # Older Genesis may not support 'vis_mode'; retry without it
+            urdf_kwargs.pop("vis_mode", None)
+            entity = scene.add_entity(gs.morphs.URDF(**urdf_kwargs))
 
         # Cache dof indices
         try:
@@ -174,20 +249,9 @@ class Simulator:
         # Kinematic control mode: ignore PD gain configuration
 
     # --- Control API ---
-    def set_joint_targets_rad(self, robot: str, q_rad: List[float]):
-        entity = self._robots[robot]
-        dofs_idx = self._robot_dofs_idx[robot]
-        q = np.array(q_rad, dtype=np.float32)
-        # Kinematic control: directly set joint positions (no PD dynamics)
-        try:
-            entity.set_dofs_position(q, dofs_idx_local=dofs_idx)
-        except Exception:
-            entity.set_dofs_position(q, dofs_idx)
-
     def set_joint_targets_deg(self, robot: str, q_deg: List[float]):
+        # Just cache targets; the sim thread applies them each loop.
         self._targets_deg[robot] = list(q_deg)
-        q_rad = [np.deg2rad(v) for v in q_deg]
-        self.set_joint_targets_rad(robot, q_rad)
 
     def get_robot_joint_limits(self, robot_cfg: RobotConfig):
         joints = parse_joint_limits(robot_cfg.urdf)
@@ -204,8 +268,6 @@ class Simulator:
 
     # --- Lifecycle ---
     def start(self):
-        if not self._built:
-            self.build_scene()
         if self._thread and self._thread.is_alive():
             return
         self._stop_evt.clear()
@@ -223,6 +285,9 @@ class Simulator:
             self.logger.error("Failed to enqueue cartesian_move: %s", e)
 
     def _loop(self):
+        # Build scene on this (sim) thread to keep all Genesis calls on one thread
+        if not self._built:
+            self.build_scene()
         assert self._scene is not None
         dt = self.config.scene.dt
         last = time.perf_counter()
@@ -265,6 +330,7 @@ class Simulator:
                     if traj:
                         # Follow current waypoint kinematically (no PD; reliable without actuators)
                         target: np.ndarray = traj["current"]  # radians
+                        # Direct set like old codebase
                         try:
                             entity.set_dofs_position(target, dofs_idx_local=dofs_idx)
                         except Exception:
@@ -280,7 +346,7 @@ class Simulator:
                             entity.set_dofs_position(q, dofs_idx)
             except Exception as e:
                 self.logger.debug("Command application failed: %s", e)
-            # Step physics
+            # Step physics - direct call like old codebase
             try:
                 self._scene.step()
             except Exception as e:
@@ -288,30 +354,47 @@ class Simulator:
                 time.sleep(dt)
                 continue
 
-            # Progress active trajectories and check for collisions (force spikes)
+            # Update EE pose cache on sim thread after scene step
             try:
-                for name, entity in list(self._active_traj.items()):
-                    waypoints: List[np.ndarray] = entity.get("waypoints")  # type: ignore
-                    idx: int = entity.get("idx")  # type: ignore
+                for name, entity in self._robots.items():
+                    ee = self._ee_link_name.get(name)
+                    if not ee:
+                        continue
+                    link = entity.get_link(ee)
+                    pos = self._to_np(link.get_pos()).astype(np.float32)
+                    quat = self._to_np(link.get_quat()).astype(np.float32)  # wxyz
+                    w, x, y, z = quat
+                    t0 = 2*(w*x + y*z); t1 = 1 - 2*(x*x + y*y)
+                    roll = np.arctan2(t0, t1)
+                    t2 = np.clip(2*(w*y - z*x), -1.0, 1.0)
+                    pitch = np.arcsin(t2)
+                    t3 = 2*(w*z + x*y); t4 = 1 - 2*(y*y + z*z)
+                    yaw = np.arctan2(t3, t4)
+                    self._ee_pose_cache[name] = (
+                        float(pos[0]), float(pos[1]), float(pos[2]),
+                        float(np.rad2deg(roll)), float(np.rad2deg(pitch)), float(np.rad2deg(yaw)),
+                    )
+            except Exception:
+                pass
+
+            # Progress active trajectories - execute one waypoint per simulation step
+            try:
+                for name, traj_data in list(self._active_traj.items()):
+                    waypoints = traj_data.get("waypoints")  # numpy array [N, dof]
+                    i: int = traj_data.get("i", 0)  # current waypoint index
                     robot_entity = self._robots[name]
-                    dofs_idx = self._robot_dofs_idx[name]
-                    # Advance if close enough
-                    try:
-                        q_actual = np.array([j.qpos for j in robot_entity.get_joints()], dtype=np.float32)
-                    except Exception:
-                        q_actual = waypoints[idx]
-                    err = np.linalg.norm((waypoints[idx] - q_actual))
-                    if err < 0.01:
-                        idx += 1
-                        if idx >= len(waypoints):
-                            # Done
-                            self._active_traj.pop(name, None)
-                            # Set hold target to final pose (deg)
-                            q_deg = [float(np.rad2deg(v)) for v in waypoints[-1]]
-                            self._targets_deg[name] = q_deg
-                            continue
-                        entity["idx"] = idx
-                        entity["current"] = waypoints[idx]
+                    
+                    # Advance to next waypoint every simulation step
+                    if i + 1 < waypoints.shape[0]:
+                        traj_data["i"] = i + 1
+                        traj_data["current"] = waypoints[i + 1]
+                    else:
+                        # Trajectory complete
+                        self._active_traj.pop(name, None)
+                        # Set hold target to final pose (deg)
+                        q_deg = [float(np.rad2deg(v)) for v in waypoints[-1]]
+                        self._targets_deg[name] = q_deg
+                        self.logger.info("Trajectory complete for %s", name)
 
                     # Simple collision monitor via joint forces (if available)
                     try:
@@ -319,7 +402,6 @@ class Simulator:
                         if np.max(np.abs(jf)) > 200.0:  # threshold
                             self.logger.warning("Collision/force spike detected; stopping trajectory for %s", name)
                             self._active_traj.pop(name, None)
-                            self._targets_deg[name] = [float(np.rad2deg(v)) for v in q_actual]
                     except Exception:
                         pass
             except Exception as e:
@@ -444,6 +526,7 @@ class Simulator:
         axis = np.array([x, y, z], dtype=np.float32) / s
         return axis * angle
 
+
     # Numeric IK fallback (damped least-squares)
     def _numeric_ik(self, entity, ee_name: str, q0: np.ndarray, pos_w: tuple, quat_w_wxyz: tuple,
                     iters: int = 60, step_scale: float = 1.0, damping: float = 1e-2) -> np.ndarray | None:
@@ -522,30 +605,16 @@ class Simulator:
         return None
 
     def get_ee_pose_xyzrpy(self, robot: str):
-        ee_name = self._ee_link_name.get(robot)
-        if not ee_name:
-            return None
-        entity = self._robots[robot]
-        try:
-            link = entity.get_link(ee_name)
-            pos = self._to_np(link.get_pos())
-            quat = self._to_np(link.get_quat())  # wxyz
-            w,x,y,z = quat
-            t0 = 2*(w*x + y*z)
-            t1 = 1 - 2*(x*x + y*y)
-            roll = np.arctan2(t0, t1)
-            t2 = 2*(w*y - z*x)
-            t2 = np.clip(t2, -1.0, 1.0)
-            pitch = np.arcsin(t2)
-            t3 = 2*(w*z + x*y)
-            t4 = 1 - 2*(y*y + z*z)
-            yaw = np.arctan2(t3, t4)
-            return (
-                float(pos[0]), float(pos[1]), float(pos[2]),
-                float(np.rad2deg(roll)), float(np.rad2deg(pitch)), float(np.rad2deg(yaw)),
-            )
-        except Exception:
-            return None
+        # Never call Genesis from the UI thread; return cache
+        return self._ee_pose_cache.get(robot)
+
+    # Thread safety helper
+    def _assert_sim_thread(self):
+        if threading.current_thread().name != "simforge-sim":
+            raise RuntimeError("Genesis access from non-sim thread")
+
+    def wait_until_built(self, timeout=None) -> bool:
+        return self._built_evt.wait(timeout)
 
     # Generic helpers to convert tensors/arrays to numpy (CPU)
     @staticmethod
@@ -566,12 +635,77 @@ class Simulator:
         # As a fallback, wrap via numpy.array
         return np.array(x)
 
+    @staticmethod
+    def _path_to_numpy(path):
+        """
+        Normalize Genesis path output to np.ndarray [K, dof].
+        Accepts:
+          - torch.Tensor [K, dof]
+          - list[torch.Tensor[dof]] / tuple[…]
+          - list[list/np.ndarray]
+          - None / []
+        """
+        if path is None:
+            return np.zeros((0, 0), dtype=np.float32)
+
+        # Flatten tuple -> list to simplify handling
+        if isinstance(path, tuple):
+            path = list(path)
+
+        try:
+            import torch  # type: ignore
+            if isinstance(path, torch.Tensor):
+                arr = path.detach().cpu().numpy()
+                if arr.ndim == 1:
+                    arr = arr.reshape(1, -1)
+                return arr.astype(np.float32, copy=False)
+
+            if isinstance(path, (list, tuple)) and len(path) > 0:
+                # If it's a list/tuple of tensors of identical shape, stack them
+                if isinstance(path[0], torch.Tensor):
+                    # Filter any empty items defensively
+                    items = [t for t in path if isinstance(t, torch.Tensor) and t.numel() > 0]
+                    if len(items) == 0:
+                        return np.zeros((0, 0), dtype=np.float32)
+                    arr = torch.stack(items).detach().cpu().numpy()
+                    if arr.ndim == 1:
+                        arr = arr.reshape(1, -1)
+                    return arr.astype(np.float32, copy=False)
+        except Exception:
+            pass
+
+        # Numpy/list fallback
+        arr = np.asarray(path, dtype=np.float32)
+        if arr.size == 0:
+            return np.zeros((0, 0), dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        return arr
+
+    def _densify_joint_path(self, q_path: np.ndarray, max_joint_delta: float = 0.04) -> np.ndarray:
+        """Insert intermediate points so adjacent joints don't change more than max_joint_delta (radians)."""
+        if q_path.shape[0] < 2:
+            return q_path
+        out = [q_path[0]]
+        for a, b in zip(q_path[:-1], q_path[1:]):
+            seg = b - a
+            steps = max(1, int(np.max(np.abs(seg)) / max_joint_delta))
+            for s in range(1, steps + 1):
+                out.append(a + seg * (s / steps))
+        result = np.asarray(out, dtype=np.float32)
+        # Clamp to at least 2 waypoints to prevent degenerate paths
+        if result.shape[0] < 2:
+            result = np.linspace(q_path[0], q_path[-1], 2, dtype=np.float32)
+        return result
+
+
     # --- Cartesian planning/execution ---
     def plan_and_execute_cartesian(self, robot: str, pose_xyzrpy: tuple, frame: str = 'base'):
         """
         Compute IK for target pose and execute a smooth joint-space trajectory.
         Falls back to linear joint interpolation if planning backend is unavailable.
         """
+        self._assert_sim_thread()
         gs = self._import_genesis()
         entity = self._robots[robot]
         dofs_idx = self._robot_dofs_idx[robot]
@@ -583,186 +717,226 @@ class Simulator:
         except Exception:
             pass
 
-        # Current joints as starting state
+        # Current joints as starting state - match old codebase simple approach
         try:
             q_start = np.array([j.qpos for j in entity.get_joints()], dtype=np.float32)
         except Exception:
             q_start = np.zeros((len(dofs_idx),), dtype=np.float32)
+        # If Genesis hasn't yet populated joint readings, use last hold target
+        if not np.any(np.abs(q_start) > 1e-6):
+            hold_deg = self._targets_deg.get(robot)
+            if hold_deg:
+                q_start = np.array([np.deg2rad(v) for v in hold_deg], dtype=np.float32)
 
         # Build base-frame target and convert to world if needed
         x, y, z, roll, pitch, yaw = pose_xyzrpy
-        q_local_wxyz = self._euler_deg_to_wxyz(roll, pitch, yaw) if hasattr(self, '_euler_deg_to_wxyz') else None
-        if q_local_wxyz is None:
-            # local fallback if helpers not yet defined in this class
-            r, p, yw = np.deg2rad([roll, pitch, yaw])
-            cr, sr = np.cos(r/2), np.sin(r/2)
-            cp, sp = np.cos(p/2), np.sin(p/2)
-            cy, sy = np.cos(yw/2), np.sin(yw/2)
-            q_local_wxyz = np.array([cy*cp*cr + sy*sp*sr,
-                                     cy*cp*sr - sy*sp*cr,
-                                     sy*cp*sr + cy*sp*cr,
-                                     sy*cp*cr - cy*sp*sr], dtype=np.float32)
+        q_local_wxyz = self._euler_deg_to_wxyz(roll, pitch, yaw)
         robot_cfg = next(r for r in self.config.robots if r.name == robot)
-        if hasattr(self, '_apply_frame'):
-            pos_w, quat_w_wxyz = self._apply_frame(robot_cfg, (x, y, z), q_local_wxyz, frame)
-        else:
-            pos_w = (x, y, z)
-            quat_w_wxyz = q_local_wxyz
+        pos_w, quat_w_wxyz = self._apply_frame(robot_cfg, (x, y, z), q_local_wxyz, frame)
         target_pos = (float(pos_w[0]), float(pos_w[1]), float(pos_w[2]))
         # Many APIs expect XYZW; also prepare WXYZ
         target_quat_xyzw = (float(quat_w_wxyz[1]), float(quat_w_wxyz[2]), float(quat_w_wxyz[3]), float(quat_w_wxyz[0]))
         target_quat_wxyz = (float(quat_w_wxyz[0]), float(quat_w_wxyz[1]), float(quat_w_wxyz[2]), float(quat_w_wxyz[3]))
 
-        # Determine end-effector link name and object if possible
+        # Determine end-effector link name and get IK solution
         ee_name = self._ee_link_name.get(robot)
-        end_eff_link = None
-        try:
-            end_eff_link = entity.get_link(ee_name) if ee_name else None
-        except Exception:
-            end_eff_link = None
+        end_eff_link = entity.get_link(ee_name) if ee_name else None
 
         started_at = time.perf_counter()
-        # Attempt Genesis IK
         q_goal = None
         used_solver = None
-        # Preferred: official inverse_kinematics with a link handle
-        try:
-            if end_eff_link is not None and hasattr(entity, 'inverse_kinematics'):
-                try:
-                    q_goal = entity.inverse_kinematics(
-                        link=end_eff_link,
-                        pos=np.array(target_pos, dtype=np.float32),
-                        quat=np.array(target_quat_xyzw, dtype=np.float32),
-                    )
-                    used_solver = 'entity.inverse_kinematics(xyzw)'
-                except Exception:
-                    q_goal = entity.inverse_kinematics(
-                        link=end_eff_link,
-                        pos=np.array(target_pos, dtype=np.float32),
-                        quat=np.array(target_quat_wxyz, dtype=np.float32),
-                    )
-                    used_solver = 'entity.inverse_kinematics(wxyz)'
-        except Exception as e:
-            self.logger.debug("inverse_kinematics raised: %s", e)
-
-        # Try multiple legacy IK signatures/orders if still not solved
-        try:
-            if hasattr(entity, 'solve_ik'):
-                kwargs = {'pos': target_pos, 'initial': q_start}
-                # Try passing EE spec via name with different common parameter names
-                if ee_name is not None:
-                    for key in ('link_name', 'ee', 'tip', 'end_effector', 'tool'):
-                        kwargs[key] = ee_name
-                # try XYZW then WXYZ; try euler as fallback
-                try:
-                    q_goal = entity.solve_ik(quat=target_quat_xyzw, **kwargs)
-                    used_solver = 'entity.solve_ik(xyzw)'
-                except Exception:
-                    try:
-                        q_goal = entity.solve_ik(quat=target_quat_wxyz, **kwargs)
-                        used_solver = 'entity.solve_ik(wxyz)'
-                    except Exception:
-                        q_goal = entity.solve_ik(euler=(np.deg2rad(roll), np.deg2rad(pitch), np.deg2rad(yaw)), **kwargs)
-                        used_solver = 'entity.solve_ik(euler)'
-            elif hasattr(gs, 'motion') and hasattr(gs.motion, 'InverseKinematics'):
-                ik = gs.motion.InverseKinematics(entity)
-                kw = {'target_pos': target_pos, 'q0': q_start}
-                if ee_name is not None:
-                    for key in ('link_name', 'ee', 'tip', 'end_effector', 'tool'):
-                        kw[key] = ee_name
-                try:
-                    sol = ik.solve(target_pos=target_pos, target_quat=target_quat_xyzw, q0=q_start)
-                    q_goal = getattr(sol, 'q', None)
-                    used_solver = 'gs.motion.IK(xyzw)'
-                except Exception:
-                    try:
-                        sol = ik.solve(target_pos=target_pos, target_quat=target_quat_wxyz, q0=q_start)
-                        q_goal = getattr(sol, 'q', None)
-                        used_solver = 'gs.motion.IK(wxyz)'
-                    except Exception:
-                        sol = ik.solve(target_pos=target_pos, target_euler=(np.deg2rad(roll), np.deg2rad(pitch), np.deg2rad(yaw)), q0=q_start)
-                        q_goal = getattr(sol, 'q', None)
-                        used_solver = 'gs.motion.IK(euler)'
-        except Exception as e:
-            self.logger.warning("Genesis IK failed: %s", e)
-
+        
+        # Try Genesis IK first
+        if end_eff_link and hasattr(entity, 'inverse_kinematics'):
+            try:
+                q_goal = entity.inverse_kinematics(
+                    link=end_eff_link,
+                    pos=np.array(target_pos, dtype=np.float32),
+                    quat=np.array(target_quat_xyzw, dtype=np.float32),
+                )
+                used_solver = 'entity.inverse_kinematics'
+            except Exception:
+                pass
+        
+        # Fallback: numeric IK
+        if q_goal is None and ee_name:
+            q_goal = self._numeric_ik(entity, ee_name, q_start, target_pos, target_quat_wxyz)
+            if q_goal is not None:
+                used_solver = 'numeric_ik'
+        
         if q_goal is None:
-            # Fallback: numeric IK
-            if ee_name:
-                q_goal = self._numeric_ik(entity, ee_name, q_start, target_pos, target_quat_wxyz)
-                if q_goal is not None:
-                    used_solver = 'numeric_ik'
-            if q_goal is None:
-                self.logger.warning("IK failed (robot=%s); rejecting Cartesian command", robot)
-                self._emit("cartesian_failed", robot, "ik_failed")
-                return False
+            self.logger.warning("IK failed (robot=%s); rejecting Cartesian command", robot)
+            self._emit("cartesian_failed", robot, "ik_failed")
+            return False
 
-        q_goal = self._to_np(q_goal).astype(np.float32)
-        # Strict Cartesian: require a planned, collision-checked path if available
+        # Normalize IK result to CPU numpy for downstream consumption (avoid CUDA tensor -> numpy errors)
+        try:
+            q_goal_np = self._to_np(q_goal).astype(np.float32)
+        except Exception:
+            try:
+                import torch  # type: ignore
+                if isinstance(q_goal, torch.Tensor):
+                    q_goal_np = q_goal.detach().cpu().numpy().astype(np.float32)
+                else:
+                    q_goal_np = np.array(q_goal, dtype=np.float32)
+            except Exception:
+                q_goal_np = np.array(q_goal, dtype=np.float32)
+
+        # Optional IK logging for debugging
+        self.logger.debug("IK solver=%s; q_goal dtype=%s shape=%s", used_solver, getattr(q_goal_np, 'dtype', None), getattr(q_goal_np, 'shape', None))
+        self.logger.debug("IK solver=%s, q_start=%s", used_solver, q_start)
+
+        if getattr(self.config.control, 'collision_check', True):
+            coll = self._colliders.get(robot)
+            if coll is not None:
+                ok, reason = coll.check_state(q_goal_np, dofs_idx)
+                if not ok:
+                    self.logger.warning("IK pose in collision (%s); rejecting Cartesian command for %s", reason, robot)
+                    self._emit("cartesian_failed", robot, "ik_in_collision")
+                    return False
+
+        # Ensure planner uses q_start as the current state
+        try:
+            entity.set_dofs_position(q_start, dofs_idx_local=dofs_idx)
+        except Exception:
+            entity.set_dofs_position(q_start, dofs_idx)
+        # one light step to flush transforms
+        try:
+            self._scene.step()
+        except Exception:
+            pass
+                
+        # --- OMPL planning (robust, minimal API) ---
         waypoints = None
         if getattr(self.config.control, 'strict_cartesian', True):
             if not hasattr(entity, 'plan_path'):
                 self.logger.warning("OMPL/plan_path not available; set control.strict_cartesian=false to test without planning")
                 self._emit("cartesian_failed", robot, "planner_unavailable")
                 return False
-            try:
+
+            # 1) Try planner (single attempt; Genesis may retry internally)
+            path = None
+            for attempt in range(1):
                 self._planning = True
-                if self._ui_exec is not None:
-                    waypoints = self._ui_exec(lambda: entity.plan_path(qpos_goal=q_goal, num_waypoints=200))
-                else:
-                    waypoints = entity.plan_path(qpos_goal=q_goal, num_waypoints=200)
-            except Exception:
-                waypoints = None
-            finally:
-                self._planning = False
-            # Convert and validate waypoints without ambiguous truthiness
-            ok = True
-            if waypoints is None:
-                ok = False
-                wp_list = []
-            else:
+                self.logger.debug("Start RRTConnect planning... (attempt %d)", attempt + 1)
+
+                # --- Prepare inputs (strict NumPy types expected by Genesis) ---
+                q_start_np1d = np.asarray(q_start, dtype=np.float32).ravel()
+                q_goal_np1d  = np.asarray(q_goal_np, dtype=np.float32).ravel()
+                num_wp = max(2, int(getattr(self.config.control, 'cartesian_waypoints', 100)))
+                res = float(getattr(self.config.control, 'planner_resolution', 0.03))
+                to  = float(getattr(self.config.control, 'planner_timeout', 1.5))
+                planner_name = str(getattr(self.config.control, 'planner', 'RRTConnect'))
+
+                t0 = time.perf_counter()
                 try:
-                    import torch  # type: ignore
-                    if hasattr(waypoints, 'numel'):
-                        ok = waypoints.numel() > 0
-                        wp_np = waypoints.detach().cpu().numpy()
-                        wp_list = [wp_np[i].astype(np.float32) for i in range(wp_np.shape[0])]
-                    else:
-                        wp_np = self._to_np(waypoints)
-                        if isinstance(wp_np, np.ndarray) and wp_np.ndim == 2:
-                            ok = wp_np.size > 0
-                            wp_list = [wp_np[i].astype(np.float32) for i in range(wp_np.shape[0])]
-                        else:
-                            wp_list = [self._to_np(w).astype(np.float32) for w in waypoints]
-                            ok = len(wp_list) > 0
-                except Exception:
-                    try:
-                        wp_np = self._to_np(waypoints)
-                        if isinstance(wp_np, np.ndarray) and wp_np.ndim == 2:
-                            ok = wp_np.size > 0
-                            wp_list = [wp_np[i].astype(np.float32) for i in range(wp_np.shape[0])]
-                        else:
-                            wp_list = [self._to_np(w).astype(np.float32) for w in waypoints]
-                            ok = len(wp_list) > 0
-                    except Exception:
-                        ok = False
-                        wp_list = []
+                    # Try modern Genesis signature (supports num_waypoints)
+                    path = entity.plan_path(
+                        qpos_goal=q_goal_np1d,
+                        qpos_start=q_start_np1d,
+                        resolution=res,
+                        timeout=to,
+                        max_retry=0,
+                        smooth_path=True,
+                        num_waypoints=num_wp,     # <<< NEVER None
+                        ignore_collision=False,
+                        planner=planner_name,
+                    )
 
-            # Drop stale plan if newer command arrived during planning
-            if started_at < self._last_enq_time:
-                self.logger.debug("Discarding stale plan for %s due to newer command", robot)
-                return False
+                except TypeError:
+                    # Older Genesis without num_waypoints kwarg
+                    # log that we're using the old signature
+                    self.logger.debug("Falling back to legacy plan_path signature (no num_waypoints argument)")
+                    path = entity.plan_path(
+                        qpos_goal=q_goal_np1d,
+                        qpos_start=q_start_np1d,
+                        resolution=res,
+                        timeout=to,
+                        max_retry=0,
+                        smooth_path=False,
+                        ignore_collision=False,
+                        planner=planner_name,
+                    )
+                except Exception as e:
+                    self.logger.debug("Planner attempt %d failed: %s", attempt + 1, e)
+                    path = None
+                finally:
+                    # try:
+                    #     import torch  # type: ignore
+                    #     if torch.cuda.is_available():
+                    #         torch.cuda.synchronize()
+                    # except Exception:
+                    #     pass
+                    plan_dt = time.perf_counter() - t0
+                    self.logger.debug("RRTConnect planning time (Genesis): %.3f", plan_dt)
+                    self._planning = False
 
-            if not ok:
-                self.logger.warning("Planning failed/collision (robot=%s); rejecting Cartesian command", robot)
-                self._emit("cartesian_failed", robot, "plan_failed")
-                return False
-            waypoints = wp_list
+                # Normalize/validate output
+                p_np = self._path_to_numpy(path)
+
+                self.logger.debug("Raw planned path: type=%s dtype=%s shape=%s", type(path), getattr(p_np, 'dtype', None), getattr(p_np, 'shape', None))
+                self.logger.debug("Planned path first few/last few waypoints: %s ... %s", p_np[:5], p_np[-5:])
+
+                # Validate shape
+                if (
+                    p_np.size > 0
+                    and p_np.shape[0] >= 2
+                    and p_np.shape[1] == q_start_np1d.shape[0]
+                    and not np.allclose(p_np[0], p_np[-1], atol=1e-6)
+                ):
+                    path = p_np
+                    break
+                else:
+                    path = None
+
+
+            if path is None:
+                self.logger.warning("Planner returned degenerate/empty path; falling back to straight-line joint interpolation")
+                # Blend in velocity-limited spacing so motion is smoother; clamp to at least 2 points
+                segs = max(2, int(np.linalg.norm(q_goal_np - q_start) / 0.01))
+                waypoints = np.linspace(q_start, q_goal_np, segs, dtype=np.float32)
+            else:
+                p_np = self._path_to_numpy(path)
+                if p_np.shape[0] < 2 or np.allclose(p_np[0], p_np[-1], atol=1e-6):
+                    self.logger.warning("Planner returned identical/too-few waypoints, falling back to linear interpolation")
+                    segs = max(2, int(np.linalg.norm(q_goal_np - q_start) / 0.01))
+                    waypoints = np.linspace(q_start, q_goal_np, segs, dtype=np.float32)
+                else:
+                    # Densify the raw path for smooth execution
+                    waypoints = self._densify_joint_path(p_np, max_joint_delta=0.04)
         else:
-            N = 60
-            waypoints = [q_start + (q_goal - q_start) * (i / (N - 1)) for i in range(N)]
+            # Dev mode: straight line (still collision-checked below)
+            segs = max(2, int(np.linalg.norm(q_goal_np - q_start) / 0.01))
+            waypoints = np.linspace(q_start, q_goal_np, segs, dtype=np.float32)
 
-        self._active_traj[robot] = {"waypoints": waypoints, "idx": 0, "current": waypoints[0]}
-        self.logger.info("Executing Cartesian move for %s with %d waypoints (solver=%s)", robot, len(waypoints), used_solver)
+        if getattr(self.config.control, 'collision_check', True):
+            coll = self._colliders.get(robot)
+            if coll is not None:
+                t_verify = time.perf_counter()
+                # keep it fast: sample ~30 segments, 3 substeps each, <0.2s budget
+                W = max(2, int(waypoints.shape[0]))
+                waypoints_list = [waypoints[i] for i in range(W)]
+                ok, reason, seg = coll.check_path(
+                    waypoints_list,
+                    dofs_idx,
+                    substeps=getattr(self.config.control, 'ccd_substeps', 3),
+                    stride=max(1, W // 30),
+                    max_time_s=getattr(self.config.control, 'postcheck_time_s', 0.2),
+                )
+                verify_dt = time.perf_counter() - t_verify
+                self.logger.debug("Post: verify time: %.3f", verify_dt)
+                if not ok:
+                    self.logger.warning("Planned path collides at segment %d (%s); rejecting", seg, reason)
+                    self._emit("cartesian_failed", robot, "path_in_collision")
+                    return False
+
+        # Debug: Check path quality
+        if waypoints.shape[0] > 1:
+            d = np.linalg.norm(np.diff(waypoints, axis=0), axis=1)
+            self.logger.debug("First 10 waypoint distances: avg=%.4f min=%.4f max=%.4f",
+                            float(np.mean(d[:10])), float(np.min(d[:10])), float(np.max(d[:10])))
+
+        self._active_traj[robot] = {"waypoints": waypoints, "i": 0, "current": waypoints[0]}
+        self.logger.info("Executing Cartesian move for %s with %d waypoints (mode=joints)", robot, int(waypoints.shape[0]))
         self._emit("cartesian_executing", robot, "")
         return True

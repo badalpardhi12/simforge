@@ -41,7 +41,7 @@ class Controller:
         self.sim.set_event_sink(self._on_sim_event)
 
     def start(self):
-        self.sim.build_scene()
+        # Build and use Genesis only on the sim thread
         self.sim.start()
         self._running = True
         self._thread.start()

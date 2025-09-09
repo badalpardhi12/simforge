@@ -12,10 +12,6 @@ robots:
     fixed_base: true
     initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
     end_effector_link: link_6
-    # Optional PD gains (stiffness/damping)
-    # kp: [180, 180, 180, 140, 120, 100]
-    # kv: [36, 36, 36, 28, 24, 20]
-
 
 objects:
   - type: "plane"
@@ -27,3 +23,15 @@ control:
   cartesian_speed_limit: 0.1
   default_tcp: [0, 0, 0, 1, 0, 0, 0]
   strict_cartesian: true
+  collision_check: true
+  ccd_substeps: 6
+  ground_plane_z: 0.0
+  # Slightly shrink all collision meshes to reduce false-positive self-collisions
+  collision_mesh_shrink: 0.97
+  allowed_collision_links:
+  - [base_link, link_1]
+  - [link_1, link_2]
+  - [link_2, link_3]
+  - [link_3, link_4]
+  - [link_4, link_5]
+  - [link_5, link_6]

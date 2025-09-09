@@ -54,4 +54,10 @@ objects:
 control:
   joint_speed_limit: 0.5
   cartesian_speed_limit: 0.1
-  default_tcp: [0, 0, 0, 1, 0, 0, 0]
+  default_tcp: [0, 0, 0, 1, 0, 0, 0]  
+  strict_cartesian: true
+  collision_check: true
+  ccd_substeps: 6
+  ground_plane_z: 0.0
+  allowed_collision_links:
+    - [wrist_3_link, tool0]
