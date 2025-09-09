@@ -60,7 +60,9 @@ class SimforgeApp:
         top.pack(fill=tk.X, padx=8, pady=8)
 
         ttk.Label(top, text="Mode:").pack(side=tk.LEFT)
-        self.mode_var = tk.StringVar(value=ControlMode.JOINT)
+        # Initialize mode based on the selected robot's effective mode
+        initial_robot = (self.config.robots[0].name if self.config.robots else "")
+        self.mode_var = tk.StringVar(value=self.controller.get_mode(initial_robot))
         mode_combo = ttk.Combobox(top, textvariable=self.mode_var, values=[ControlMode.JOINT, ControlMode.CARTESIAN], state="readonly")
         mode_combo.pack(side=tk.LEFT, padx=6)
         mode_combo.bind("<<ComboboxSelected>>", self._on_mode_change)
@@ -70,10 +72,16 @@ class SimforgeApp:
         robot_names = [r.name for r in self.config.robots]
         robot_combo = ttk.Combobox(top, textvariable=self.robot_var, values=robot_names, state="readonly")
         robot_combo.pack(side=tk.LEFT, padx=6)
-        robot_combo.bind("<<ComboboxSelected>>", lambda e: self._rebuild_joint_sliders())
+        robot_combo.bind("<<ComboboxSelected>>", self._on_robot_change)
+
+        # Effective control info (per-robot)
+        self.ctrl_info = ttk.Label(self.root, text="", anchor=tk.W, justify=tk.LEFT)
+        self.ctrl_info.pack(fill=tk.X, padx=8, pady=(4, 0))
 
         self.content = ttk.Frame(self.root)
         self.content.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        # Initialize control info display
+        self._refresh_ctrl_info()
 
         self.status = ttk.Label(self.root, text="Ready", anchor=tk.W)
         self.status.pack(fill=tk.X, padx=8, pady=(0, 8))
@@ -100,10 +108,13 @@ class SimforgeApp:
         if not joints:
             ttk.Label(self.content, text="No joint limits found in URDF; using -180..180°").pack()
 
-        for idx in range(len(rob.initial_joint_positions or [0]*6)):
+        # Use controller's current targets for this robot to preserve state
+        current_targets = self.controller.get_joint_targets_deg(rob.name) or (rob.initial_joint_positions or [])
+        dof_count = max(len(current_targets), len(joints) if joints else 6)
+        for idx in range(dof_count):
             lower = math.degrees(joints[idx].lower) if idx < len(joints) and joints[idx].lower is not None else -180
             upper = math.degrees(joints[idx].upper) if idx < len(joints) and joints[idx].upper is not None else 180
-            val = (rob.initial_joint_positions[idx] if rob.initial_joint_positions else 0.0)
+            val = float(current_targets[idx]) if idx < len(current_targets) else 0.0
 
             row = ttk.Frame(self.content)
             row.pack(fill=tk.X, pady=4)
@@ -122,13 +133,26 @@ class SimforgeApp:
 
     def _build_cartesian_controls(self):
         # XYZ in meters, RPY in degrees
+        robot = self.robot_var.get()
+        # Prefer last commanded Cartesian target for this robot
+        last = self.controller.get_last_cartesian_target(robot)
+        if last and len(last) == 6:
+            init_pose = dict(x=last[0], y=last[1], z=last[2], roll=last[3], pitch=last[4], yaw=last[5])
+        else:
+            # Fallback to current EE pose, else defaults
+            ee = self.controller.get_ee_pose_xyzrpy(robot)
+            if ee and len(ee) == 6:
+                init_pose = dict(x=ee[0], y=ee[1], z=ee[2], roll=ee[3], pitch=ee[4], yaw=ee[5])
+            else:
+                init_pose = dict(x=0.4, y=0.0, z=0.3, roll=0.0, pitch=180.0, yaw=0.0)
+
         self.cart_vars = {
-            'x': tk.DoubleVar(value=0.4),
-            'y': tk.DoubleVar(value=0.0),
-            'z': tk.DoubleVar(value=0.3),
-            'roll': tk.DoubleVar(value=0.0),
-            'pitch': tk.DoubleVar(value=180.0),
-            'yaw': tk.DoubleVar(value=0.0),
+            'x': tk.DoubleVar(value=float(init_pose['x'])),
+            'y': tk.DoubleVar(value=float(init_pose['y'])),
+            'z': tk.DoubleVar(value=float(init_pose['z'])),
+            'roll': tk.DoubleVar(value=float(init_pose['roll'])),
+            'pitch': tk.DoubleVar(value=float(init_pose['pitch'])),
+            'yaw': tk.DoubleVar(value=float(init_pose['yaw'])),
         }
         ranges = {
             'x': (-1.0, 1.0),
@@ -163,12 +187,63 @@ class SimforgeApp:
     def _rebuild_joint_sliders(self):
         self._build_controls_for_mode()
 
-    def _on_mode_change(self, event=None):
-        mode = self.mode_var.get()
-        self.controller.switch_mode(mode)
-        self.status.configure(text=f"Switched to {mode} mode; resetting to home")
-        # Rebuild control panel to reflect mode (joint vs cartesian)
+    def _on_robot_change(self, event=None):
+        # Update mode selector to reflect this robot's preserved mode
+        robot = self.robot_var.get()
+        self.mode_var.set(self.controller.get_mode(robot))
+        # Rebuild UI for the new robot and refresh effective control display
         self._build_controls_for_mode()
+        self._refresh_ctrl_info()
+
+    def _refresh_ctrl_info(self):
+        try:
+            robot = self.robot_var.get()
+            ctrl = self.config.control_for(robot)
+            info = (
+                f"Effective control for {robot} — "
+                f"planner={getattr(ctrl, 'planner', '')} | "
+                f"timeout={getattr(ctrl, 'planner_timeout', '')} | "
+                f"resolution={getattr(ctrl, 'planner_resolution', '')} | "
+                f"waypoints={getattr(ctrl, 'cartesian_waypoints', '')} | "
+                f"strict_cartesian={getattr(ctrl, 'strict_cartesian', '')}"
+            )
+        except Exception as e:
+            info = f"Effective control: unavailable ({e})"
+        if hasattr(self, 'ctrl_info') and self.ctrl_info:
+            self.ctrl_info.configure(text=info)
+
+    def _on_robot_change(self, event=None):
+        # Rebuild UI for the new robot and refresh effective control display
+        self._rebuild_joint_sliders()
+        self._refresh_ctrl_info()
+
+    def _refresh_ctrl_info(self):
+        try:
+            robot = self.robot_var.get()
+            # Show effective control (per-robot overrides merged with global defaults)
+            ctrl = self.config.control_for(robot)
+            info = (
+                f"Effective control for {robot} — "
+                f"planner={getattr(ctrl, 'planner', '')} | "
+                f"timeout={getattr(ctrl, 'planner_timeout', '')} | "
+                f"resolution={getattr(ctrl, 'planner_resolution', '')} | "
+                f"waypoints={getattr(ctrl, 'cartesian_waypoints', '')} | "
+                f"strict_cartesian={getattr(ctrl, 'strict_cartesian', '')}"
+            )
+        except Exception as e:
+            info = f"Effective control: unavailable ({e})"
+        if hasattr(self, 'ctrl_info') and self.ctrl_info:
+            self.ctrl_info.configure(text=info)
+
+    def _on_mode_change(self, event=None):
+        robot = self.robot_var.get()
+        mode = self.mode_var.get()
+        self.controller.switch_mode(robot, mode)
+        self.status.configure(text=f"Switched {robot} to {mode} mode; preserving other robots' state")
+        # Rebuild control panel to reflect mode (joint vs cartesian) for this robot
+        self._build_controls_for_mode()
+        # Refresh effective control display
+        self._refresh_ctrl_info()
 
     def _on_joint_slider(self, idx: int, value_deg: float):
         robot = self.robot_var.get()
@@ -201,7 +276,8 @@ class SimforgeApp:
         if not self._ui_updater_running:
             return
         # Update status with simple heartbeat
-        self.status.configure(text=f"Mode: {self.controller.mode} | Robot: {self.robot_var.get()}")
+        current_robot = self.robot_var.get()
+        self.status.configure(text=f"Mode: {self.controller.get_mode(current_robot)} | Robot: {current_robot}")
         # If last Cartesian failed, reset sliders to actual EE pose
         if self.mode_var.get() == ControlMode.CARTESIAN:
             robot = self.robot_var.get()

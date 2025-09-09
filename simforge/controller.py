@@ -26,7 +26,8 @@ class Controller:
     def __init__(self, config: SimforgeConfig, debug: bool = False) -> None:
         self.config = config
         self.sim = Simulator(config, debug=debug)
-        self.mode = ControlMode.JOINT
+        # Per-robot control mode (default to JOINT)
+        self._mode_by_robot: Dict[str, str] = {r.name: ControlMode.JOINT for r in self.config.robots}
         self._cmd_q: "queue.Queue[Command]" = queue.Queue()
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._running = False
@@ -35,6 +36,7 @@ class Controller:
         self._targets_deg: Dict[str, List[float]] = {}
         for r in self.config.robots:
             self._targets_deg[r.name] = list(r.initial_joint_positions or [])
+        # Per-robot last Cartesian target (to preserve UI state)
         self._last_cartesian: Dict[str, tuple] = {}
         self._last_evt: Dict[str, str] = {}
         # connect event sink
@@ -69,17 +71,18 @@ class Controller:
                 robot, arr = cmd.payload
                 self._targets_deg[robot] = list(arr)
                 self.sim.set_joint_targets_deg(robot, list(arr))
-            elif cmd.kind == "switch_mode":
-                mode, = cmd.payload
-                self.mode = mode
-                # Reset robot(s) to home on mode switch
-                for r in self.config.robots:
-                    init = r.initial_joint_positions or []
-                    if init:
-                        self._targets_deg[r.name] = list(init)
-                        self.sim.set_joint_targets_deg(r.name, list(init))
-                # Log EE link choice for debugging when entering Cartesian mode
-                if self.mode == ControlMode.CARTESIAN:
+            elif cmd.kind == "switch_mode_robot":
+                robot, mode = cmd.payload
+                if robot not in self._mode_by_robot:
+                    continue
+                self._mode_by_robot[robot] = mode
+                # Optionally reset only this robot to its home position when switching mode
+                init = next((r.initial_joint_positions for r in self.config.robots if r.name == robot), None)
+                if init:
+                    self._targets_deg[robot] = list(init)
+                    self.sim.set_joint_targets_deg(robot, list(init))
+                # Log EE link choice for debugging when entering Cartesian mode for this robot
+                if mode == ControlMode.CARTESIAN:
                     self.sim.log_end_effector_choices()
             elif cmd.kind == "cartesian_move":
                 robot, pose, frame = cmd.payload
@@ -97,9 +100,9 @@ class Controller:
     def set_joint_targets_deg(self, robot: str, vals_deg: List[float]):
         self._cmd_q.put(Command("set_joint_targets_deg", (robot, vals_deg)))
 
-    def switch_mode(self, mode: str):
+    def switch_mode(self, robot: str, mode: str):
         assert mode in (ControlMode.JOINT, ControlMode.CARTESIAN)
-        self._cmd_q.put(Command("switch_mode", (mode,)))
+        self._cmd_q.put(Command("switch_mode_robot", (robot, mode)))
 
     def set_cartesian_target(self, robot: str, pose_xyzrpy: tuple, frame: str = 'world'):
         # Basic de-bounce: avoid flooding queue with nearly-identical commands
@@ -132,3 +135,13 @@ class Controller:
 
     def get_ee_pose_xyzrpy(self, robot: str):
         return self.sim.get_ee_pose_xyzrpy(robot)
+
+    # --- Additional helpers for GUI state preservation ---
+    def get_mode(self, robot: str) -> str:
+        return self._mode_by_robot.get(robot, ControlMode.JOINT)
+
+    def get_joint_targets_deg(self, robot: str) -> List[float]:
+        return list(self._targets_deg.get(robot, []))
+
+    def get_last_cartesian_target(self, robot: str) -> Optional[tuple]:
+        return self._last_cartesian.get(robot)

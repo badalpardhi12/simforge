@@ -130,38 +130,35 @@ class Simulator:
         # Kinematic control mode: no PD/force tweaking
         # Resolve EE link names for Cartesian planning (prefer config override)
         for r in self.config.robots:
-            ee_name = r.end_effector_link if hasattr(r, 'end_effector_link') else None
+            ee_name = getattr(r, 'end_effector_link', None)
             if not ee_name:
-                try:
-                    ee_name = select_end_effector_link(r.urdf)
-                except Exception as e:
-                    self.logger.debug("EE select failed for %s: %s", r.name, e)
-                    ee_name = None
-            if ee_name:
+                # Enforce manual EE selection via YAML as requested
+                self.logger.error("%s: end_effector_link is not set in the YAML; Cartesian IK will be disabled", r.name)
+            else:
                 self._ee_link_name[r.name] = ee_name
                 self.logger.info("%s: Using EE link '%s' for Cartesian planning", r.name, ee_name)
-            else:
-                self.logger.warning("%s: No EE link resolved; Cartesian IK will fail", r.name)
 
         # Build collision checkers (per robot) using URDF collision meshes
         for r in self.config.robots:
             try:
                 ent = self._robots[r.name]
+                ctrl = self._ctrl_for(r.name)
                 self._colliders[r.name] = CollisionChecker(
                     robot_name=r.name,
                     urdf_path=r.urdf,
                     entity=ent,
                     logger=self.logger,
-                    plane_z=getattr(self.config.control, "ground_plane_z", 0.0),
-                    allowed_pairs=getattr(self.config.control, "allowed_collision_links", []),
-                    mesh_shrink=getattr(self.config.control, "collision_mesh_shrink", 1.0),
+                    plane_z=getattr(ctrl, "ground_plane_z", 0.0),
+                    allowed_pairs=getattr(ctrl, "allowed_collision_links", []),
+                    mesh_shrink=getattr(ctrl, "collision_mesh_shrink", 1.0),
                 )
             except Exception as e:
                 self.logger.warning("Failed to build CollisionChecker for %s: %s", r.name, e)
 
         # Optionally auto-allow any self-collision pairs present at the home pose (URDF artifacts)
-        if getattr(self.config.control, "collision_check", True) and getattr(self.config.control, "auto_allow_home_collisions", True):
-            for r in self.config.robots:
+        for r in self.config.robots:
+            ctrl = self._ctrl_for(r.name)
+            if getattr(ctrl, "collision_check", True) and getattr(ctrl, "auto_allow_home_collisions", True):
                 coll = self._colliders.get(r.name)
                 if not coll:
                     continue
@@ -212,6 +209,7 @@ class Simulator:
         self.logger.info(
             "Loading robot %s from %s", robot_cfg.name, robot_cfg.urdf
         )
+        ctrl = self._ctrl_for(robot_cfg.name)
         # Optionally render collision meshes for debugging if supported by backend
         urdf_kwargs = dict(
             file=robot_cfg.urdf,
@@ -219,7 +217,7 @@ class Simulator:
             euler=tuple(robot_cfg.base_orientation),
             fixed=robot_cfg.fixed_base,
         )
-        if getattr(self.config.control, "visualize_collision_meshes", False):
+        if getattr(ctrl, "visualize_collision_meshes", False):
             urdf_kwargs["vis_mode"] = "collision"
         try:
             entity = scene.add_entity(gs.morphs.URDF(**urdf_kwargs))
@@ -616,6 +614,14 @@ class Simulator:
     def wait_until_built(self, timeout=None) -> bool:
         return self._built_evt.wait(timeout)
 
+    # Per-robot effective control (fallback to global)
+    def _ctrl_for(self, robot_name: str):
+        try:
+            return self.config.control_for(robot_name)
+        except Exception:
+            # Fallback for older configs without control_for
+            return getattr(self.config, "control", None)
+
     # Generic helpers to convert tensors/arrays to numpy (CPU)
     @staticmethod
     def _to_np(x):
@@ -786,7 +792,8 @@ class Simulator:
         self.logger.debug("IK solver=%s; q_goal dtype=%s shape=%s", used_solver, getattr(q_goal_np, 'dtype', None), getattr(q_goal_np, 'shape', None))
         self.logger.debug("IK solver=%s, q_start=%s", used_solver, q_start)
 
-        if getattr(self.config.control, 'collision_check', True):
+        ctrl = self._ctrl_for(robot)
+        if getattr(ctrl, 'collision_check', True):
             coll = self._colliders.get(robot)
             if coll is not None:
                 ok, reason = coll.check_state(q_goal_np, dofs_idx)
@@ -808,7 +815,7 @@ class Simulator:
                 
         # --- OMPL planning (robust, minimal API) ---
         waypoints = None
-        if getattr(self.config.control, 'strict_cartesian', True):
+        if getattr(ctrl, 'strict_cartesian', True):
             if not hasattr(entity, 'plan_path'):
                 self.logger.warning("OMPL/plan_path not available; set control.strict_cartesian=false to test without planning")
                 self._emit("cartesian_failed", robot, "planner_unavailable")
@@ -823,10 +830,10 @@ class Simulator:
                 # --- Prepare inputs (strict NumPy types expected by Genesis) ---
                 q_start_np1d = np.asarray(q_start, dtype=np.float32).ravel()
                 q_goal_np1d  = np.asarray(q_goal_np, dtype=np.float32).ravel()
-                num_wp = max(2, int(getattr(self.config.control, 'cartesian_waypoints', 100)))
-                res = float(getattr(self.config.control, 'planner_resolution', 0.03))
-                to  = float(getattr(self.config.control, 'planner_timeout', 1.5))
-                planner_name = str(getattr(self.config.control, 'planner', 'RRTConnect'))
+                num_wp = max(2, int(getattr(ctrl, 'cartesian_waypoints', 100)))
+                res = float(getattr(ctrl, 'planner_resolution', 0.03))
+                to  = float(getattr(ctrl, 'planner_timeout', 1.5))
+                planner_name = str(getattr(ctrl, 'planner', 'RRTConnect'))
 
                 t0 = time.perf_counter()
                 try:
@@ -909,7 +916,7 @@ class Simulator:
             segs = max(2, int(np.linalg.norm(q_goal_np - q_start) / 0.01))
             waypoints = np.linspace(q_start, q_goal_np, segs, dtype=np.float32)
 
-        if getattr(self.config.control, 'collision_check', True):
+        if getattr(ctrl, 'collision_check', True):
             coll = self._colliders.get(robot)
             if coll is not None:
                 t_verify = time.perf_counter()
@@ -919,9 +926,9 @@ class Simulator:
                 ok, reason, seg = coll.check_path(
                     waypoints_list,
                     dofs_idx,
-                    substeps=getattr(self.config.control, 'ccd_substeps', 3),
+                    substeps=getattr(ctrl, 'ccd_substeps', 3),
                     stride=max(1, W // 30),
-                    max_time_s=getattr(self.config.control, 'postcheck_time_s', 0.2),
+                    max_time_s=getattr(ctrl, 'postcheck_time_s', 0.2),
                 )
                 verify_dt = time.perf_counter() - t_verify
                 self.logger.debug("Post: verify time: %.3f", verify_dt)

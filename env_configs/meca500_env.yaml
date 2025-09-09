@@ -12,9 +12,6 @@ robots:
     fixed_base: true
     initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
     end_effector_link: meca_axis_6_link
-    # Optional PD gains (stiffness/damping)
-    # kp: [120, 120, 120, 100, 80, 60]
-    # kv: [24, 24, 24, 20, 16, 12]
 
 objects:
   - type: "plane"

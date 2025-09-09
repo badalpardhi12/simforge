@@ -1,63 +1,91 @@
+# env_configs/all_robots.yaml
 scene:
-  dt: 0.01
-  gravity: [0, 0, -9.81]
-  backend: "gpu"
   show_viewer: true
-
-robots:
-  - name: "TX2_60_1"
-    urdf: "assets/tx2_60/tx2_60.urdf"
-    base_position: [0.0, 0.0, 0.0]
-    base_orientation: [0, 0, 0]
-    fixed_base: true
-    initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
-    # Optional PD gains (stiffness/damping)
-    # kp: [180, 180, 180, 140, 120, 100]
-    # kv: [36, 36, 36, 28, 24, 20]
-
-  - name: "TX2_60_2"
-    urdf: "assets/tx2_60/tx2_60.urdf"
-    base_position: [1.0, 0.0, 0.0]
-    base_orientation: [0, 0, 0]
-    fixed_base: true
-    initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
-    # Optional PD gains (stiffness/damping)
-    # kp: [180, 180, 180, 140, 120, 100]
-    # kv: [36, 36, 36, 28, 24, 20]
-
-  - name: "Meca500_1"
-    urdf: "assets/meca500/meca.urdf"
-    base_position: [0.0, 1.0, 0.0]
-    base_orientation: [0, 0, 0]
-    fixed_base: true
-    initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
-    # Optional PD gains (stiffness/damping)
-    # kp: [120, 120, 120, 100, 80, 60]
-    # kv: [24, 24, 24, 20, 16, 12]
-
-  - name: "UR5e_1"
-    urdf: "assets/ur5e/ur5e.urdf"
-    base_position: [1.0, 1.0, 0.0]
-    base_orientation: [0, 0, 0]
-    fixed_base: true
-    initial_joint_positions: [0, -90, 0, -90, 0, 0]  # degrees
-    # Optional: PD gains to increase stiffness and damping (arrays per joint)
-    # Tune by increasing kp for stiffness and kv for damping to reduce oscillations.
-    # kp: [150, 150, 150, 120, 100, 80]
-    # kv: [30, 30, 30, 24, 20, 16]
+  dt: 0.005
+  max_fps: 60
+  backend: gpu
 
 objects:
   - type: "plane"
     position: [0, 0, 0]
     size: [5, 5]
 
-control:
-  joint_speed_limit: 0.5
-  cartesian_speed_limit: 0.1
-  default_tcp: [0, 0, 0, 1, 0, 0, 0]  
-  strict_cartesian: true
-  collision_check: true
-  ccd_substeps: 6
-  ground_plane_z: 0.0
-  allowed_collision_links:
-    - [wrist_3_link, tool0]
+# Defaults applied to every robot unless overridden below
+defaults:
+  control:
+    planner: RRTConnect
+    planner_timeout: 1.5
+    planner_resolution: 0.03
+    planner_max_retry: 2
+    cartesian_waypoints: 200
+    strict_cartesian: false
+
+robots:
+  # You can inline a robot OR include an existing robot yaml and override fields.
+  - include: tx2_60_env.yaml
+    name: TX2_60_1
+    pose: {position: [0.0, 0.0, 0.0], rpy: [0, 0, 0]}
+    # Either 'control' or legacy 'planning' keys are accepted for overrides:
+    control:
+      joint_speed_limit: 0.5
+      cartesian_speed_limit: 0.1
+      default_tcp: [0, 0, 0, 1, 0, 0, 0]
+      strict_cartesian: true
+      collision_check: true
+      ccd_substeps: 6
+      ground_plane_z: 0.0
+      # Slightly shrink all collision meshes to reduce false-positive self-collisions
+      collision_mesh_shrink: 0.97
+      allowed_collision_links:
+      - [base_link, link_1]
+      - [link_1, link_2]
+      - [link_2, link_3]
+      - [link_3, link_4]
+      - [link_4, link_5]
+      - [link_5, link_6]
+
+  - include: ur5e_env.yaml
+    name: UR5e_1
+    pose: {position: [0.5, 0.5, 0.0], rpy: [0, 0, 0]}
+    control:
+      joint_speed_limit: 0.5
+      cartesian_speed_limit: 0.1
+      default_tcp: [0, 0, 0, 1, 0, 0, 0]
+      strict_cartesian: true
+      collision_check: true
+      ccd_substeps: 6
+      ground_plane_z: 0.0
+      # Slightly shrink all collision meshes to reduce false-positive self-collisions
+      collision_mesh_shrink: 0.97
+      allowed_collision_links:
+      - [base_link, shoulder_link]
+      - [shoulder_link, upper_arm_link]
+      - [upper_arm_link, forearm_link]
+      - [forearm_link, wrist_1_link]
+      - [wrist_1_link, wrist_2_link]
+      - [wrist_2_link, wrist_3_link]
+
+  - include: meca500_env.yaml
+    name: MECA500_1
+    pose: {position: [0.5, -0.5, 0.0], rpy: [0, 0, 0]}
+    control:
+      joint_speed_limit: 0.5
+      cartesian_speed_limit: 0.1
+      default_tcp: [0, 0, 0, 1, 0, 0, 0]
+      strict_cartesian: true
+      collision_check: true
+      ccd_substeps: 6
+      ground_plane_z: 0.0
+      # Slightly shrink all collision meshes to reduce false-positive self-collisions
+      collision_mesh_shrink: 0.97
+      # Parent-child adjacency pairs to ignore in self-collision (URDF link names)
+      allowed_collision_links:
+        - [meca_base_link, meca_axis_1_link]
+        - [meca_axis_1_link, meca_axis_2_link]
+        - [meca_axis_2_link, meca_axis_3_link]
+        - [meca_axis_3_link, meca_axis_4_link]
+        - [meca_axis_4_link, meca_axis_5_link]
+        - [meca_axis_5_link, meca_axis_6_link]
+        - [meca_axis_6_link, meca_gripper_link]
+        - [meca_gripper_link, meca_gripper_finger1]
+        - [meca_gripper_link, meca_gripper_finger2]
