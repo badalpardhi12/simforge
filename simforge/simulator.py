@@ -9,11 +9,23 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+from . import commands
 from .config import SimforgeConfig, RobotConfig
 from .logging_utils import setup_logging
 from .urdf_utils import parse_joint_limits, select_end_effector_link
 from .collision import CollisionChecker, CollisionWorld
-from .utils import rpy_to_quat_wxyz, quat_wxyz_multiply, quat_wxyz_rotate_vec, quat_wxyz_to_rotation_matrix, to_numpy, safe_set_dofs_position, quat_wxyz_conj, quat_wxyz_normalize
+from .genesis_wrapper import GenesisWrapper
+from .utils import (
+    rpy_to_quat_wxyz,
+    quat_wxyz_multiply,
+    quat_wxyz_rotate_vec,
+    quat_wxyz_to_rotation_matrix,
+    to_numpy,
+    safe_set_dofs_position,
+    quat_wxyz_conj,
+    quat_wxyz_normalize,
+    quat_wxyz_to_rotvec,
+)
 
 
 class Simulator:
@@ -22,7 +34,7 @@ class Simulator:
     IK planning, and trajectory execution in real-time.
 
     This class handles:
-    - Genesis backend initialization (GPU, CPU, or CUDA)
+    - Genesis backend initialization (GPU, CPU)
     - Scene construction from configuration
     - Robot loading and IK setup
     - Collision checking with FCL
@@ -37,6 +49,9 @@ class Simulator:
     def __init__(self, config: SimforgeConfig, debug: bool = False) -> None:
         self.config = config
         self.logger = setup_logging(debug)
+        self.gs = GenesisWrapper(
+            backend_cfg=(self.config.scene.backend or "gpu"), logger=self.logger
+        )
         self._scene = None
         self._robots: Dict[str, object] = {}
         self._robot_dofs_idx: Dict[str, List[int]] = {}
@@ -67,48 +82,12 @@ class Simulator:
         self._shutdown_evt = threading.Event()
 
         # Command queue to run IK/planning on the sim thread
-        self._cmd_q: "queue.Queue[tuple]" = queue.Queue()
+        self._cmd_q: "queue.Queue[commands.Command]" = queue.Queue()
         self._last_enq_time: float = 0.0
-
-    # --- Genesis helpers ---
-    def _import_genesis(self):
-        try:
-            import genesis as gs  # type: ignore
-        except Exception as e:
-            raise RuntimeError(
-                "Genesis is not installed. Please `pip install genesis-world`"
-            ) from e
-        return gs
-
-    def _init_genesis(self):
-        # Suppress TensorFlow warnings (keep minimal to avoid conflicts)
-        import os
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow warnings
-
-        gs = self._import_genesis()
-        backend_cfg = (self.config.scene.backend or "gpu").lower()
-        if backend_cfg == "gpu":
-            gs.init(backend=gs.gpu)
-        elif backend_cfg == "cuda":
-            gs.init(backend=gs.cuda)
-        else:
-            gs.init(backend=gs.cpu)
-
-        # Ensure Genesis logger does not double-print alongside our root handler
-        import logging as _logging
-        g = _logging.getLogger("genesis")
-        for h in list(g.handlers):
-            g.removeHandler(h)
-        g.propagate = True
-        g.setLevel(_logging.WARNING)  # Only show warnings and errors
-
-        self.logger.info("Genesis initialized (backend=%s)", backend_cfg)
-        return gs
 
     def build_scene(self):
         if self._built:
             return
-        gs = self._init_genesis()
 
         # Patch Genesis cleanup immediately after initialization
         try:
@@ -118,17 +97,7 @@ class Simulator:
         except Exception as e:
             self.logger.warning(f"Could not patch Genesis cleanup in simulator: {e}")
 
-        scene = gs.Scene(
-            sim_options=gs.options.SimOptions(
-                dt=self.config.scene.dt, gravity=tuple(self.config.scene.gravity)
-            ),
-            viewer_options=gs.options.ViewerOptions(
-                camera_pos=(3.0, 0.0, 2.0),
-                camera_lookat=(0.0, 0.0, 0.5),
-                max_FPS=self.config.scene.max_fps,
-            ),
-            show_viewer=self.config.scene.show_viewer
-        )
+        scene = self.gs.create_scene(self.config.scene)
         scene.profiling_options.show_FPS = False
 
         # Store viewer reference for shutdown detection
@@ -144,12 +113,12 @@ class Simulator:
             if obj.type == "plane":
                 # Genesis Plane does not accept a 'size' attribute in 0.3.3; it's an infinite plane.
                 scene.add_entity(
-                    gs.morphs.Plane(
+                    self.gs.morphs.Plane(
                         pos=tuple(obj.position),
                     )
                 )
             elif obj.type == "box" and obj.size is not None:
-                scene.add_entity(gs.morphs.Box(
+                scene.add_entity(self.gs.morphs.Box(
                     pos=tuple(obj.position),
                     size=tuple(obj.size),
                     euler=tuple(getattr(obj, "orientation_rpy", (0.0,0.0,0.0)))
@@ -288,7 +257,6 @@ class Simulator:
             self._evt_cb("scene_built", "", "")
 
     def _add_robot(self, scene, robot_cfg: RobotConfig):
-        gs = self._import_genesis()
         self.logger.info(
             "Loading robot %s from %s", robot_cfg.name, robot_cfg.urdf
         )
@@ -303,11 +271,11 @@ class Simulator:
         if getattr(ctrl, "visualize_collision_meshes", False):
             urdf_kwargs["vis_mode"] = "collision"
         try:
-            entity = scene.add_entity(gs.morphs.URDF(**urdf_kwargs))
+            entity = scene.add_entity(self.gs.morphs.URDF(**urdf_kwargs))
         except TypeError:
             # Older Genesis may not support 'vis_mode'; retry without it
             urdf_kwargs.pop("vis_mode", None)
-            entity = scene.add_entity(gs.morphs.URDF(**urdf_kwargs))
+            entity = scene.add_entity(self.gs.morphs.URDF(**urdf_kwargs))
 
         # Cache dof indices
         try:
@@ -360,15 +328,13 @@ class Simulator:
         """Public API to request a Cartesian move; runs on the sim thread."""
         try:
             self._last_enq_time = time.perf_counter()
-            self._cmd_q.put(("cartesian_move", (robot, pose_xyzrpy, frame)), block=False)
+            self._cmd_q.put(commands.CartesianMove(robot, pose_xyzrpy, frame), block=False)
             self.logger.debug("Enqueued cartesian_move for %s: %s in %s", robot, pose_xyzrpy, frame)
         except Exception as e:
             self.logger.error("Failed to enqueue cartesian_move: %s", e)
 
     def _loop(self):
-        # Build scene on this (sim) thread to keep all Genesis calls on one thread
-        if not self._built:
-            self.build_scene()
+        # Scene is now built on the main thread before starting the simulation loop.
         assert self._scene is not None
         dt = self.config.scene.dt
         last = time.perf_counter()
@@ -379,25 +345,22 @@ class Simulator:
                 last_cmd = None
                 cancels: set[str] = set()
                 while True:
-                    kind, payload = self._cmd_q.get_nowait()
-                    if kind == "cartesian_move":
+                    cmd = self._cmd_q.get_nowait()
+                    if isinstance(cmd, commands.CartesianMove):
                         # skip moves for robots that were canceled in this drain
-                        r, pose, frame = payload
-                        if r in cancels:
+                        if cmd.robot in cancels:
                             continue
-                        last_cmd = payload  # keep only the latest move
-                    elif kind == "cartesian_cancel":
-                        (r,) = payload
-                        cancels.add(r)
+                        last_cmd = cmd  # keep only the latest move
+                    elif isinstance(cmd, commands.CartesianCancel):
+                        cancels.add(cmd.robot)
                         # stop active trajectory and drop pending moves for this robot
-                        self._active_traj.pop(r, None)
+                        self._active_traj.pop(cmd.robot, None)
                 # no break; rely on exception
             except queue.Empty:
                 pass
             if last_cmd is not None:
-                robot, pose, frame = last_cmd
                 try:
-                    self.plan_and_execute_cartesian(robot, pose, frame)
+                    self.plan_and_execute_cartesian(last_cmd.robot, last_cmd.pose_xyzrpy, last_cmd.frame)
                 except Exception as e:
                     self.logger.error("plan_and_execute_cartesian error: %s", e)
             # Apply kinematic holds or follow active trajectories
@@ -467,8 +430,8 @@ class Simulator:
                     if not ee:
                         continue
                     link = entity.get_link(ee)
-                    pos = self._to_np(link.get_pos()).astype(np.float32)
-                    quat = self._to_np(link.get_quat()).astype(np.float32)  # wxyz
+                    pos = to_numpy(link.get_pos()).astype(np.float32)
+                    quat = to_numpy(link.get_quat()).astype(np.float32)  # wxyz
                     w, x, y, z = quat
                     t0 = 2*(w*x + y*z); t1 = 1 - 2*(x*x + y*y)
                     roll = np.arctan2(t0, t1)
@@ -586,42 +549,8 @@ class Simulator:
         except Exception:
             pass
 
-    # Quaternion helpers (WXYZ)
-    @staticmethod
-    def _rpy_to_quat_wxyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
-        cr, sr = np.cos(roll/2), np.sin(roll/2)
-        cp, sp = np.cos(pitch/2), np.sin(pitch/2)
-        cy, sy = np.cos(yaw/2), np.sin(yaw/2)
-        return np.array([
-            cy*cp*cr + sy*sp*sr,
-            cy*cp*sr - sy*sp*cr,
-            sy*cp*sr + cy*sp*cr,
-            sy*cp*cr - cy*sp*sr,
-        ], dtype=np.float32)
-
-    @staticmethod
-    def _quat_wxyz_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-        w1,x1,y1,z1 = q1; w2,x2,y2,z2 = q2
-        return np.array([
-            w1*w2 - x1*x2 - y1*y2 - z1*z2,
-            w1*x2 + x1*w2 + y1*z2 - z1*y2,
-            w1*y2 - x1*z2 + y1*w2 + z1*x2,
-            w1*z2 + x1*y2 - y1*x2 + z1*w2,
-        ], dtype=np.float32)
-
-    @staticmethod
-    def _quat_wxyz_rotate_vec(q: np.ndarray, v: np.ndarray) -> np.ndarray:
-        # rotate v by quaternion q (wxyz)
-        w,x,y,z = q
-        R = np.array([
-            [1-2*(y*y+z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
-            [2*(x*y + z*w), 1-2*(x*x+z*z), 2*(y*z - x*w)],
-            [2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x*x+y*y)],
-        ], dtype=np.float32)
-        return R @ v
-
     def _euler_deg_to_wxyz(self, roll: float, pitch: float, yaw: float) -> np.ndarray:
-        return self._rpy_to_quat_wxyz(np.deg2rad(roll), np.deg2rad(pitch), np.deg2rad(yaw))
+        return rpy_to_quat_wxyz(np.deg2rad(roll), np.deg2rad(pitch), np.deg2rad(yaw))
 
     def _base_pose(self, robot_cfg: RobotConfig):
         t = np.array(robot_cfg.base_position, dtype=np.float32)
@@ -632,8 +561,8 @@ class Simulator:
         if frame == 'base':
             t_base, q_base = self._base_pose(robot_cfg)
             pos_local = np.array(target_pos_base, dtype=np.float32)
-            pw = t_base + self._quat_wxyz_rotate_vec(q_base, pos_local)
-            qw = self._quat_wxyz_multiply(q_base, np.array(target_quat_base_wxyz, dtype=np.float32))
+            pw = t_base + quat_wxyz_rotate_vec(q_base, pos_local)
+            qw = quat_wxyz_multiply(q_base, np.array(target_quat_base_wxyz, dtype=np.float32))
             return tuple(pw.tolist()), tuple(qw.tolist())
         return target_pos_base, target_quat_base_wxyz
 
@@ -642,28 +571,10 @@ class Simulator:
         link = entity.get_link(ee_name)
         pos = link.get_pos()
         quat = link.get_quat()  # wxyz
-        pos = self._to_np(pos)
-        quat = self._to_np(quat)
+        pos = to_numpy(pos)
+        quat = to_numpy(quat)
         return pos.astype(np.float32), quat.astype(np.float32)
 
-    @staticmethod
-    def _quat_wxyz_conj(q: np.ndarray) -> np.ndarray:
-        return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float32)
-
-    @staticmethod
-    def _quat_wxyz_normalize(q: np.ndarray) -> np.ndarray:
-        n = np.linalg.norm(q)
-        return q / (n + 1e-9)
-
-    def _quat_wxyz_to_rotvec(self, q: np.ndarray) -> np.ndarray:
-        qn = self._quat_wxyz_normalize(q)
-        w, x, y, z = qn
-        s = np.linalg.norm([x, y, z])
-        if s < 1e-9:
-            return np.zeros(3, dtype=np.float32)
-        angle = 2.0 * np.arctan2(s, w)
-        axis = np.array([x, y, z], dtype=np.float32) / s
-        return axis * angle
 
 
     # Numeric IK fallback (damped least-squares)
@@ -689,8 +600,8 @@ class Simulator:
             p_cur, q_cur = self._get_ee_pose_w(entity, ee_name)
             # Error: position + orientation (rotation vector)
             e_pos = target_p - p_cur
-            q_err = self._quat_wxyz_multiply(target_q, self._quat_wxyz_conj(q_cur))
-            e_rot = self._quat_wxyz_to_rotvec(q_err)
+            q_err = quat_wxyz_multiply(target_q, quat_wxyz_conj(q_cur))
+            e_rot = quat_wxyz_to_rotvec(q_err)
             e = np.concatenate([e_pos, e_rot]).astype(np.float32)
             if np.linalg.norm(e_pos) < 1e-3 and np.linalg.norm(e_rot) < 1e-2:
                 break
@@ -707,8 +618,8 @@ class Simulator:
                     entity.set_dofs_position(q_pert, dofs_idx)
                 p_p, q_p = self._get_ee_pose_w(entity, ee_name)
                 dp = (p_p - p_cur) / eps
-                dq = self._quat_wxyz_multiply(q_p, self._quat_wxyz_conj(q_cur))
-                drot = self._quat_wxyz_to_rotvec(dq) / eps
+                dq = quat_wxyz_multiply(q_p, quat_wxyz_conj(q_cur))
+                drot = quat_wxyz_to_rotvec(dq) / eps
                 J[:, j] = np.concatenate([dp, drot])
 
             # Restore to q after perturbations
@@ -730,8 +641,8 @@ class Simulator:
         # Final pose check
         p_cur, q_cur = self._get_ee_pose_w(entity, ee_name)
         e_pos = np.linalg.norm(target_p - p_cur)
-        q_err = self._quat_wxyz_multiply(target_q, self._quat_wxyz_conj(q_cur))
-        e_rot = np.linalg.norm(self._quat_wxyz_to_rotvec(q_err))
+        q_err = quat_wxyz_multiply(target_q, quat_wxyz_conj(q_cur))
+        e_rot = np.linalg.norm(quat_wxyz_to_rotvec(q_err))
 
         # Restore original q0; we'll return solution separately
         try:
@@ -764,23 +675,6 @@ class Simulator:
             return getattr(self.config, "control", None)
 
     # Generic helpers to convert tensors/arrays to numpy (CPU)
-    @staticmethod
-    def _to_np(x):
-        try:
-            # torch.Tensor on GPU/CPU
-            import torch  # type: ignore
-            if isinstance(x, torch.Tensor):
-                return x.detach().cpu().numpy()
-        except Exception:
-            pass
-        try:
-            # Objects exposing .numpy()
-            if hasattr(x, 'numpy') and callable(getattr(x, 'numpy')):
-                return x.numpy()
-        except Exception:
-            pass
-        # As a fallback, wrap via numpy.array
-        return np.array(x)
 
     @staticmethod
     def _path_to_numpy(path):
@@ -853,7 +747,6 @@ class Simulator:
         Falls back to linear joint interpolation if planning backend is unavailable.
         """
         self._assert_sim_thread()
-        gs = self._import_genesis()
         entity = self._robots[robot]
         dofs_idx = self._robot_dofs_idx[robot]
         # Cancel any existing trajectory for this robot, we will replace it
@@ -918,7 +811,7 @@ class Simulator:
 
         # Normalize IK result to CPU numpy for downstream consumption (avoid CUDA tensor -> numpy errors)
         try:
-            q_goal_np = self._to_np(q_goal).astype(np.float32)
+            q_goal_np = to_numpy(q_goal).astype(np.float32)
         except Exception:
             try:
                 import torch  # type: ignore
@@ -961,15 +854,21 @@ class Simulator:
         except Exception:
             pass
 
-        # --- OMPL planning with enforced timeout/retry limits ---
+        # --- OMPL planning or linear interpolation ---
         waypoints = None
-        if getattr(ctrl, 'strict_cartesian', True):
+        use_ompl = getattr(ctrl, 'strict_cartesian', True)
+
+        # OMPL requires the main thread, so we can't use it in headless mode without a UI executor.
+        if use_ompl and not self._ui_exec:
+            self.logger.warning("OMPL planner requires GUI mode; falling back to linear interpolation for this move.")
+            use_ompl = False
+
+        if use_ompl:
             if not hasattr(entity, 'plan_path'):
-                self.logger.warning("OMPL/plan_path not available; set control.strict_cartesian=false to test without planning")
+                self.logger.warning("OMPL/plan_path not available; set control.strict_cartesian=false to use linear interpolation fallback.")
                 self._emit("cartesian_failed", robot, "planner_unavailable")
                 return False
 
-            # Get configuration parameters with strict type checking
             res = float(getattr(ctrl, 'planner_resolution', 0.03))
             planner_timeout = float(getattr(ctrl, 'planner_timeout', 1.5))
             planner_max_retry = int(getattr(ctrl, 'planner_max_retry', 3))
@@ -979,30 +878,25 @@ class Simulator:
             self.logger.debug("Planning config: timeout=%.1fs, max_retry=%d, waypoints=%d, planner=%s",
                              planner_timeout, planner_max_retry, num_wp, planner_name)
 
-            # --- Prepare inputs (strict NumPy types expected by Genesis) ---
             q_start_np1d = np.asarray(q_start, dtype=np.float32).ravel()
             q_goal_np1d  = np.asarray(q_goal_np, dtype=np.float32).ravel()
 
-            # Prepare plan_path call parameters
             plan_params = {
-                'qpos_goal': q_goal_np1d,
-                'qpos_start': q_start_np1d,
-                'resolution': res,
-                'timeout': planner_timeout,
-                'max_retry': planner_max_retry,
-                'smooth_path': True,
-                'num_waypoints': num_wp,
-                'ignore_collision': False,
-                'planner': planner_name,
+                'qpos_goal': q_goal_np1d, 'qpos_start': q_start_np1d, 'resolution': res,
+                'timeout': planner_timeout, 'max_retry': planner_max_retry, 'smooth_path': True,
+                'num_waypoints': num_wp, 'ignore_collision': False, 'planner': planner_name,
             }
 
-            # Use Genesis's built-in timeout and retry capabilities (no manual wrapping needed)
             self._planning = True
             t0 = time.perf_counter()
+            path = None
+            
+            def do_plan():
+                return entity.plan_path(**plan_params)
 
             try:
-                # Genesis handles timeout and retries internally via plan_params
-                path = entity.plan_path(**plan_params)
+                # This MUST run on the main thread.
+                path = self._ui_exec(do_plan)
                 plan_dt = time.perf_counter() - t0
                 self.logger.debug("Planning completed in %.3fs", plan_dt)
             except Exception as e:
@@ -1012,34 +906,26 @@ class Simulator:
             finally:
                 self._planning = False
 
-            # Validate the result
             if path is not None:
                 p_np = self._path_to_numpy(path)
-
-                self.logger.debug("Planned path: type=%s dtype=%s shape=%s",
-                                type(path), getattr(p_np, 'dtype', None), getattr(p_np, 'shape', None))
-                self.logger.debug("Path waypoints: first=%s last=%s", p_np[0] if len(p_np) > 0 else "none", p_np[-1] if len(p_np) > 0 else "none")
-
-                # Validate shape and quality
-                if (p_np.size > 0 and p_np.shape[0] >= 2 and
-                    p_np.shape[1] == q_start_np1d.shape[0] and
+                if (p_np.size > 0 and p_np.shape[0] >= 2 and p_np.shape[1] == q_start_np1d.shape[0] and
                     not np.allclose(p_np[0], p_np[-1], atol=1e-6)):
-                    # Path validated successfully - densify for smooth execution
                     waypoints = self._densify_joint_path(p_np, max_joint_delta=0.04)
                     self.logger.debug("Planning successful: %d waypoints generated", len(waypoints))
                 else:
-                    self.logger.error("Path planner failed: IK succeeded but planner returned invalid path (all waypoints at same position)")
+                    self.logger.error("Path planner failed: IK succeeded but planner returned invalid path.")
                     self._emit("cartesian_failed", robot, "planner_invalid_path")
                     return False
             else:
-                self.logger.error("Path planner failed: All planning attempts failed within timeout")
+                self.logger.error("Path planner failed: All planning attempts failed within timeout.")
                 self._emit("cartesian_failed", robot, "planner_failed")
                 return False
         else:
-            # Planning disabled - reject command entirely
-            self.logger.error("Path planner failed: Cartesan planning disabled (strict_cartesian=false); cannot execute movement without planning")
-            self._emit("cartesian_failed", robot, "planning_disabled")
-            return False
+            # Fallback: simple linear interpolation in joint space
+            self.logger.debug("Using linear joint interpolation (strict_cartesian=false or headless mode).")
+            num_wp = max(2, int(getattr(ctrl, 'cartesian_waypoints', 100)))
+            q_path = np.linspace(q_start, q_goal_np, num=num_wp, dtype=np.float32)
+            waypoints = self._densify_joint_path(q_path, max_joint_delta=0.04)
 
         if getattr(ctrl, 'collision_check', True):
             if self._world is not None:

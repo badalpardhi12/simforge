@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from . import commands
 from .config import SimforgeConfig, RobotConfig
 from .simulator import Simulator
 
@@ -14,12 +15,6 @@ from .simulator import Simulator
 class ControlMode:
     JOINT = "joint"
     CARTESIAN = "cartesian"
-
-
-@dataclass
-class Command:
-    kind: str
-    payload: tuple
 
 
 class Controller:
@@ -43,7 +38,7 @@ class Controller:
         self.sim = Simulator(config, debug=debug)
         # Per-robot control mode (default to JOINT)
         self._mode_by_robot: Dict[str, str] = {r.name: ControlMode.JOINT for r in self.config.robots}
-        self._cmd_q: "queue.Queue[Command]" = queue.Queue()
+        self._cmd_q: "queue.Queue[commands.Command]" = queue.Queue()
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._running = False
 
@@ -75,65 +70,74 @@ class Controller:
             except queue.Empty:
                 continue
 
-            if cmd.kind == "set_joint_deg":
-                robot, idx, val_deg = cmd.payload
-                arr = self._targets_deg.get(robot)
-                if arr is None or idx >= len(arr):
+            if isinstance(cmd, commands.SetJointDeg):
+                arr = self._targets_deg.get(cmd.robot)
+                if arr is None or cmd.idx >= len(arr):
                     continue
-                arr[idx] = float(val_deg)
-                self.sim.set_joint_targets_deg(robot, arr)
-            elif cmd.kind == "set_joint_targets_deg":
-                robot, arr = cmd.payload
-                self._targets_deg[robot] = list(arr)
-                self.sim.set_joint_targets_deg(robot, list(arr))
-            elif cmd.kind == "switch_mode_robot":
-                robot, mode = cmd.payload
-                if robot not in self._mode_by_robot:
+                arr[cmd.idx] = float(cmd.val_deg)
+                self.sim.set_joint_targets_deg(cmd.robot, arr)
+            elif isinstance(cmd, commands.SetJointTargetsDeg):
+                self._targets_deg[cmd.robot] = list(cmd.vals_deg)
+                self.sim.set_joint_targets_deg(cmd.robot, list(cmd.vals_deg))
+            elif isinstance(cmd, commands.SwitchMode):
+                if cmd.robot not in self._mode_by_robot:
                     continue
-                self._mode_by_robot[robot] = mode
+                self._mode_by_robot[cmd.robot] = cmd.mode
                 # Optionally reset only this robot to its home position when switching mode
-                init = next((r.initial_joint_positions for r in self.config.robots if r.name == robot), None)
+                init = next(
+                    (
+                        r.initial_joint_positions
+                        for r in self.config.robots
+                        if r.name == cmd.robot
+                    ),
+                    None,
+                )
                 if init:
-                    self._targets_deg[robot] = list(init)
-                    self.sim.set_joint_targets_deg(robot, list(init))
+                    self._targets_deg[cmd.robot] = list(init)
+                    self.sim.set_joint_targets_deg(cmd.robot, list(init))
                 # Log EE link choice for debugging when entering Cartesian mode for this robot
-                if mode == ControlMode.CARTESIAN:
+                if cmd.mode == ControlMode.CARTESIAN:
                     self.sim.log_end_effector_choices()
-            elif cmd.kind == "cartesian_move":
-                robot, pose, frame = cmd.payload
+            elif isinstance(cmd, commands.CartesianMove):
                 try:
                     # Enqueue to sim thread to avoid nested kernel calls
-                    self.sim.enqueue_cartesian_move(robot, pose, frame)
+                    self.sim.enqueue_cartesian_move(
+                        cmd.robot, cmd.pose_xyzrpy, cmd.frame
+                    )
                 except Exception:
                     # Avoid crashing GUI thread; errors will be logged by simulator
                     continue
 
     # --- Public API for GUI ---
     def set_joint_deg(self, robot: str, idx: int, val_deg: float):
-        self._cmd_q.put(Command("set_joint_deg", (robot, idx, val_deg)))
+        self._cmd_q.put(commands.SetJointDeg(robot, idx, val_deg))
 
     def set_joint_targets_deg(self, robot: str, vals_deg: List[float]):
-        self._cmd_q.put(Command("set_joint_targets_deg", (robot, vals_deg)))
+        self._cmd_q.put(commands.SetJointTargetsDeg(robot, vals_deg))
 
     def switch_mode(self, robot: str, mode: str):
         assert mode in (ControlMode.JOINT, ControlMode.CARTESIAN)
-        self._cmd_q.put(Command("switch_mode_robot", (robot, mode)))
+        self._cmd_q.put(commands.SwitchMode(robot, mode))
 
-    def set_cartesian_target(self, robot: str, pose_xyzrpy: tuple, frame: str = 'world'):
+    def set_cartesian_target(
+        self, robot: str, pose_xyzrpy: tuple, frame: str = "world"
+    ):
         # Basic de-bounce: avoid flooding queue with nearly-identical commands
         last = self._last_cartesian.get(robot)
         if last:
-            dx = sum(abs(a-b) for a,b in zip(last[:3], pose_xyzrpy[:3]))
-            da = sum(abs(a-b) for a,b in zip(last[3:], pose_xyzrpy[3:]))
+            dx = sum(abs(a - b) for a, b in zip(last[:3], pose_xyzrpy[:3]))
+            da = sum(abs(a - b) for a, b in zip(last[3:], pose_xyzrpy[3:]))
             if dx < 1e-3 and da < 1.0:  # <1mm and <1deg aggregate
                 return
         self._last_cartesian[robot] = pose_xyzrpy
-        self._cmd_q.put(Command("cartesian_move", (robot, pose_xyzrpy, frame)))
+        self._cmd_q.put(commands.CartesianMove(robot, pose_xyzrpy, frame))
         # Explicit debug print so we can see GUI events arriving
-        print(f"[CTRL] Enqueued cartesian_move for {robot}: {pose_xyzrpy} in {frame}")
+        print(
+            f"[CTRL] Enqueued cartesian_move for {robot}: {pose_xyzrpy} in {frame}"
+        )
 
     def cancel_cartesian(self, robot: str):
-        self._cmd_q.put(Command("cartesian_cancel", (robot,)))
+        self._cmd_q.put(commands.CartesianCancel(robot))
         print(f"[CTRL] Cancel cartesian for {robot}")
 
     # --- Events and queries for GUI ---

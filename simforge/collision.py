@@ -102,17 +102,25 @@ def _read_urdf_collisions(urdf_path: str | Path) -> URDFCollisions:
 
             # Resolve relative paths against URDF file
             mesh_path = (path.parent / fname).resolve()
-            tm = trimesh.load(mesh_path, force="mesh")
-            if not isinstance(tm, trimesh.Trimesh):
-                # handle Scene by concatenating
-                tm = trimesh.util.concatenate(tuple(m for m in tm.dump() if isinstance(m, trimesh.Trimesh)))
+            # Load as a scene to preserve transforms and multiple meshes
+            loaded = trimesh.load(mesh_path)
 
-            v = np.array(tm.vertices, dtype=np.float32)
-            f = np.array(tm.faces, dtype=np.int32)
-            geoms.append(CollisionGeom(
-                link=lname, vertices=v, triangles=f,
-                origin_xyz=ox, origin_quat_wxyz=oq, scale=scale,
-            ))
+            if isinstance(loaded, trimesh.Scene):
+                mesh_list = [g for g in loaded.dump() if isinstance(g, trimesh.Trimesh)]
+            elif isinstance(loaded, trimesh.Trimesh):
+                mesh_list = [loaded]
+            else:
+                mesh_list = []
+
+            for tm in mesh_list:
+                if tm.is_empty:
+                    continue
+                v = np.array(tm.vertices, dtype=np.float32)
+                f = np.array(tm.faces, dtype=np.int32)
+                geoms.append(CollisionGeom(
+                    link=lname, vertices=v, triangles=f,
+                    origin_xyz=ox, origin_quat_wxyz=oq, scale=scale,
+                ))
 
         if geoms:
             link_map[lname] = LinkCollisionSet(link=lname, geoms=geoms)

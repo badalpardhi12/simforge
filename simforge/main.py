@@ -150,7 +150,8 @@ def cmd_run(config_path: str, headless: bool, debug: bool):
     if headless:
         sim = Simulator(cfg, debug=debug)
         _current_simulator = sim  # Set global reference for cleanup
-        sim.start()  # <-- don't call build_scene() here
+        sim.build_scene()  # Build scene on main thread before starting sim thread
+        sim.start()
         logger.info("Running headless. Press Ctrl+C to stop.")
         try:
             while not _shutdown_requested:

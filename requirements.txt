@@ -10,3 +10,5 @@ PyYAML>=6.0
 ompl>=1.6
 PySide6>=6.6
 
+
+pydantic

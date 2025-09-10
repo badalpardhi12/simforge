@@ -130,3 +130,15 @@ def quat_wxyz_normalize(q: np.ndarray) -> np.ndarray:
     """Normalize quaternion."""
     n = np.linalg.norm(q)
     return q / (n + 1e-9)
+
+
+def quat_wxyz_to_rotvec(q: np.ndarray) -> np.ndarray:
+    """Convert quaternion to rotation vector."""
+    qn = quat_wxyz_normalize(q)
+    w, x, y, z = qn
+    s = np.linalg.norm([x, y, z])
+    if s < 1e-9:
+        return np.zeros(3, dtype=np.float32)
+    angle = 2.0 * np.arctan2(s, w)
+    axis = np.array([x, y, z], dtype=np.float32) / s
+    return axis * angle

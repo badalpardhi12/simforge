@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import atexit
 import math
 import threading
 import time
@@ -39,30 +38,24 @@ class SimforgeApp:
                 self._on_window_close()
         signal.signal(signal.SIGINT, signal_handler)
 
-        # 1) start simulation thread immediately
-        self.controller.start()
-        # 2) block until the scene is built, so the viewer pops first
-        #    (wait up to ~10s; adjust if needed)
-        self.controller.sim.wait_until_built(timeout=10.0)
-        # 3) now build the UI
+        # 1) Build the UI widgets first
         self._build_widgets()
-        # Provide a UI-thread executor to simulator for main-thread-only Genesis calls
+
+        # 2) Set up callbacks and UI-thread executor
         self.controller.sim.set_ui_executor(self._run_on_ui_thread_sync)
-        # Set up shutdown callback for when simulator detects viewer closure
+
         def shutdown_callback():
             try:
                 self.logger.info("Shutdown callback triggered from controller")
             except AttributeError:
-                pass  # Logger may not be available during shutdown
+                pass
             self.root.quit()
         self.controller._shutdown_callback = shutdown_callback
 
-        # Set up scene built callback to show window when scene is ready
         def scene_callback():
             try:
                 self.logger.info("Scene built, showing GUI window")
-                self.root.deiconify()  # Show the window
-                # Bring window to front
+                self.root.deiconify()
                 self.root.lift()
                 self.root.focus_force()
             except Exception as e:
@@ -72,7 +65,11 @@ class SimforgeApp:
                     pass
         self.controller._scene_callback = scene_callback
 
-        # Start UI update loop
+        # 3) Now, build the scene on the main thread. The callback will show the window.
+        self.controller.sim.build_scene()
+
+        # 4) Start the simulation thread and UI update loop
+        self.controller.start()
         self._ui_updater_running = True
         self.root.after(100, self._ui_update_loop)
 
@@ -307,10 +304,6 @@ class SimforgeApp:
         except Exception as e:
             print(f"Error stopping controller: {e}")
 
-        # Give a brief moment for threads to finish
-        import time
-        time.sleep(0.2)
-
         # Destroy the window safely
         try:
             print("Closing GUI windows...")
@@ -318,10 +311,9 @@ class SimforgeApp:
         except Exception as e:
             print(f"Error closing window: {e}")
 
-        # Force clean exit to prevent Genesis CUDA cleanup issues
-        print("Forcing clean exit to avoid CUDA context errors...")
-        import os
-        os._exit(0)
+        # Use a cleaner exit
+        import sys
+        sys.exit(0)
 
     def _ui_update_loop(self):
         if not self._ui_updater_running:
@@ -381,16 +373,4 @@ def run_app(config: SimforgeConfig, debug: bool = False):
         import traceback
         traceback.print_exc()
     finally:
-        # Ensure cleanup if mainloop exits normally but shutdown wasn't called
-        if app and hasattr(app, '_is_shutting_down') and not app._is_shutting_down:
-            try:
-                print("Forcing cleanup...")
-                if app._ui_updater_running:
-                    app._ui_updater_running = False
-                if hasattr(app, 'controller'):
-                    app.controller.stop()
-                if root:
-                    root.destroy()
-            except Exception as cleanup_error:
-                print(f"Error during force cleanup: {cleanup_error}")
         print("GUI application shutdown complete")

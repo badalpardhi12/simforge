@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
+from pydantic import BaseModel, Field
 
 
 # Core scene/viewer options
-@dataclass
-class SceneConfig:
+class SceneConfig(BaseModel):
     dt: float = 0.01
     gravity: Tuple[float, float, float] = (0.0, 0.0, -9.81)
     backend: str = "gpu"  # "gpu" (auto), "cpu", "cuda"
@@ -18,8 +17,7 @@ class SceneConfig:
 
 
 # Robot descriptor (URDF + placement + optional EE and per-robot overrides)
-@dataclass
-class RobotConfig:
+class RobotConfig(BaseModel):
     name: str
     urdf: str
     base_position: Tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -35,28 +33,34 @@ class RobotConfig:
 
 
 # Simple environment object
-@dataclass
-class ObjectConfig:
-    type: str                      # "plane", "box" (future: "mesh")
-    name: str = ""                 # optional unique name for ACM / debugging
+class ObjectConfig(BaseModel):
+    type: str  # "plane", "box" (future: "mesh")
+    name: str = ""  # optional unique name for ACM / debugging
     position: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     orientation_rpy: Tuple[float, float, float] = (0.0, 0.0, 0.0)  # degrees
-    size: Tuple[float, float, float] | None = None                 # for box
+    size: Optional[Tuple[float, float, float]] = None  # for box
     collision_enabled: bool = True
 
 
 # Planning + collision + execution parameters
-@dataclass
-class ControlConfig:
+class ControlConfig(BaseModel):
     joint_speed_limit: float = 1.0
     cartesian_speed_limit: float = 0.1
-    default_tcp: Tuple[float, float, float, float, float, float, float] = (0, 0, 0, 1, 0, 0, 0)
+    default_tcp: Tuple[float, float, float, float, float, float, float] = (
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+    )
     strict_cartesian: bool = True
 
     # Collision control
     collision_check: bool = True
     ccd_substeps: int = 5
-    allowed_collision_links: List[Tuple[str, str]] = field(default_factory=list)
+    allowed_collision_links: List[Tuple[str, str]] = Field(default_factory=list)
     ground_plane_z: float = 0.0
     collision_mesh_shrink: float = 1.0
     auto_allow_home_collisions: bool = True
@@ -72,11 +76,12 @@ class ControlConfig:
 
     # World-collision options (for inter-robot and static objects)
     min_clearance_m: float = 0.005
-    world_allowed_pairs: List[Tuple[str, str]] = field(default_factory=list)  # e.g., ["ur5e_1/wrist_3_link", "obj:table1"]
+    world_allowed_pairs: List[Tuple[str, str]] = Field(
+        default_factory=list
+    )  # e.g., ["ur5e_1/wrist_3_link", "obj:table1"]
 
 
-@dataclass
-class SimforgeConfig:
+class SimforgeConfig(BaseModel):
     """
     Top-level configuration container for a Simforge simulation.
     Combines scene settings, robot definitions, environment objects, and control parameters.
@@ -87,10 +92,11 @@ class SimforgeConfig:
         objects: List of static objects (planes, boxes) in the scene
         control: Global control settings; can be overridden per robot
     """
-    scene: SceneConfig = field(default_factory=SceneConfig)
-    robots: List[RobotConfig] = field(default_factory=list)
-    objects: List[ObjectConfig] = field(default_factory=list)
-    control: ControlConfig = field(default_factory=ControlConfig)
+
+    scene: SceneConfig = Field(default_factory=SceneConfig)
+    robots: List[RobotConfig] = Field(default_factory=list)
+    objects: List[ObjectConfig] = Field(default_factory=list)
+    control: ControlConfig = Field(default_factory=ControlConfig)
 
     # Return effective control for a robot: per-robot override merged over globals.
     def control_for(self, robot_name: str) -> ControlConfig:
@@ -99,8 +105,8 @@ class SimforgeConfig:
         if rob is None or rob.control is None:
             return self.control
         # Merge global (base) with per-robot override
-        base = asdict(self.control)
-        override = asdict(rob.control)
+        base = self.control.model_dump()
+        override = rob.control.model_dump()
         base.update(override)
         return ControlConfig(**base)
 
@@ -119,101 +125,44 @@ class SimforgeConfig:
         path = Path(path)
         data = yaml.safe_load(path.read_text()) or {}
 
-        # Scene
-        scene_map = data.get("scene") or {}
-        scene = SceneConfig(**scene_map)
-
-        # Objects
-        objects: List[ObjectConfig] = []
-        for obj in (data.get("objects") or []):
-            if not isinstance(obj, dict):
-                continue
-            # Accept ObjectConfig fields directly
-            objects.append(ObjectConfig(**obj))
-
         # Global control = defaults.control overlaid by top-level control
-        defaults_map = data.get("defaults") or {}
-        defaults_ctrl = defaults_map.get("control") or {}
-        top_ctrl = data.get("control") or {}
+        defaults_map = data.get("defaults", {})
+        defaults_ctrl = defaults_map.get("control", {})
+        top_ctrl = data.get("control", {})
         gctrl = {**defaults_ctrl, **top_ctrl}
-        global_ctrl = ControlConfig(**gctrl)
+        data["control"] = gctrl
 
-        # Helper to coerce a robot mapping into RobotConfig
-        def build_robot(rmap_raw: Dict[str, Any]) -> RobotConfig:
-            rmap = dict(rmap_raw)
-
-            # Optional 'pose' -> base_position/base_orientation
-            pose = rmap.pop("pose", None)
-            if isinstance(pose, dict):
-                pos = pose.get("position")
-                rpy = pose.get("rpy")
-                if pos is not None:
-                    rmap["base_position"] = tuple(pos)
-                if rpy is not None:
-                    rmap["base_orientation"] = tuple(rpy)
-
-            # Per-robot control override (kept as a ControlConfig on the robot)
-            ctrl_override = None
-            if "control" in rmap and isinstance(rmap["control"], dict):
-                ctrl_override = ControlConfig(**rmap.pop("control"))
-
-            # Build RobotConfig (fields must match dataclass)
-            robot = RobotConfig(**rmap)
-            robot.control = ctrl_override
-            return robot
-
-        # Robots list
-        robots: List[RobotConfig] = []
-        for entry in (data.get("robots") or []):
-            # 1) String path -> include file
+        # Process robot includes
+        processed_robots = []
+        for entry in data.get("robots", []):
             if isinstance(entry, str):
                 inc_path = (path.parent / entry).resolve()
-                inc = yaml.safe_load(inc_path.read_text()) or {}
-                # Extract first robot from included file
-                inc_robots = inc.get("robots") or []
-                if not inc_robots:
-                    raise ValueError(f"Included file {inc_path} has no 'robots' list")
-                base_map = dict(inc_robots[0])
-                # Ensure required fields exist
-                if "urdf" not in base_map:
-                    raise ValueError(f"Included file {inc_path} robot entry must specify 'urdf'")
-                # Require end_effector_link per user instruction
-                if "end_effector_link" not in base_map:
-                    raise ValueError(f"Included file {inc_path} robot entry must specify 'end_effector_link'")
-                robots.append(build_robot(base_map))
-                continue
-
-            if isinstance(entry, dict) and "include" in entry:
-                # 2) {'include': 'file.yaml', ...overrides...}
+                inc_data = yaml.safe_load(inc_path.read_text()) or {}
+                if not inc_data.get("robots"):
+                    raise ValueError(
+                        f"Included file {inc_path} has no 'robots' list"
+                    )
+                processed_robots.append(inc_data["robots"][0])
+            elif isinstance(entry, dict) and "include" in entry:
                 inc_path = (path.parent / str(entry["include"])).resolve()
-                inc = yaml.safe_load(inc_path.read_text()) or {}
-                inc_robots = inc.get("robots") or []
-                if not inc_robots:
-                    raise ValueError(f"Included file {inc_path} has no 'robots' list")
-                base_map = dict(inc_robots[0])
-
-                # overlays: copy other keys from entry (except 'include')
+                inc_data = yaml.safe_load(inc_path.read_text()) or {}
+                if not inc_data.get("robots"):
+                    raise ValueError(
+                        f"Included file {inc_path} has no 'robots' list"
+                    )
+                base_map = inc_data["robots"][0]
                 overlay = {k: v for k, v in entry.items() if k != "include"}
-                # Support 'pose' override (handled later in build_robot)
                 base_map.update(overlay)
+                processed_robots.append(base_map)
+            else:
+                # Handle 'pose' key mapping to base_position/orientation
+                if 'pose' in entry and isinstance(entry['pose'], dict):
+                    pose_data = entry.pop('pose')
+                    if 'position' in pose_data:
+                        entry['base_position'] = pose_data['position']
+                    if 'rpy' in pose_data:
+                        entry['base_orientation'] = pose_data['rpy']
+                processed_robots.append(entry)
+        data["robots"] = processed_robots
 
-                # Must have urdf and end_effector_link
-                if "urdf" not in base_map:
-                    raise ValueError(f"Included file {inc_path} robot entry must specify 'urdf'")
-                if "end_effector_link" not in base_map:
-                    raise ValueError(f"Include override for {inc_path} must specify 'end_effector_link' explicitly")
-
-                robots.append(build_robot(base_map))
-                continue
-
-            if isinstance(entry, dict):
-                # 3) Inline robot mapping
-                # Require end_effector_link explicitly
-                if "end_effector_link" not in entry:
-                    raise ValueError("Inline robot entry must specify 'end_effector_link'")
-                robots.append(build_robot(entry))
-                continue
-
-            raise TypeError("robots: each item must be a mapping, or a string path to a YAML (include)")
-
-        return SimforgeConfig(scene=scene, robots=robots, objects=objects, control=global_ctrl)
+        return SimforgeConfig.model_validate(data)
