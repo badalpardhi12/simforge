@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import math
 import threading
 import time
@@ -17,9 +18,26 @@ class SimforgeApp:
         self.root = root
         self.config = config
         self.controller = Controller(config, debug=debug)
+        self._is_shutting_down = False
+        # Hide the window until scene is built
+        self.root.withdraw()
+
+        # Add logger to GUI class
+        from .logging_utils import setup_logging
+        self.logger = setup_logging(debug)
 
         self.root.title("Simforge")
         self.root.geometry("720x540")
+
+        # Set up window close handler for graceful shutdown
+        self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
+
+        # Handle SIGINT for GUI mode too
+        import signal
+        def signal_handler(signum, frame):
+            if not self._is_shutting_down:
+                self._on_window_close()
+        signal.signal(signal.SIGINT, signal_handler)
 
         # 1) start simulation thread immediately
         self.controller.start()
@@ -30,6 +48,30 @@ class SimforgeApp:
         self._build_widgets()
         # Provide a UI-thread executor to simulator for main-thread-only Genesis calls
         self.controller.sim.set_ui_executor(self._run_on_ui_thread_sync)
+        # Set up shutdown callback for when simulator detects viewer closure
+        def shutdown_callback():
+            try:
+                self.logger.info("Shutdown callback triggered from controller")
+            except AttributeError:
+                pass  # Logger may not be available during shutdown
+            self.root.quit()
+        self.controller._shutdown_callback = shutdown_callback
+
+        # Set up scene built callback to show window when scene is ready
+        def scene_callback():
+            try:
+                self.logger.info("Scene built, showing GUI window")
+                self.root.deiconify()  # Show the window
+                # Bring window to front
+                self.root.lift()
+                self.root.focus_force()
+            except Exception as e:
+                try:
+                    self.logger.warning(f"Failed to show GUI window: {e}")
+                except AttributeError:
+                    pass
+        self.controller._scene_callback = scene_callback
+
         # Start UI update loop
         self._ui_updater_running = True
         self.root.after(100, self._ui_update_loop)
@@ -212,28 +254,6 @@ class SimforgeApp:
         if hasattr(self, 'ctrl_info') and self.ctrl_info:
             self.ctrl_info.configure(text=info)
 
-    def _on_robot_change(self, event=None):
-        # Rebuild UI for the new robot and refresh effective control display
-        self._rebuild_joint_sliders()
-        self._refresh_ctrl_info()
-
-    def _refresh_ctrl_info(self):
-        try:
-            robot = self.robot_var.get()
-            # Show effective control (per-robot overrides merged with global defaults)
-            ctrl = self.config.control_for(robot)
-            info = (
-                f"Effective control for {robot} — "
-                f"planner={getattr(ctrl, 'planner', '')} | "
-                f"timeout={getattr(ctrl, 'planner_timeout', '')} | "
-                f"resolution={getattr(ctrl, 'planner_resolution', '')} | "
-                f"waypoints={getattr(ctrl, 'cartesian_waypoints', '')} | "
-                f"strict_cartesian={getattr(ctrl, 'strict_cartesian', '')}"
-            )
-        except Exception as e:
-            info = f"Effective control: unavailable ({e})"
-        if hasattr(self, 'ctrl_info') and self.ctrl_info:
-            self.ctrl_info.configure(text=info)
 
     def _on_mode_change(self, event=None):
         robot = self.robot_var.get()
@@ -271,13 +291,61 @@ class SimforgeApp:
         self.controller.cancel_cartesian(robot)
         self.status.configure(text="Stopped active motion")
 
+    def _on_window_close(self):
+        """Handle window close event for graceful shutdown."""
+        if self._is_shutting_down:
+            return
+        self._is_shutting_down = True
+
+        # Stop UI update loop FIRST
+        self._ui_updater_running = False
+
+        # Stop the controller (simulation) gracefully
+        try:
+            print("Stopping simulation controller...")
+            self.controller.stop()
+        except Exception as e:
+            print(f"Error stopping controller: {e}")
+
+        # Give a brief moment for threads to finish
+        import time
+        time.sleep(0.2)
+
+        # Destroy the window safely
+        try:
+            print("Closing GUI windows...")
+            self.root.destroy()
+        except Exception as e:
+            print(f"Error closing window: {e}")
+
+        # Force clean exit to prevent Genesis CUDA cleanup issues
+        print("Forcing clean exit to avoid CUDA context errors...")
+        import os
+        os._exit(0)
 
     def _ui_update_loop(self):
         if not self._ui_updater_running:
             return
+        # If shutting down, don't continue the loop
+        if self._is_shutting_down:
+            return
+
+        # Check if simulator requested shutdown (e.g., viewer window closed)
+        if self.controller.sim._shutdown_evt.is_set():
+            try:
+                self.logger.info("Received shutdown request from simulator, closing GUI")
+            except AttributeError:
+                pass  # Logger may not be available during shutdown
+            self.root.quit()
+            return
+
         # Update status with simple heartbeat
-        current_robot = self.robot_var.get()
-        self.status.configure(text=f"Mode: {self.controller.get_mode(current_robot)} | Robot: {current_robot}")
+        try:
+            current_robot = self.robot_var.get()
+            self.status.configure(text=f"Mode: {self.controller.get_mode(current_robot)} | Robot: {current_robot}")
+        except Exception:
+            # Skip status updates during shutdown
+            pass
         # If last Cartesian failed, reset sliders to actual EE pose
         if self.mode_var.get() == ControlMode.CARTESIAN:
             robot = self.robot_var.get()
@@ -298,6 +366,31 @@ class SimforgeApp:
 
 
 def run_app(config: SimforgeConfig, debug: bool = False):
-    root = tk.Tk()
-    app = SimforgeApp(root, config=config, debug=debug)
-    root.mainloop()
+    root = None
+    app = None
+    try:
+        root = tk.Tk()
+        app = SimforgeApp(root, config=config, debug=debug)
+        print("Starting GUI main loop...")
+        root.mainloop()
+        print("GUI main loop exited cleanly")
+    except KeyboardInterrupt:
+        print("Received keyboard interrupt in GUI mode")
+    except Exception as e:
+        print(f"Error in GUI mode: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Ensure cleanup if mainloop exits normally but shutdown wasn't called
+        if app and hasattr(app, '_is_shutting_down') and not app._is_shutting_down:
+            try:
+                print("Forcing cleanup...")
+                if app._ui_updater_running:
+                    app._ui_updater_running = False
+                if hasattr(app, 'controller'):
+                    app.controller.stop()
+                if root:
+                    root.destroy()
+            except Exception as cleanup_error:
+                print(f"Error during force cleanup: {cleanup_error}")
+        print("GUI application shutdown complete")

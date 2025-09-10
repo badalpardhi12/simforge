@@ -442,3 +442,208 @@ class CollisionChecker:
                 if not ok:
                     return False, reason, i
         return True, "ok", -1
+
+# === World-aware collision manager ===========================================
+# Appended: MoveIt-like planning scene utilities that aggregate all robot checkers
+# and static objects to support inter-robot/world collision and clearance checks.
+
+from typing import Set
+
+def _rpy_deg_to_wxyz(r: float, p: float, y: float) -> np.ndarray:
+    return _rpy_to_wxyz(np.deg2rad(r), np.deg2rad(p), np.deg2rad(y))
+
+class CollisionWorld:
+    """
+    MoveIt-like world built over per-robot CollisionChecker(s).
+    Supports:
+      - inter-robot mesh-mesh collision/clearance
+      - static objects (boxes) with names
+      - allowed-collision pairs across robots/objects
+      - min clearance (meters) using FCL distance if available
+    """
+    def __init__(self, logger, min_clearance: float = 0.0):
+        self.logger = logger
+        self.min_clearance = float(min_clearance)
+        self._robots: Dict[str, CollisionChecker] = {}
+        self._static_objs: Dict[str, "fcl.CollisionObject"] = {}
+        self._allowed: Set[Tuple[str, str]] = set()
+        self._have_distance = hasattr(fcl, "DistanceRequest") if fcl else False
+        if self._have_distance:
+            self._dist_req = fcl.DistanceRequest(enable_nearest_points=False)
+            self._dist_res = fcl.DistanceResult()
+
+    # --- registration & config ---
+    def add_robot(self, name: str, checker: "CollisionChecker"):
+        self._robots[name] = checker
+
+    def allow(self, pairs: List[Tuple[str, str]]):
+        for a, b in pairs or []:
+            A = tuple(sorted((a, b)))
+            self._allowed.add(A)
+
+    def _key_link(self, robot: str, link: str) -> str:
+        return f"{robot}/{link}"
+
+    def _key_obj(self, obj_name: str) -> str:
+        return f"obj:{obj_name}"
+
+    def add_box(self, name: str, size_xyz: Tuple[float, float, float],
+                pos_w: Tuple[float, float, float],
+                rpy_deg_w: Tuple[float, float, float] = (0.0, 0.0, 0.0)):
+        if not fcl:
+            return
+        sx, sy, sz = [float(abs(v)) for v in size_xyz]
+        bx = fcl.Box(sx, sy, sz)
+        q = _rpy_deg_to_wxyz(*rpy_deg_w)
+        R = _wxyz_to_R(q).astype(np.float32)
+        p = np.array(pos_w, dtype=np.float32).reshape(3)
+        tf = fcl.Transform(R, p)
+        self._static_objs[str(name)] = fcl.CollisionObject(bx, tf)
+
+    # --- core updates ---
+    def _update_all_robot_transforms(self):
+        # Make sure each robot's link collision objects are at current poses
+        for chk in self._robots.values():
+            try:
+                chk._update_world_transforms()
+            except Exception:
+                pass
+
+    def _with_robot_q(self, robot: str, q: np.ndarray, dofs_idx):
+        """Temporarily set robot 'robot' to joint state q (radians), yield qprev, and restore on exit (call _restore_robot_q)."""
+        ent = self._robots[robot].entity
+        # capture previous
+        try:
+            joints = ent.get_joints()
+            qprev = np.array([float(getattr(j, "qpos", 0.0)) for j in joints], dtype=np.float32)
+        except Exception:
+            qprev = None
+        # set new
+        try:
+            ent.set_dofs_position(q, dofs_idx_local=dofs_idx)
+        except Exception:
+            ent.set_dofs_position(q, dofs_idx)
+        return qprev
+
+    def _restore_robot_q(self, robot: str, qprev: Optional[np.ndarray], dofs_idx):
+        if qprev is None:
+            return
+        ent = self._robots[robot].entity
+        try:
+            ent.set_dofs_position(qprev, dofs_idx_local=dofs_idx)
+        except Exception:
+            ent.set_dofs_position(qprev, dofs_idx)
+
+    # --- pairwise helpers ---
+    def _pairs_iter_links(self, robotA: str, robotB: str):
+        A = self._robots[robotA]; B = self._robots[robotB]
+        for la, objs_a in A._objs.items():
+            keyA = self._key_link(robotA, la)
+            for lb, objs_b in B._objs.items():
+                keyB = self._key_link(robotB, lb)
+                if tuple(sorted((keyA, keyB))) in self._allowed:
+                    continue
+                yield keyA, objs_a, keyB, objs_b
+
+    def _collide_objs(self, oa: "fcl.CollisionObject", ob: "fcl.CollisionObject") -> bool:
+        res = fcl.CollisionResult()
+        # reuse any request from an existing checker
+        req = None
+        for chk in self._robots.values():
+            req = chk._fcl_req
+            break
+        if req is None:
+            req = fcl.CollisionRequest(num_max_contacts=1, enable_contact=True)
+        return fcl.collide(oa, ob, req, res) > 0
+
+    def _violates_clearance(self, oa: "fcl.CollisionObject", ob: "fcl.CollisionObject") -> bool:
+        if not self._have_distance or self.min_clearance <= 0.0:
+            return False
+        try:
+            self._dist_res.clear()
+            d = fcl.distance(oa, ob, self._dist_req, self._dist_res)
+            return d < self.min_clearance
+        except Exception:
+            return False
+
+    # --- public API (state and path) ---
+    def check_state(self, robot: str, q: np.ndarray, dofs_idx) -> Tuple[bool, str]:
+        """
+        Test the given joint state of 'robot' against:
+          - its own self-collision + ground (via per-robot checker)
+          - other robots
+          - static objects
+          - optional min clearance
+        """
+        if robot not in self._robots:
+            return True, "no_checker"
+        chk = self._robots[robot]
+
+        # 1) self + ground (uses its own restore logic)
+        ok, reason = chk.check_state(q, dofs_idx)
+        if not ok:
+            return ok, reason
+
+        if not fcl:
+            return True, "fcl_unavailable"
+
+        # 2) world checks: set q temporarily, update transforms
+        qprev = self._with_robot_q(robot, _to_numpy(q).astype(np.float32), dofs_idx)
+        try:
+            self._update_all_robot_transforms()
+
+            # (a) against other robots
+            for other in self._robots.keys():
+                if other == robot:
+                    continue
+                for keyA, objs_a, keyB, objs_b in self._pairs_iter_links(robot, other):
+                    for oa in objs_a:
+                        for ob in objs_b:
+                            if self._collide_objs(oa, ob):
+                                return False, f"robot_collision:{keyA}~{keyB}"
+                            if self._violates_clearance(oa, ob):
+                                return False, f"clearance_violation:{keyA}~{keyB}"
+
+            # (b) against static objects
+            for la, objs_a in chk._objs.items():
+                keyA = self._key_link(robot, la)
+                for oname, ob in self._static_objs.items():
+                    keyB = self._key_obj(oname)
+                    if tuple(sorted((keyA, keyB))) in self._allowed:
+                        continue
+                    for oa in objs_a:
+                        if self._collide_objs(oa, ob):
+                            return False, f"world_collision:{keyA}~{oname}"
+                        if self._violates_clearance(oa, ob):
+                            return False, f"world_clearance:{keyA}~{oname}"
+
+            return True, ""
+        finally:
+            self._restore_robot_q(robot, qprev, dofs_idx)
+
+    def check_path(self, robot: str, waypoints: List[np.ndarray], dofs_idx,
+                   substeps: int = 3, stride: Optional[int] = None, max_time_s: Optional[float] = None):
+        """
+        Sampled CCD-like path validator over the WHOLE WORLD (robots + static objects).
+        Mirrors per-robot check_path signature.
+        """
+        import time
+        start = time.perf_counter()
+        n = len(waypoints)
+        if n < 2:
+            return True, "trivial", -1
+        if stride is None or stride < 1:
+            stride = max(1, n // 30)
+
+        for i in range(0, n - 1, stride):
+            a = _to_numpy(waypoints[i]).astype(np.float32)
+            b = _to_numpy(waypoints[min(i + stride, n - 1)]).astype(np.float32)
+            for s in range(substeps + 1):
+                if max_time_s is not None and (time.perf_counter() - start) > max_time_s:
+                    return True, "time_budget_exhausted", i
+                alpha = s / max(1, substeps)
+                q = a * (1 - alpha) + b * alpha
+                ok, reason = self.check_state(robot, q, dofs_idx)
+                if not ok:
+                    return False, reason, i
+        return True, "ok", -1

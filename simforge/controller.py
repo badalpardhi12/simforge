@@ -125,6 +125,14 @@ class Controller:
     def _on_sim_event(self, kind: str, robot: str, info: str):
         if kind.startswith("cartesian_"):
             self._last_evt[robot] = f"{kind}:{info}"
+        elif kind == "shutdown_request":
+            # Forward shutdown request to GUI thread
+            if hasattr(self, '_shutdown_callback'):
+                self._shutdown_callback()
+        elif kind == "scene_built":
+            # Forward scene built event to GUI thread to show window
+            if hasattr(self, '_scene_callback'):
+                self._scene_callback()
 
     def get_last_cartesian_status(self, robot: str):
         return self._last_evt.get(robot)

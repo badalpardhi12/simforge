@@ -12,7 +12,7 @@ import numpy as np
 from .config import SimforgeConfig, RobotConfig
 from .logging_utils import setup_logging
 from .urdf_utils import parse_joint_limits, select_end_effector_link
-from .collision import CollisionChecker
+from .collision import CollisionChecker, CollisionWorld
 
 
 class Simulator:
@@ -40,10 +40,13 @@ class Simulator:
         # Planning guard to avoid stepping during heavy kernels on UI thread
         self._planning = False
         self._colliders: Dict[str, CollisionChecker] = {}
+        self._world: Optional[CollisionWorld] = None  # world-aware collision checker
         # Cache for EE poses (updated on sim thread, read from UI thread)
         self._ee_pose_cache: Dict[str, tuple] = {}
         # Built event for startup synchronization
         self._built_evt = threading.Event()
+        # Shutdown synchronization event for GUI thread
+        self._shutdown_evt = threading.Event()
 
         # Command queue to run IK/planning on the sim thread
         self._cmd_q: "queue.Queue[tuple]" = queue.Queue()
@@ -60,6 +63,10 @@ class Simulator:
         return gs
 
     def _init_genesis(self):
+        # Suppress TensorFlow warnings (keep minimal to avoid conflicts)
+        import os
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow warnings
+
         gs = self._import_genesis()
         backend_cfg = (self.config.scene.backend or "gpu").lower()
         if backend_cfg == "gpu":
@@ -68,13 +75,14 @@ class Simulator:
             gs.init(backend=gs.cuda)
         else:
             gs.init(backend=gs.cpu)
+
         # Ensure Genesis logger does not double-print alongside our root handler
         import logging as _logging
         g = _logging.getLogger("genesis")
         for h in list(g.handlers):
             g.removeHandler(h)
         g.propagate = True
-        g.setLevel(_logging.DEBUG if self.logger.isEnabledFor(_logging.DEBUG) else _logging.INFO)
+        g.setLevel(_logging.WARNING)  # Only show warnings and errors
 
         self.logger.info("Genesis initialized (backend=%s)", backend_cfg)
         return gs
@@ -83,6 +91,14 @@ class Simulator:
         if self._built:
             return
         gs = self._init_genesis()
+
+        # Patch Genesis cleanup immediately after initialization
+        try:
+            from .main import _patch_genesis_cleanup
+            _patch_genesis_cleanup()
+            self.logger.debug("Genesis cleanup patching applied")
+        except Exception as e:
+            self.logger.warning(f"Could not patch Genesis cleanup in simulator: {e}")
 
         scene = gs.Scene(
             sim_options=gs.options.SimOptions(
@@ -97,6 +113,14 @@ class Simulator:
         )
         scene.profiling_options.show_FPS = False
 
+        # Store viewer reference for shutdown detection
+        self._viewer_open = self.config.scene.show_viewer
+        if self.config.scene.show_viewer and hasattr(scene, 'viewer_manager'):
+            self._viewer_manager = scene.viewer_manager
+            self.logger.debug("Genesis viewer manager found")
+        else:
+            self._viewer_manager = None
+
         # Objects
         for obj in self.config.objects:
             if obj.type == "plane":
@@ -106,6 +130,12 @@ class Simulator:
                         pos=tuple(obj.position),
                     )
                 )
+            elif obj.type == "box" and obj.size is not None:
+                scene.add_entity(gs.morphs.Box(
+                    pos=tuple(obj.position),
+                    size=tuple(obj.size),
+                    euler=tuple(getattr(obj, "orientation_rpy", (0.0,0.0,0.0)))
+                ))
             
         # Robots
         for r in self.config.robots:
@@ -174,6 +204,41 @@ class Simulator:
                         "%s: Auto-allowed %d self-collision pair(s) at home pose: %s",
                         r.name, len(hits), pairs
                     )
+
+        # --- Build world-aware collision manager (robots + objects)
+        try:
+            gctrl = self._ctrl_for(self.config.robots[0].name) if self.config.robots else self.config.control
+        except Exception:
+            gctrl = getattr(self.config, "control", None)
+
+        self._world = CollisionWorld(logger=self.logger, min_clearance=getattr(gctrl, "min_clearance_m", 0.0))
+
+        # Register robots
+        for r in self.config.robots:
+            chk = self._colliders.get(r.name)
+            if chk:
+                self._world.add_robot(r.name, chk)
+
+        # Add static objects
+        for obj in self.config.objects:
+            if not getattr(obj, "collision_enabled", True):
+                continue
+            if obj.type == "box" and obj.size is not None:
+                name = obj.name or f"box_{len(self._world._static_objs)}"
+                self._world.add_box(
+                    name=name,
+                    size_xyz=tuple(obj.size),
+                    pos_w=tuple(obj.position),
+                    rpy_deg_w=tuple(getattr(obj, "orientation_rpy", (0.0, 0.0, 0.0))),
+                )
+            # 'plane' is already handled by per-robot ground_plane_z
+            # (future: add meshes here via trimesh->BVH if needed)
+
+        # Allowed pairs that involve robots and/or objects, e.g. ("ur5e_1/wrist_3_link", "obj:table1")
+        try:
+            self._world.allow(getattr(gctrl, "world_allowed_pairs", []))
+        except Exception:
+            pass
 
         # Apply initial joint targets (degrees from config) and step a few frames
         try:
@@ -289,7 +354,8 @@ class Simulator:
         assert self._scene is not None
         dt = self.config.scene.dt
         last = time.perf_counter()
-        while not self._stop_evt.is_set():
+        viewer_check_counter = 0
+        while not self._stop_evt.is_set() and not self._shutdown_evt.is_set():
             # Handle queued commands from controller (ensure Genesis calls happen on this thread)
             try:
                 last_cmd = None
@@ -348,9 +414,33 @@ class Simulator:
             try:
                 self._scene.step()
             except Exception as e:
-                self.logger.error("Scene step failed: %s", e)
-                time.sleep(dt)
-                continue
+                error_msg = str(e).lower()
+                if "viewer" in error_msg and ("closed" in error_msg or "shut down" in error_msg):
+                    self.logger.info("Genesis viewer closed - initiating graceful shutdown")
+                    try:
+                        self.trigger_shutdown()
+                    except Exception as e:
+                        self.logger.warning(f"Error triggering shutdown: {e}")
+                        # Still try to exit gracefully even if event sending fails
+                        break
+                    break  # Exit the simulation loop cleanly
+                else:
+                    self.logger.error("Scene step failed: %s", e)
+                    time.sleep(dt)
+                    continue
+
+            # Check for viewer window closure (every ~30 iterations or ~1.5 seconds at 60fps)
+            viewer_check_counter += 1
+            if viewer_check_counter >= 30:
+                viewer_check_counter = 0
+                if self._check_viewer_closed():
+                    self.logger.info("Genesis viewer closed, initiating graceful shutdown")
+                    try:
+                        self.trigger_shutdown()
+                    except Exception as e:
+                        self.logger.warning(f"Error triggering shutdown: {e}")
+                        break
+                    break
 
             # Update EE pose cache on sim thread after scene step
             try:
@@ -427,6 +517,39 @@ class Simulator:
                 self.logger.info("%s: EE link not resolved yet", r.name)
             else:
                 self.logger.info("%s: Using EE link '%s'", r.name, name)
+
+    def _check_viewer_closed(self):
+        """Check if the Genesis viewer window has been closed."""
+        if not self._viewer_open or not self._viewer_manager:
+            return False
+
+        try:
+            # Try to check if the viewer window is still open
+            # This is a heuristics-based approach since Genesis doesn't provide direct viewer close detection
+            # We can check if scene stepping still works or if certain viewer properties exist
+            # For now, we'll use a simple periodic check
+            if hasattr(self._viewer_manager, '_closed') and self._viewer_manager._closed:
+                self.logger.info("Genesis viewer window detected as closed")
+                return True
+        except Exception:
+            # If we can't access the viewer, assume it's closed
+            if self._viewer_open:
+                self.logger.info("Genesis viewer may have been closed (detection failed)")
+                return True
+
+        return False
+
+    def trigger_shutdown(self):
+        """Trigger graceful shutdown from simulator thread."""
+        self.logger.info("Triggering graceful shutdown from simulator thread")
+        self._shutdown_evt.set()
+        # Also notify event sink for GUI thread
+        try:
+            if self._evt_cb:
+                self._evt_cb("shutdown_request", "", "")
+        except Exception as e:
+            self.logger.warning(f"Error notifying GUI thread of shutdown: {e}")
+            # Continue with shutdown even if GUI notification fails
 
     # Event sink & helpers
     def set_event_sink(self, cb):
@@ -751,7 +874,7 @@ class Simulator:
         started_at = time.perf_counter()
         q_goal = None
         used_solver = None
-        
+
         # Try Genesis IK first
         if end_eff_link and hasattr(entity, 'inverse_kinematics'):
             try:
@@ -763,13 +886,13 @@ class Simulator:
                 used_solver = 'entity.inverse_kinematics'
             except Exception:
                 pass
-        
+
         # Fallback: numeric IK
         if q_goal is None and ee_name:
             q_goal = self._numeric_ik(entity, ee_name, q_start, target_pos, target_quat_wxyz)
             if q_goal is not None:
                 used_solver = 'numeric_ik'
-        
+
         if q_goal is None:
             self.logger.warning("IK failed (robot=%s); rejecting Cartesian command", robot)
             self._emit("cartesian_failed", robot, "ik_failed")
@@ -794,8 +917,15 @@ class Simulator:
 
         ctrl = self._ctrl_for(robot)
         if getattr(ctrl, 'collision_check', True):
-            coll = self._colliders.get(robot)
-            if coll is not None:
+            if self._world is not None:
+                ok, reason = self._world.check_state(robot, q_goal_np, dofs_idx)
+                if not ok:
+                    self.logger.warning("IK pose in collision (%s); rejecting Cartesian command for %s", reason, robot)
+                    self._emit("cartesian_failed", robot, "ik_in_collision")
+                    return False
+            elif self._colliders.get(robot) is not None:
+                # fallback to per-robot if world not available
+                coll = self._colliders[robot]
                 ok, reason = coll.check_state(q_goal_np, dofs_idx)
                 if not ok:
                     self.logger.warning("IK pose in collision (%s); rejecting Cartesian command for %s", reason, robot)
@@ -812,8 +942,8 @@ class Simulator:
             self._scene.step()
         except Exception:
             pass
-                
-        # --- OMPL planning (robust, minimal API) ---
+
+        # --- OMPL planning with enforced timeout/retry limits ---
         waypoints = None
         if getattr(ctrl, 'strict_cartesian', True):
             if not hasattr(entity, 'plan_path'):
@@ -821,104 +951,101 @@ class Simulator:
                 self._emit("cartesian_failed", robot, "planner_unavailable")
                 return False
 
-            # 1) Try planner (single attempt; Genesis may retry internally)
-            path = None
-            for attempt in range(1):
-                self._planning = True
-                self.logger.debug("Start RRTConnect planning... (attempt %d)", attempt + 1)
+            # Get configuration parameters with strict type checking
+            res = float(getattr(ctrl, 'planner_resolution', 0.03))
+            planner_timeout = float(getattr(ctrl, 'planner_timeout', 1.5))
+            planner_max_retry = int(getattr(ctrl, 'planner_max_retry', 3))
+            num_wp = max(2, int(getattr(ctrl, 'cartesian_waypoints', 100)))
+            planner_name = str(getattr(ctrl, 'planner', 'RRTConnect'))
 
-                # --- Prepare inputs (strict NumPy types expected by Genesis) ---
-                q_start_np1d = np.asarray(q_start, dtype=np.float32).ravel()
-                q_goal_np1d  = np.asarray(q_goal_np, dtype=np.float32).ravel()
-                num_wp = max(2, int(getattr(ctrl, 'cartesian_waypoints', 100)))
-                res = float(getattr(ctrl, 'planner_resolution', 0.03))
-                to  = float(getattr(ctrl, 'planner_timeout', 1.5))
-                planner_name = str(getattr(ctrl, 'planner', 'RRTConnect'))
+            self.logger.debug("Planning config: timeout=%.1fs, max_retry=%d, waypoints=%d, planner=%s",
+                             planner_timeout, planner_max_retry, num_wp, planner_name)
 
-                t0 = time.perf_counter()
-                try:
-                    # Try modern Genesis signature (supports num_waypoints)
-                    path = entity.plan_path(
-                        qpos_goal=q_goal_np1d,
-                        qpos_start=q_start_np1d,
-                        resolution=res,
-                        timeout=to,
-                        max_retry=0,
-                        smooth_path=True,
-                        num_waypoints=num_wp,     # <<< NEVER None
-                        ignore_collision=False,
-                        planner=planner_name,
-                    )
+            # --- Prepare inputs (strict NumPy types expected by Genesis) ---
+            q_start_np1d = np.asarray(q_start, dtype=np.float32).ravel()
+            q_goal_np1d  = np.asarray(q_goal_np, dtype=np.float32).ravel()
 
-                except TypeError:
-                    # Older Genesis without num_waypoints kwarg
-                    # log that we're using the old signature
-                    self.logger.debug("Falling back to legacy plan_path signature (no num_waypoints argument)")
-                    path = entity.plan_path(
-                        qpos_goal=q_goal_np1d,
-                        qpos_start=q_start_np1d,
-                        resolution=res,
-                        timeout=to,
-                        max_retry=0,
-                        smooth_path=False,
-                        ignore_collision=False,
-                        planner=planner_name,
-                    )
-                except Exception as e:
-                    self.logger.debug("Planner attempt %d failed: %s", attempt + 1, e)
-                    path = None
-                finally:
-                    # try:
-                    #     import torch  # type: ignore
-                    #     if torch.cuda.is_available():
-                    #         torch.cuda.synchronize()
-                    # except Exception:
-                    #     pass
-                    plan_dt = time.perf_counter() - t0
-                    self.logger.debug("RRTConnect planning time (Genesis): %.3f", plan_dt)
-                    self._planning = False
+            # Prepare plan_path call parameters
+            plan_params = {
+                'qpos_goal': q_goal_np1d,
+                'qpos_start': q_start_np1d,
+                'resolution': res,
+                'timeout': planner_timeout,
+                'max_retry': planner_max_retry,
+                'smooth_path': True,
+                'num_waypoints': num_wp,
+                'ignore_collision': False,
+                'planner': planner_name,
+            }
 
-                # Normalize/validate output
+            # Use Genesis's built-in timeout and retry capabilities (no manual wrapping needed)
+            self._planning = True
+            t0 = time.perf_counter()
+
+            try:
+                # Genesis handles timeout and retries internally via plan_params
+                path = entity.plan_path(**plan_params)
+                plan_dt = time.perf_counter() - t0
+                self.logger.debug("Planning completed in %.3fs", plan_dt)
+            except Exception as e:
+                plan_dt = time.perf_counter() - t0
+                self.logger.debug("Planning failed after %.3fs: %s", plan_dt, str(e)[:100])
+                path = None
+            finally:
+                self._planning = False
+
+            # Validate the result
+            if path is not None:
                 p_np = self._path_to_numpy(path)
 
-                self.logger.debug("Raw planned path: type=%s dtype=%s shape=%s", type(path), getattr(p_np, 'dtype', None), getattr(p_np, 'shape', None))
-                self.logger.debug("Planned path first few/last few waypoints: %s ... %s", p_np[:5], p_np[-5:])
+                self.logger.debug("Planned path: type=%s dtype=%s shape=%s",
+                                type(path), getattr(p_np, 'dtype', None), getattr(p_np, 'shape', None))
+                self.logger.debug("Path waypoints: first=%s last=%s", p_np[0] if len(p_np) > 0 else "none", p_np[-1] if len(p_np) > 0 else "none")
 
-                # Validate shape
-                if (
-                    p_np.size > 0
-                    and p_np.shape[0] >= 2
-                    and p_np.shape[1] == q_start_np1d.shape[0]
-                    and not np.allclose(p_np[0], p_np[-1], atol=1e-6)
-                ):
-                    path = p_np
-                    break
-                else:
-                    path = None
-
-
-            if path is None:
-                self.logger.warning("Planner returned degenerate/empty path; falling back to straight-line joint interpolation")
-                # Blend in velocity-limited spacing so motion is smoother; clamp to at least 2 points
-                segs = max(2, int(np.linalg.norm(q_goal_np - q_start) / 0.01))
-                waypoints = np.linspace(q_start, q_goal_np, segs, dtype=np.float32)
-            else:
-                p_np = self._path_to_numpy(path)
-                if p_np.shape[0] < 2 or np.allclose(p_np[0], p_np[-1], atol=1e-6):
-                    self.logger.warning("Planner returned identical/too-few waypoints, falling back to linear interpolation")
-                    segs = max(2, int(np.linalg.norm(q_goal_np - q_start) / 0.01))
-                    waypoints = np.linspace(q_start, q_goal_np, segs, dtype=np.float32)
-                else:
-                    # Densify the raw path for smooth execution
+                # Validate shape and quality
+                if (p_np.size > 0 and p_np.shape[0] >= 2 and
+                    p_np.shape[1] == q_start_np1d.shape[0] and
+                    not np.allclose(p_np[0], p_np[-1], atol=1e-6)):
+                    # Path validated successfully - densify for smooth execution
                     waypoints = self._densify_joint_path(p_np, max_joint_delta=0.04)
+                    self.logger.debug("Planning successful: %d waypoints generated", len(waypoints))
+                else:
+                    self.logger.error("Path planner failed: IK succeeded but planner returned invalid path (all waypoints at same position)")
+                    self._emit("cartesian_failed", robot, "planner_invalid_path")
+                    return False
+            else:
+                self.logger.error("Path planner failed: All planning attempts failed within timeout")
+                self._emit("cartesian_failed", robot, "planner_failed")
+                return False
         else:
-            # Dev mode: straight line (still collision-checked below)
-            segs = max(2, int(np.linalg.norm(q_goal_np - q_start) / 0.01))
-            waypoints = np.linspace(q_start, q_goal_np, segs, dtype=np.float32)
+            # Planning disabled - reject command entirely
+            self.logger.error("Path planner failed: Cartesan planning disabled (strict_cartesian=false); cannot execute movement without planning")
+            self._emit("cartesian_failed", robot, "planning_disabled")
+            return False
 
         if getattr(ctrl, 'collision_check', True):
-            coll = self._colliders.get(robot)
-            if coll is not None:
+            if self._world is not None:
+                t_verify = time.perf_counter()
+                # keep it fast: sample ~30 segments, 3 substeps each, <0.2s budget
+                W = max(2, int(waypoints.shape[0]))
+                waypoints_list = [waypoints[i] for i in range(W)]
+                ok, reason, seg = self._world.check_path(
+                    robot,
+                    waypoints_list,
+                    dofs_idx,
+                    substeps=getattr(ctrl, 'ccd_substeps', 3),
+                    stride=max(1, W // 30),
+                    max_time_s=getattr(ctrl, 'postcheck_time_s', 0.2),
+                )
+                verify_dt = time.perf_counter() - t_verify
+                self.logger.debug("World postcheck time: %.3f", verify_dt)
+                if not ok:
+                    self.logger.warning("Planned path collides at segment %d (%s); rejecting", seg, reason)
+                    self._emit("cartesian_failed", robot, "path_in_collision")
+                    return False
+            elif self._colliders.get(robot) is not None:
+                # fallback to per-robot if world not available
+                coll = self._colliders[robot]
                 t_verify = time.perf_counter()
                 # keep it fast: sample ~30 segments, 3 substeps each, <0.2s budget
                 W = max(2, int(waypoints.shape[0]))

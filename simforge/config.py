@@ -37,15 +37,18 @@ class RobotConfig:
 # Simple environment object
 @dataclass
 class ObjectConfig:
-    type: str
+    type: str                      # "plane", "box" (future: "mesh")
+    name: str = ""                 # optional unique name for ACM / debugging
     position: Tuple[float, float, float] = (0.0, 0.0, 0.0)
-    size: Tuple[float, float] | Tuple[float, float, float] | Tuple[float] | None = None
+    orientation_rpy: Tuple[float, float, float] = (0.0, 0.0, 0.0)  # degrees
+    size: Tuple[float, float, float] | None = None                 # for box
+    collision_enabled: bool = True
 
 
 # Planning + collision + execution parameters
 @dataclass
 class ControlConfig:
-    joint_speed_limit: float = 0.5
+    joint_speed_limit: float = 1.0
     cartesian_speed_limit: float = 0.1
     default_tcp: Tuple[float, float, float, float, float, float, float] = (0, 0, 0, 1, 0, 0, 0)
     strict_cartesian: bool = True
@@ -61,11 +64,15 @@ class ControlConfig:
 
     # Planning control
     planner: str = "RRTConnect"
-    planner_timeout: float = 1.5
+    planner_timeout: float = 1.0
     planner_resolution: float = 0.02
-    planner_max_retry: int = 0
+    planner_max_retry: int = 50
     cartesian_waypoints: int = 100
     postcheck_time_s: float = 0.2
+
+    # World-collision options (for inter-robot and static objects)
+    min_clearance_m: float = 0.005
+    world_allowed_pairs: List[Tuple[str, str]] = field(default_factory=list)  # e.g., ["ur5e_1/wrist_3_link", "obj:table1"]
 
 
 @dataclass

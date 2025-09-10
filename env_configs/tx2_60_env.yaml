@@ -1,37 +1,60 @@
+# env_configs/all_robots.yaml
 scene:
-  dt: 0.01
-  gravity: [0, 0, -9.81]
-  backend: "gpu"
   show_viewer: true
-
-robots:
-  - name: "TX2_60_1"
-    urdf: "assets/tx2_60/tx2_60.urdf"
-    base_position: [0.0, 0.0, 0.0]
-    base_orientation: [0, 0, 0]
-    fixed_base: true
-    initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
-    end_effector_link: link_6
+  dt: 0.005
+  max_fps: 60
+  backend: gpu
 
 objects:
   - type: "plane"
     position: [0, 0, 0]
     size: [5, 5]
+  - type: "box"
+    name: table1
+    position: [-1.0, 0.0, 0.38]
+    orientation_rpy: [0, 0, 0]
+    size: [1.2, 0.8, 0.76]
 
-control:
-  joint_speed_limit: 0.5
-  cartesian_speed_limit: 0.1
-  default_tcp: [0, 0, 0, 1, 0, 0, 0]
-  strict_cartesian: true
-  collision_check: true
-  ccd_substeps: 6
-  ground_plane_z: 0.0
-  # Slightly shrink all collision meshes to reduce false-positive self-collisions
-  collision_mesh_shrink: 0.97
-  allowed_collision_links:
-  - [base_link, link_1]
-  - [link_1, link_2]
-  - [link_2, link_3]
-  - [link_3, link_4]
-  - [link_4, link_5]
-  - [link_5, link_6]
+# Defaults applied to every robot unless overridden below
+defaults:
+  control:
+    planner: RRTConnect
+    planner_timeout: 1.0
+    planner_resolution: 0.02
+    planner_max_retry: 10
+    cartesian_waypoints: 200
+    strict_cartesian: false
+    # World-collision options
+    min_clearance_m: 0.02  # 2cm buffer via FCL distance (if compiled)
+    # Pairs involving robots and/or objects that should ignore collision
+    world_allowed_pairs:
+      - ["TX2_60_1/tool0", "obj:table1"]    # e.g., resting contact
+      - ["UR5e_1/tool0", "obj:table1"]
+      - ["MECA500_1/meca_gripper_link", "obj:table1"]
+
+robots:
+  # You can inline a robot OR include an existing robot yaml and override fields.
+  - name: TX2_60_1
+    urdf: "assets/tx2_60/tx2_60.urdf"
+    pose: {position: [0.0, 0.0, 0.0], rpy: [0, 0, 0]}
+    fixed_base: true
+    initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
+    end_effector_link: link_6
+    # Either 'control' or legacy 'planning' keys are accepted for overrides:
+    control:
+      joint_speed_limit: 0.5
+      cartesian_speed_limit: 0.1
+      default_tcp: [0, 0, 0, 1, 0, 0, 0]
+      strict_cartesian: true
+      collision_check: true
+      ccd_substeps: 6
+      ground_plane_z: 0.0
+      # Slightly shrink all collision meshes to reduce false-positive self-collisions
+      collision_mesh_shrink: 0.97
+      allowed_collision_links:
+      - [base_link, link_1]
+      - [link_1, link_2]
+      - [link_2, link_3]
+      - [link_3, link_4]
+      - [link_4, link_5]
+      - [link_5, link_6]

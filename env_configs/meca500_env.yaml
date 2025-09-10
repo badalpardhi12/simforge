@@ -1,41 +1,62 @@
+# env_configs/all_robots.yaml
 scene:
-  dt: 0.01
-  gravity: [0, 0, -9.81]
-  backend: "gpu"
   show_viewer: true
-
-robots:
-  - name: "Meca500_1"
-    urdf: "assets/meca500/meca.urdf"
-    base_position: [0.0, 0.0, 0.0]
-    base_orientation: [0, 0, 0]
-    fixed_base: true
-    initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
-    end_effector_link: meca_axis_6_link
+  dt: 0.005
+  max_fps: 60
+  backend: gpu
 
 objects:
   - type: "plane"
     position: [0, 0, 0]
     size: [5, 5]
+  - type: "box"
+    name: table1
+    position: [-1.0, 0.0, 0.38]
+    orientation_rpy: [0, 0, 0]
+    size: [1.2, 0.8, 0.76]
 
-control:
-  joint_speed_limit: 0.5
-  cartesian_speed_limit: 0.1
-  default_tcp: [0, 0, 0, 1, 0, 0, 0]
-  strict_cartesian: true
-  collision_check: true
-  ccd_substeps: 6
-  ground_plane_z: 0.0
-  # Slightly shrink all collision meshes to reduce false-positive self-collisions
-  collision_mesh_shrink: 0.97
-  # Parent-child adjacency pairs to ignore in self-collision (URDF link names)
-  allowed_collision_links:
-    - [meca_base_link, meca_axis_1_link]
-    - [meca_axis_1_link, meca_axis_2_link]
-    - [meca_axis_2_link, meca_axis_3_link]
-    - [meca_axis_3_link, meca_axis_4_link]
-    - [meca_axis_4_link, meca_axis_5_link]
-    - [meca_axis_5_link, meca_axis_6_link]
-    - [meca_axis_6_link, meca_gripper_link]
-    - [meca_gripper_link, meca_gripper_finger1]
-    - [meca_gripper_link, meca_gripper_finger2]
+# Defaults applied to every robot unless overridden below
+defaults:
+  control:
+    planner: RRTConnect
+    planner_timeout: 1.0
+    planner_resolution: 0.02
+    planner_max_retry: 10
+    cartesian_waypoints: 200
+    strict_cartesian: false
+    # World-collision options
+    min_clearance_m: 0.02  # 2cm buffer via FCL distance (if compiled)
+    # Pairs involving robots and/or objects that should ignore collision
+    world_allowed_pairs:
+      - ["TX2_60_1/tool0", "obj:table1"]    # e.g., resting contact
+      - ["UR5e_1/tool0", "obj:table1"]
+      - ["MECA500_1/meca_gripper_link", "obj:table1"]
+
+robots:
+  - name: MECA500_1
+    urdf: "assets/meca500/meca.urdf"
+    pose: {position: [0.5, -0.5, 0.0], rpy: [0, 0, 0]}
+    fixed_base: true
+    initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
+    end_effector_link: meca_axis_6_link
+    control:
+      joint_speed_limit: 0.5
+      cartesian_speed_limit: 0.1
+      default_tcp: [0, 0, 0, 1, 0, 0, 0]
+      strict_cartesian: true
+      collision_check: true
+      ccd_substeps: 6
+      ground_plane_z: 0.0
+      # Slightly shrink all collision meshes to reduce false-positive self-collisions
+      collision_mesh_shrink: 0.97
+      # Parent-child adjacency pairs to ignore in self-collision (URDF link names)
+      allowed_collision_links:
+        - [meca_base_link, meca_axis_1_link]
+        - [meca_axis_1_link, meca_axis_2_link]
+        - [meca_axis_2_link, meca_axis_3_link]
+        - [meca_axis_3_link, meca_axis_4_link]
+        - [meca_axis_4_link, meca_axis_5_link]
+        - [meca_axis_5_link, meca_axis_6_link]
+        - [meca_axis_6_link, meca_gripper_link]
+        - [meca_gripper_link, meca_gripper_finger1]
+        - [meca_gripper_link, meca_gripper_finger2]
