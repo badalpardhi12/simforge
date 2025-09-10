@@ -7,6 +7,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import trimesh
 
+from .utils import rpy_to_quat_wxyz, quat_wxyz_multiply, quat_wxyz_rotate_vec, quat_wxyz_to_rotation_matrix, to_numpy, safe_set_dofs_position
+
 try:
     import fcl  # python-fcl
 except Exception:  # pragma: no cover
@@ -24,17 +26,6 @@ class CollisionGeom:
     scale: np.ndarray  # (3,)
 
 
-def _to_numpy(x) -> np.ndarray:
-    """Convert tensor or array-like to numpy array."""
-    if hasattr(x, 'detach'):
-        # PyTorch tensor
-        return x.detach().cpu().numpy()
-    elif hasattr(x, 'numpy'):
-        # Other tensor types with .numpy() method
-        return x.numpy()
-    else:
-        # Already numpy or convertible
-        return np.array(x)
 
 
 @dataclass
@@ -50,25 +41,8 @@ class URDFCollisions:
     adjacent_pairs: set[Tuple[str, str]]
 
 
-def _rpy_to_wxyz(r: float, p: float, y: float) -> np.ndarray:
-    cr, sr = np.cos(r/2), np.sin(r/2)
-    cp, sp = np.cos(p/2), np.sin(p/2)
-    cy, sy = np.cos(y/2), np.sin(y/2)
-    return np.array([
-        cy*cp*cr + sy*sp*sr,
-        cy*cp*sr - sy*sp*cr,
-        sy*cp*sr + cy*sp*cr,
-        sy*cp*cr - cy*sp*sr,
-    ], dtype=np.float32)
 
 
-def _wxyz_to_R(q: np.ndarray) -> np.ndarray:
-    w, x, y, z = q
-    return np.array([
-        [1-2*(y*y+z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
-        [2*(x*y + z*w), 1-2*(x*x+z*z), 2*(y*z - x*w)],
-        [2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x*x+y*y)],
-    ], dtype=np.float32)
 
 
 def _read_urdf_collisions(urdf_path: str | Path) -> URDFCollisions:
@@ -107,7 +81,7 @@ def _read_urdf_collisions(urdf_path: str | Path) -> URDFCollisions:
                     ox = np.array([float(x) for x in origin.attrib["xyz"].split()], dtype=np.float32)
                 if "rpy" in origin.attrib:
                     rpy = [float(x) for x in origin.attrib["rpy"].split()]
-                    oq = _rpy_to_wxyz(*rpy)
+                    oq = rpy_to_quat_wxyz(*rpy)
 
             # geometry->mesh
             geom = col.find("geometry")
@@ -222,28 +196,20 @@ class CollisionChecker:
         self.links = valid_links
 
     # --- transforms ---
-    @staticmethod
-    def _quat_mul_wxyz(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        w1,x1,y1,z1 = a; w2,x2,y2,z2 = b
-        return np.array([
-            w1*w2 - x1*x2 - y1*y2 - z1*z2,
-            w1*x2 + x1*w2 + y1*z2 - z1*y2,
-            w1*y2 - x1*z2 + y1*w2 + z1*x2,
-            w1*z2 + x1*y2 - y1*x2 + z1*w2], dtype=np.float32)
 
     def _link_pose_w(self, link_name: str) -> Tuple[np.ndarray, np.ndarray]:
         link = self.entity.get_link(link_name)
         # wxyz (ensure CPU numpy even if backend returns torch cuda tensors)
-        pos = _to_numpy(link.get_pos()).astype(np.float32).reshape(3)
-        quat = _to_numpy(link.get_quat()).astype(np.float32).reshape(4)
+        pos = to_numpy(link.get_pos()).astype(np.float32).reshape(3)
+        quat = to_numpy(link.get_quat()).astype(np.float32).reshape(4)
         return pos, quat
 
     def _apply_origin(self, pos_w: np.ndarray, quat_w_wxyz: np.ndarray,
-                      ox: np.ndarray, oq_wxyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+                       ox: np.ndarray, oq_wxyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         # world_T_link * link_T_origin
-        Rw = _wxyz_to_R(quat_w_wxyz)
+        Rw = quat_wxyz_to_rotation_matrix(quat_w_wxyz)
         p = pos_w + Rw @ ox
-        q = self._quat_mul_wxyz(quat_w_wxyz, oq_wxyz)
+        q = quat_wxyz_multiply(quat_w_wxyz, oq_wxyz)
         return p, q
 
     # --- updates & checks ---
@@ -256,11 +222,11 @@ class CollisionChecker:
                 pos_w, quat_w = self._link_pose_w(lname)
             except Exception:
                 continue
-            Rw = _wxyz_to_R(quat_w)
+            Rw = quat_wxyz_to_rotation_matrix(quat_w)
             for obj, geom in zip(objs, self.urdf.links[lname].geoms):
                 # bake the local origin into the object transform
                 p, q = self._apply_origin(pos_w, quat_w, geom.origin_xyz, geom.origin_quat_wxyz)
-                R = _wxyz_to_R(q)
+                R = quat_wxyz_to_rotation_matrix(q)
                 obj.setTransform(fcl.Transform(R.astype(np.float32), p.astype(np.float32)))
 
     # --- diagnostics & dynamic allow-list management ---
@@ -342,7 +308,7 @@ class CollisionChecker:
                 continue
             for geom in lset.geoms:
                 p, q = self._apply_origin(pos_w, quat_w, geom.origin_xyz, geom.origin_quat_wxyz)
-                R = _wxyz_to_R(q)
+                R = quat_wxyz_to_rotation_matrix(q)
                 v_scaled = (geom.vertices * geom.scale[None, :]).astype(np.float32)
                 if self.shrink != 1.0:
                     c = np.mean(v_scaled, axis=0, dtype=np.float32)
@@ -365,23 +331,20 @@ class CollisionChecker:
         Returns (ok, reason)
         """
         # Convert tensor to numpy if needed
-        q_np = _to_numpy(q).astype(np.float32)
-        
+        q_np = to_numpy(q).astype(np.float32)
+
         # Stash and set kinematic pose
         try:
             joints = self.entity.get_joints()
             q_list: List[float] = []
             for j in joints:
-                v = _to_numpy(getattr(j, "qpos", 0.0))
+                v = to_numpy(getattr(j, "qpos", 0.0))
                 v = np.array(v, dtype=np.float32).reshape(-1)
                 q_list.append(float(v[0]))
             qprev = np.array(q_list, dtype=np.float32)
         except Exception:
-            qprev = _to_numpy(q).astype(np.float32)
-        try:
-            self.entity.set_dofs_position(q_np, dofs_idx_local=dofs_idx)
-        except Exception:
-            self.entity.set_dofs_position(q_np, dofs_idx)
+            qprev = to_numpy(q).astype(np.float32)
+        safe_set_dofs_position(self.entity, q_np, dofs_idx)
 
         # Update collision object transforms from current link poses
         self._update_world_transforms()
@@ -391,26 +354,17 @@ class CollisionChecker:
             hits = self._check_self()
             if hits:
                 # Restore and report
-                try:
-                    self.entity.set_dofs_position(qprev, dofs_idx_local=dofs_idx)
-                except Exception:
-                    self.entity.set_dofs_position(qprev, dofs_idx)
+                safe_set_dofs_position(self.entity, qprev, dofs_idx)
                 return False, f"self_collision:{hits[0][0]}-{hits[0][1]}"
 
         # Plane collision
         gviol = self._check_plane()
         if gviol:
-            try:
-                self.entity.set_dofs_position(qprev, dofs_idx_local=dofs_idx)
-            except Exception:
-                self.entity.set_dofs_position(qprev, dofs_idx)
+            safe_set_dofs_position(self.entity, qprev, dofs_idx)
             return False, f"ground_collision:{gviol[0]}"
 
         # Restore original pose
-        try:
-            self.entity.set_dofs_position(qprev, dofs_idx_local=dofs_idx)
-        except Exception:
-            self.entity.set_dofs_position(qprev, dofs_idx)
+        safe_set_dofs_position(self.entity, qprev, dofs_idx)
 
         return True, ""
 
@@ -430,8 +384,8 @@ class CollisionChecker:
             stride = max(1, n // 30)  # ~30 samples max
 
         for i in range(0, n-1, stride):
-            a = _to_numpy(waypoints[i]).astype(np.float32)
-            b = _to_numpy(waypoints[min(i+stride, n-1)]).astype(np.float32)
+            a = to_numpy(waypoints[i]).astype(np.float32)
+            b = to_numpy(waypoints[min(i+stride, n-1)]).astype(np.float32)
             # check a->b in 'substeps' straight-line joint increments
             for s in range(substeps + 1):
                 if max_time_s is not None and (time.perf_counter() - start) > max_time_s:
@@ -450,7 +404,7 @@ class CollisionChecker:
 from typing import Set
 
 def _rpy_deg_to_wxyz(r: float, p: float, y: float) -> np.ndarray:
-    return _rpy_to_wxyz(np.deg2rad(r), np.deg2rad(p), np.deg2rad(y))
+    return rpy_to_quat_wxyz(np.deg2rad(r), np.deg2rad(p), np.deg2rad(y))
 
 class CollisionWorld:
     """
@@ -495,7 +449,7 @@ class CollisionWorld:
         sx, sy, sz = [float(abs(v)) for v in size_xyz]
         bx = fcl.Box(sx, sy, sz)
         q = _rpy_deg_to_wxyz(*rpy_deg_w)
-        R = _wxyz_to_R(q).astype(np.float32)
+        R = quat_wxyz_to_rotation_matrix(q).astype(np.float32)
         p = np.array(pos_w, dtype=np.float32).reshape(3)
         tf = fcl.Transform(R, p)
         self._static_objs[str(name)] = fcl.CollisionObject(bx, tf)
@@ -515,24 +469,18 @@ class CollisionWorld:
         # capture previous
         try:
             joints = ent.get_joints()
-            qprev = np.array([float(getattr(j, "qpos", 0.0)) for j in joints], dtype=np.float32)
+            qprev = np.array([float(to_numpy(getattr(j, "qpos", 0.0))) for j in joints], dtype=np.float32)
         except Exception:
             qprev = None
         # set new
-        try:
-            ent.set_dofs_position(q, dofs_idx_local=dofs_idx)
-        except Exception:
-            ent.set_dofs_position(q, dofs_idx)
+        safe_set_dofs_position(ent, q, dofs_idx)
         return qprev
 
     def _restore_robot_q(self, robot: str, qprev: Optional[np.ndarray], dofs_idx):
         if qprev is None:
             return
         ent = self._robots[robot].entity
-        try:
-            ent.set_dofs_position(qprev, dofs_idx_local=dofs_idx)
-        except Exception:
-            ent.set_dofs_position(qprev, dofs_idx)
+        safe_set_dofs_position(ent, qprev, dofs_idx)
 
     # --- pairwise helpers ---
     def _pairs_iter_links(self, robotA: str, robotB: str):
@@ -588,7 +536,7 @@ class CollisionWorld:
             return True, "fcl_unavailable"
 
         # 2) world checks: set q temporarily, update transforms
-        qprev = self._with_robot_q(robot, _to_numpy(q).astype(np.float32), dofs_idx)
+        qprev = self._with_robot_q(robot, to_numpy(q).astype(np.float32), dofs_idx)
         try:
             self._update_all_robot_transforms()
 
@@ -636,8 +584,8 @@ class CollisionWorld:
             stride = max(1, n // 30)
 
         for i in range(0, n - 1, stride):
-            a = _to_numpy(waypoints[i]).astype(np.float32)
-            b = _to_numpy(waypoints[min(i + stride, n - 1)]).astype(np.float32)
+            a = to_numpy(waypoints[i]).astype(np.float32)
+            b = to_numpy(waypoints[min(i + stride, n - 1)]).astype(np.float32)
             for s in range(substeps + 1):
                 if max_time_s is not None and (time.perf_counter() - start) > max_time_s:
                     return True, "time_budget_exhausted", i

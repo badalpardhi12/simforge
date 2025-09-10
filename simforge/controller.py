@@ -23,6 +23,21 @@ class Command:
 
 
 class Controller:
+    """
+    Manages high-level robot control, bridging between the GUI/user input and
+    the simulator back-end. Handles queueing of commands (joint moves, Cartesian plans)
+    and coordinates thread-safe interactions.
+
+    This class provides APIs for:
+    - Joint position control (UI sliders)
+    - Cartesian motion planning and execution
+    - Mode switching (joint vs Cartesian)
+    - Real-time status updates and EE pose feedback
+
+    Args:
+        config: Configuration object
+        debug: Enable debug logging
+    """
     def __init__(self, config: SimforgeConfig, debug: bool = False) -> None:
         self.config = config
         self.sim = Simulator(config, debug=debug)

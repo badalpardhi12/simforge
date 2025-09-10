@@ -13,9 +13,27 @@ from .config import SimforgeConfig, RobotConfig
 from .logging_utils import setup_logging
 from .urdf_utils import parse_joint_limits, select_end_effector_link
 from .collision import CollisionChecker, CollisionWorld
+from .utils import rpy_to_quat_wxyz, quat_wxyz_multiply, quat_wxyz_rotate_vec, quat_wxyz_to_rotation_matrix, to_numpy, safe_set_dofs_position, quat_wxyz_conj, quat_wxyz_normalize
 
 
 class Simulator:
+    """
+    Main simulator class that manages the Genesis scene, robots, collision checking,
+    IK planning, and trajectory execution in real-time.
+
+    This class handles:
+    - Genesis backend initialization (GPU, CPU, or CUDA)
+    - Scene construction from configuration
+    - Robot loading and IK setup
+    - Collision checking with FCL
+    - Cartesian and joint-space path planning
+    - Real-time trajectory execution on a background thread
+    - Thread-safe communication with the GUI and controllers
+
+    Args:
+        config: Configuration object containing scene, robots, and control parameters
+        debug: Enable debug logging
+    """
     def __init__(self, config: SimforgeConfig, debug: bool = False) -> None:
         self.config = config
         self.logger = setup_logging(debug)

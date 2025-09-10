@@ -77,6 +77,16 @@ class ControlConfig:
 
 @dataclass
 class SimforgeConfig:
+    """
+    Top-level configuration container for a Simforge simulation.
+    Combines scene settings, robot definitions, environment objects, and control parameters.
+
+    Attributes:
+        scene: Simulation scene parameters (backend, FPS, gravity)
+        robots: List of robots to load with their URDFs and configurations
+        objects: List of static objects (planes, boxes) in the scene
+        control: Global control settings; can be overridden per robot
+    """
     scene: SceneConfig = field(default_factory=SceneConfig)
     robots: List[RobotConfig] = field(default_factory=list)
     objects: List[ObjectConfig] = field(default_factory=list)
