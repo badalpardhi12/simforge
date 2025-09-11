@@ -45,6 +45,33 @@ class URDFCollisions:
 
 
 
+def _read_urdf_kinematics(urdf_path: str | Path) -> Dict[str, Tuple[str, np.ndarray, np.ndarray]]:
+    """Parses the URDF to get a map of child -> (parent, pos, quat) for all joints."""
+    import xml.etree.ElementTree as ET
+    path = Path(urdf_path)
+    tree = ET.parse(path)
+    root = tree.getroot()
+    
+    kinematics = {}
+    for joint in root.findall("joint"):
+        parent = joint.find("parent").attrib.get("link")
+        child = joint.find("child").attrib.get("link")
+        if not parent or not child:
+            continue
+        
+        ox = np.zeros(3, dtype=np.float32)
+        oq = np.array([1, 0, 0, 0], dtype=np.float32)
+        origin = joint.find("origin")
+        if origin is not None:
+            if "xyz" in origin.attrib:
+                ox = np.array([float(x) for x in origin.attrib["xyz"].split()], dtype=np.float32)
+            if "rpy" in origin.attrib:
+                rpy = [float(x) for x in origin.attrib["rpy"].split()]
+                oq = rpy_to_quat_wxyz(*rpy)
+        kinematics[child] = (parent, ox, oq)
+    return kinematics
+
+
 def _read_urdf_collisions(urdf_path: str | Path) -> URDFCollisions:
     """
     Minimal URDF parser for <collision><geometry><mesh filename=...> with optional
@@ -155,7 +182,8 @@ class CollisionChecker:
         if not self.available:
             self.logger.warning("python-fcl not available; geometric collision checks are disabled")
 
-        self.urdf = _read_urdf_collisions(self.urdf_path)
+        urdf_model = _read_urdf_collisions(self.urdf_path)
+        self.urdf = self._synchronize_collision_model(urdf_model)
 
         # Expand adjacency one hop to reduce wrist false-positives
         adj = set(self.urdf.adjacent_pairs)
@@ -164,23 +192,17 @@ class CollisionChecker:
                 if b == x:
                     self.urdf.adjacent_pairs.add(tuple(sorted((a, y))))
 
-        # Build FCL collision objects per link geometry, but only for links that actually exist on the Genesis entity
+        # Build FCL collision objects per link geometry
+        # Build FCL collision objects per link geometry
         self._objs: Dict[str, List["fcl.CollisionObject"]] = {}
+        self._tool_objs: Dict[str, List[Tuple[str, int]]] = {} # tool_name -> [(link, num_geoms)]
         # Track the filtered, valid link names
         valid_links: List[str] = []
         # Cache collision request to avoid allocation in inner loops
         self._fcl_req = fcl.CollisionRequest(num_max_contacts=1, enable_contact=True) if self.available else None
         if self.available:
             for lname, lset in self.urdf.links.items():
-                # Skip URDF links that the Genesis entity does not expose
-                try:
-                    _ = self.entity.get_link(lname)
-                except Exception:
-                    try:
-                        self.logger.warning("%s: URDF link '%s' not found on Genesis entity; skipping from collision model", self.robot_name, lname)
-                    except Exception:
-                        pass
-                    continue
+                # The synchronized model should only contain links present in the entity
                 objs = []
                 for g in lset.geoms:
                     # Apply URDF scale to vertices
@@ -202,6 +224,84 @@ class CollisionChecker:
                     valid_links.append(lname)
         # Publish filtered link list for downstream loops
         self.links = valid_links
+
+    def _get_genesis_kinematic_tree(self) -> set[str]:
+        """Traverse the Genesis entity to find all existing link names."""
+        try:
+            return {link.name for link in self.entity.links}
+        except Exception as e:
+            self.logger.warning(f"Failed to get links from Genesis entity: {e}")
+            return set()
+
+    def _synchronize_collision_model(self, urdf_model: URDFCollisions) -> URDFCollisions:
+        """
+        Reparents collision geometries from missing links (e.g., fixed joints merged
+        by Genesis) to their first existing ancestor in the simulator's kinematic tree.
+        """
+        sim_links = self._get_genesis_kinematic_tree()
+        if not sim_links:
+            self.logger.error("Could not get any links from the Genesis entity. Collision model will be empty.")
+            return URDFCollisions(links={}, adjacent_pairs=set())
+
+        urdf_kinematics = _read_urdf_kinematics(self.urdf_path)
+        
+        synced_links: Dict[str, LinkCollisionSet] = {}
+
+        for lname, lset in urdf_model.links.items():
+            if lname in sim_links:
+                # This link exists in the simulator, so its geometries are correctly parented.
+                if lname not in synced_links:
+                    synced_links[lname] = LinkCollisionSet(link=lname, geoms=[])
+                synced_links[lname].geoms.extend(lset.geoms)
+                continue
+
+            # This link is missing. Find its closest existing ancestor.
+            self.logger.debug(f"{self.robot_name}: Reparenting geometries from missing link '{lname}'")
+            
+            parent = lname
+            cumulative_pos = np.zeros(3, dtype=np.float32)
+            cumulative_quat = np.array([1, 0, 0, 0], dtype=np.float32)
+            
+            path_to_ancestor = []
+            while parent in urdf_kinematics and parent not in sim_links:
+                parent, p_pos, p_quat = urdf_kinematics[parent]
+                path_to_ancestor.append((p_pos, p_quat))
+
+            if parent not in sim_links:
+                self.logger.warning(f"{self.robot_name}: Could not find a valid simulation parent for missing link '{lname}'. Geometries will be dropped.")
+                continue
+
+            # Calculate the cumulative transform from the ancestor to the original link
+            for p_pos, p_quat in reversed(path_to_ancestor):
+                # Correct composition: T_new = T_cumulative * T_step
+                cumulative_pos = quat_wxyz_rotate_vec(cumulative_quat, p_pos) + cumulative_pos
+                cumulative_quat = quat_wxyz_multiply(cumulative_quat, p_quat)
+
+            # Reparent the geometries
+            if parent not in synced_links:
+                synced_links[parent] = LinkCollisionSet(link=parent, geoms=[])
+
+            for geom in lset.geoms:
+                # Original geometry transform relative to its (missing) link
+                orig_pos = geom.origin_xyz
+                orig_quat = geom.origin_quat_wxyz
+                
+                # New transform relative to the existing ancestor
+                new_pos = quat_wxyz_rotate_vec(cumulative_quat, orig_pos) + cumulative_pos
+                new_quat = quat_wxyz_multiply(cumulative_quat, orig_quat)
+
+                new_geom = CollisionGeom(
+                    link=parent, # Reparented
+                    vertices=geom.vertices,
+                    triangles=geom.triangles,
+                    origin_xyz=new_pos,
+                    origin_quat_wxyz=new_quat,
+                    scale=geom.scale
+                )
+                synced_links[parent].geoms.append(new_geom)
+            self.logger.info(f"{self.robot_name}: Successfully reparented {len(lset.geoms)} geometries from '{lname}' to '{parent}'")
+
+        return URDFCollisions(links=synced_links, adjacent_pairs=urdf_model.adjacent_pairs)
 
     # --- transforms ---
 
@@ -225,17 +325,17 @@ class CollisionChecker:
         if not self.available:
             return
 
-        for lname, objs in self._objs.items():
+        for lname, lset in self.urdf.links.items():
             try:
                 pos_w, quat_w = self._link_pose_w(lname)
+                objs = self._objs.get(lname, [])
+                for obj, geom in zip(objs, lset.geoms):
+                    # bake the local origin into the object transform
+                    p, q = self._apply_origin(pos_w, quat_w, geom.origin_xyz, geom.origin_quat_wxyz)
+                    R = quat_wxyz_to_rotation_matrix(q)
+                    obj.setTransform(fcl.Transform(R.astype(np.float32), p.astype(np.float32)))
             except Exception:
                 continue
-            Rw = quat_wxyz_to_rotation_matrix(quat_w)
-            for obj, geom in zip(objs, self.urdf.links[lname].geoms):
-                # bake the local origin into the object transform
-                p, q = self._apply_origin(pos_w, quat_w, geom.origin_xyz, geom.origin_quat_wxyz)
-                R = quat_wxyz_to_rotation_matrix(q)
-                obj.setTransform(fcl.Transform(R.astype(np.float32), p.astype(np.float32)))
 
     # --- diagnostics & dynamic allow-list management ---
     def list_self_collisions_now(self) -> List[tuple[str, str]]:
@@ -273,6 +373,81 @@ class CollisionChecker:
     def add_allowed_pairs(self, pairs: List[tuple[str, str]]):
         for p in pairs:
             self.allowed_pairs.add(tuple(sorted(p)))
+
+    def add_tool(self, tool_name: str, tool_urdf_path: str | Path, parent_link: str):
+        if not self.available:
+            return
+        if tool_name in self._tool_objs:
+            self.logger.warning(f"Tool '{tool_name}' is already attached. Please remove it first.")
+            return
+
+        tool_model = _read_urdf_collisions(tool_urdf_path)
+        tool_kinematics = _read_urdf_kinematics(tool_urdf_path)
+        
+        # Find the transform from the tool's base to the parent_link of the robot
+        # For now, assume tool base is attached directly to parent_link with identity transform.
+        # A more robust solution would parse the fixed joint from robot->tool.
+        
+        self._tool_objs[tool_name] = []
+        for lname, lset in tool_model.links.items():
+            # For each geometry in the tool, create a collision object and attach it to the parent_link
+            if parent_link not in self._objs:
+                self._objs[parent_link] = []
+            if parent_link not in self.urdf.links:
+                self.urdf.links[parent_link] = LinkCollisionSet(link=parent_link, geoms=[])
+
+            num_geoms_added = 0
+            for g in lset.geoms:
+                v_scaled = (g.vertices * g.scale[None, :]).astype(np.float32)
+                if self.shrink != 1.0:
+                    c = np.mean(v_scaled, axis=0, dtype=np.float32)
+                    v = (c + self.shrink * (v_scaled - c)).astype(np.float32)
+                else:
+                    v = v_scaled
+                
+                m = fcl.BVHModel()
+                m.beginModel(v.shape[0], g.triangles.shape[0])
+                m.addSubModel(v, g.triangles.astype(np.int32))
+                m.endModel()
+                tf = fcl.Transform(np.eye(3, dtype=np.float32), np.zeros(3, dtype=np.float32))
+                
+                # The geometry's origin is relative to the tool link. We need to transform it
+                # to be relative to the robot's parent_link.
+                # For now, we assume the tool is attached at the parent_link's origin.
+                # This is a simplification; a full implementation would trace the kinematic chain.
+                new_geom = CollisionGeom(
+                    link=parent_link, # Attach to the robot's link
+                    vertices=g.vertices,
+                    triangles=g.triangles,
+                    origin_xyz=g.origin_xyz,
+                    origin_quat_wxyz=g.origin_quat_wxyz,
+                    scale=g.scale
+                )
+                
+                self.urdf.links[parent_link].geoms.append(new_geom)
+                self._objs[parent_link].append(fcl.CollisionObject(m, tf))
+                num_geoms_added += 1
+            
+            if num_geoms_added > 0:
+                self._tool_objs[tool_name].append((parent_link, num_geoms_added))
+
+        self.logger.info(f"Attached tool '{tool_name}' to link '{parent_link}' with {sum(n for _, n in self._tool_objs[tool_name])} collision geometries.")
+
+    def remove_tool(self, tool_name: str):
+        if tool_name not in self._tool_objs:
+            return
+
+        for link_name, num_geoms in self._tool_objs[tool_name]:
+            if link_name in self._objs and len(self._objs[link_name]) >= num_geoms:
+                # Remove the last N objects/geometries that were added for this tool
+                self._objs[link_name] = self._objs[link_name][:-num_geoms]
+                self.urdf.links[link_name].geoms = self.urdf.links[link_name].geoms[:-num_geoms]
+                if not self._objs[link_name]:
+                    del self._objs[link_name]
+                    del self.urdf.links[link_name]
+
+        del self._tool_objs[tool_name]
+        self.logger.info(f"Removed tool '{tool_name}'.")
 
     def _check_self(self) -> List[Tuple[str, str]]:
         if not self.available:

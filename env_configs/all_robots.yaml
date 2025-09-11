@@ -70,6 +70,7 @@ robots:
     fixed_base: true
     initial_joint_positions: [0, -90, 0, -90, 0, 0]  # degrees
     end_effector_link: wrist_3_link
+    # end_effector: ../assets/tools/simple_tool.urdf
     control:
       planner: RRTConnect
       planner_timeout: 1.0

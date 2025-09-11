@@ -142,3 +142,31 @@ def quat_wxyz_to_rotvec(q: np.ndarray) -> np.ndarray:
     angle = 2.0 * np.arctan2(s, w)
     axis = np.array([x, y, z], dtype=np.float32) / s
     return axis * angle
+
+
+def rotation_matrix_to_quat_wxyz(m: np.ndarray) -> np.ndarray:
+    """Convert rotation matrix to quaternion in WXYZ format."""
+    w = 0.5 * np.sqrt(1.0 + m[0, 0] + m[1, 1] + m[2, 2])
+    x = (m[2, 1] - m[1, 2]) / (4.0 * w)
+    y = (m[0, 2] - m[2, 0]) / (4.0 * w)
+    z = (m[1, 0] - m[0, 1]) / (4.0 * w)
+    return np.array([w, x, y, z], dtype=np.float32)
+
+
+def quat_wxyz_to_xyzw(q_wxyz: np.ndarray) -> np.ndarray:
+    """Convert quaternion from WXYZ to XYZW format."""
+    return np.array([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]], dtype=np.float32)
+
+def rotation_matrix_to_euler_rpy(m: np.ndarray) -> np.ndarray:
+    """Convert rotation matrix to Euler angles (roll, pitch, yaw)."""
+    sy = np.sqrt(m[0,0] * m[0,0] +  m[1,0] * m[1,0])
+    singular = sy < 1e-6
+    if not singular:
+        x = np.arctan2(m[2,1] , m[2,2])
+        y = np.arctan2(-m[2,0], sy)
+        z = np.arctan2(m[1,0], m[0,0])
+    else :
+        x = np.arctan2(-m[1,2], m[1,1])
+        y = np.arctan2(-m[2,0], sy)
+        z = 0
+    return np.array([x, y, z], dtype=np.float32)

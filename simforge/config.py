@@ -20,6 +20,7 @@ class SceneConfig(BaseModel):
 class RobotConfig(BaseModel):
     name: str
     urdf: str
+    _raw_urdf_path: Optional[str] = None  # Internal use: path before resolving includes
     base_position: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     base_orientation: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     fixed_base: bool = True
@@ -28,6 +29,7 @@ class RobotConfig(BaseModel):
     kv: Optional[List[float]] = None
     force_limits: Optional[Tuple[List[float], List[float]]] = None
     end_effector_link: Optional[str] = None
+    end_effector: Optional[str] = None # urdf or yaml file for the tool
     # Optional: per-robot control overrides (merged over globals by control_for)
     control: Optional["ControlConfig"] = None
 
@@ -139,21 +141,28 @@ class SimforgeConfig(BaseModel):
                 inc_path = (path.parent / entry).resolve()
                 inc_data = yaml.safe_load(inc_path.read_text()) or {}
                 if not inc_data.get("robots"):
-                    raise ValueError(
-                        f"Included file {inc_path} has no 'robots' list"
-                    )
-                processed_robots.append(inc_data["robots"][0])
+                    raise ValueError(f"Included file {inc_path} has no 'robots' list")
+                robot_config = inc_data["robots"][0]
+                if "end_effector" in robot_config:
+                    robot_config["end_effector"] = str((inc_path.parent / robot_config["end_effector"]).resolve())
+                processed_robots.append(robot_config)
+            
             elif isinstance(entry, dict) and "include" in entry:
                 inc_path = (path.parent / str(entry["include"])).resolve()
                 inc_data = yaml.safe_load(inc_path.read_text()) or {}
                 if not inc_data.get("robots"):
-                    raise ValueError(
-                        f"Included file {inc_path} has no 'robots' list"
-                    )
+                    raise ValueError(f"Included file {inc_path} has no 'robots' list")
+                
                 base_map = inc_data["robots"][0]
                 overlay = {k: v for k, v in entry.items() if k != "include"}
+
+                # Resolve end_effector path if present in the overlay
+                if "end_effector" in overlay:
+                    overlay["end_effector"] = str((path.parent / overlay["end_effector"]).resolve())
+                
                 base_map.update(overlay)
                 processed_robots.append(base_map)
+
             else:
                 # Handle 'pose' key mapping to base_position/orientation
                 if 'pose' in entry and isinstance(entry['pose'], dict):
@@ -162,7 +171,19 @@ class SimforgeConfig(BaseModel):
                         entry['base_position'] = pose_data['position']
                     if 'rpy' in pose_data:
                         entry['base_orientation'] = pose_data['rpy']
-                processed_robots.append(entry)
-        data["robots"] = processed_robots
+                
+                # Resolve end_effector path if present directly in the entry
+                if 'end_effector' in entry:
+                    entry['end_effector'] = str((path.parent / entry['end_effector']).resolve())
+                
+                if 'urdf' in entry:
+                    entry['_raw_urdf_path'] = entry['urdf'] # Keep original path for non-relative loading
 
-        return SimforgeConfig.model_validate(data)
+                processed_robots.append(entry)
+
+        # Ensure that the processed robot configurations are valid RobotConfig objects
+        # before adding them to the final config. This ensures correct data types.
+        data["robots"] = [RobotConfig.model_validate(r) for r in processed_robots]
+        config = SimforgeConfig.model_validate(data)
+        config.robots = data["robots"]
+        return config

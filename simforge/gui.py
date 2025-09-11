@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import numpy as np
 import threading
 import time
 import tkinter as tk
@@ -151,8 +152,8 @@ class SimforgeApp:
         current_targets = self.controller.get_joint_targets_deg(rob.name) or (rob.initial_joint_positions or [])
         dof_count = max(len(current_targets), len(joints) if joints else 6)
         for idx in range(dof_count):
-            lower = math.degrees(joints[idx].lower) if idx < len(joints) and joints[idx].lower is not None else -180
-            upper = math.degrees(joints[idx].upper) if idx < len(joints) and joints[idx].upper is not None else 180
+            lower = math.degrees(joints[idx]['lower']) if idx < len(joints) and joints[idx]['lower'] is not None else -180
+            upper = math.degrees(joints[idx]['upper']) if idx < len(joints) and joints[idx]['upper'] is not None else 180
             val = float(current_targets[idx]) if idx < len(current_targets) else 0.0
 
             row = ttk.Frame(self.content)
@@ -338,22 +339,39 @@ class SimforgeApp:
         except Exception:
             # Skip status updates during shutdown
             pass
-        # If last Cartesian failed, reset sliders to actual EE pose
-        if self.mode_var.get() == ControlMode.CARTESIAN:
-            robot = self.robot_var.get()
-            st = self.controller.get_last_cartesian_status(robot)
-            if st and st.startswith("cartesian_failed"):
-                pose = self.controller.get_ee_pose_xyzrpy(robot)
-                if pose and hasattr(self, 'cart_vars'):
-                    x,y,z, r,p,yw = pose
-                    self.cart_vars['x'].set(x)
-                    self.cart_vars['y'].set(y)
-                    self.cart_vars['z'].set(z)
-                    self.cart_vars['roll'].set(r)
-                    self.cart_vars['pitch'].set(p)
-                    self.cart_vars['yaw'].set(yw)
-                # clear last event
-                self.controller.clear_last_cartesian_status(robot)
+        # If last Cartesian failed, reset UI to actual state
+        robot = self.robot_var.get()
+        st = self.controller.get_last_cartesian_status(robot)
+        if st and st.startswith("cartesian_failed"):
+            # Prefer reverting Cartesian sliders to the last successfully executed target
+            if self.mode_var.get() == ControlMode.CARTESIAN and hasattr(self, 'cart_vars'):
+                last_ok = self.controller.get_last_cartesian_target(robot)
+                if last_ok and len(last_ok) == 6:
+                    x,y,z,r,p,yw = last_ok
+                else:
+                    # Fallback to current EE pose
+                    pose = self.controller.get_ee_pose_xyzrpy(robot)
+                    if pose:
+                        x,y,z,r,p,yw = pose
+                    else:
+                        x=y=z=r=p=yw=0.0
+                self.cart_vars['x'].set(x)
+                self.cart_vars['y'].set(y)
+                self.cart_vars['z'].set(z)
+                self.cart_vars['roll'].set(r)
+                self.cart_vars['pitch'].set(p)
+                self.cart_vars['yaw'].set(yw)
+            # Update joint slider widget values (if visible)
+            if self.mode_var.get() == ControlMode.JOINT and hasattr(self, 'joint_sliders'):
+                try:
+                    qrad = self.controller.sim.get_joint_positions_rad(robot)
+                    if qrad and len(self.joint_sliders) == len(qrad):
+                        for i, s in enumerate(self.joint_sliders):
+                            s.set(float(np.rad2deg(qrad[i])))
+                except Exception:
+                    pass
+            # clear last event
+            self.controller.clear_last_cartesian_status(robot)
         self.root.after(200, self._ui_update_loop)
 
 

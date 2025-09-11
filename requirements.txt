@@ -12,3 +12,6 @@ PySide6>=6.6
 
 
 pydantic
+
+ikpy
+pybullet

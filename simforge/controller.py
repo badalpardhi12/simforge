@@ -46,8 +46,10 @@ class Controller:
         self._targets_deg: Dict[str, List[float]] = {}
         for r in self.config.robots:
             self._targets_deg[r.name] = list(r.initial_joint_positions or [])
-        # Per-robot last Cartesian target (to preserve UI state)
-        self._last_cartesian: Dict[str, tuple] = {}
+        # Per-robot last requested Cartesian target (raw request)
+        self._last_cartesian_req: Dict[str, tuple] = {}
+        # Per-robot last successfully accepted/executed Cartesian target
+        self._last_cartesian_ok: Dict[str, tuple] = {}
         self._last_evt: Dict[str, str] = {}
         # connect event sink
         self.sim.set_event_sink(self._on_sim_event)
@@ -122,14 +124,14 @@ class Controller:
     def set_cartesian_target(
         self, robot: str, pose_xyzrpy: tuple, frame: str = "world"
     ):
-        # Basic de-bounce: avoid flooding queue with nearly-identical commands
-        last = self._last_cartesian.get(robot)
+        # Basic de-bounce on last requested command
+        last = self._last_cartesian_req.get(robot)
         if last:
             dx = sum(abs(a - b) for a, b in zip(last[:3], pose_xyzrpy[:3]))
             da = sum(abs(a - b) for a, b in zip(last[3:], pose_xyzrpy[3:]))
             if dx < 1e-3 and da < 1.0:  # <1mm and <1deg aggregate
                 return
-        self._last_cartesian[robot] = pose_xyzrpy
+        self._last_cartesian_req[robot] = pose_xyzrpy
         self._cmd_q.put(commands.CartesianMove(robot, pose_xyzrpy, frame))
         # Explicit debug print so we can see GUI events arriving
         print(
@@ -144,6 +146,20 @@ class Controller:
     def _on_sim_event(self, kind: str, robot: str, info: str):
         if kind.startswith("cartesian_"):
             self._last_evt[robot] = f"{kind}:{info}"
+            # On execution start, promote the last requested pose to 'accepted'
+            if kind == "cartesian_executing":
+                req = self._last_cartesian_req.get(robot)
+                if req is not None:
+                    self._last_cartesian_ok[robot] = req
+            # On failure, synchronize joint slider cache to the robot's actual state
+            if kind == "cartesian_failed":
+                try:
+                    qrad = self.sim.get_joint_positions_rad(robot)
+                    if qrad:
+                        qdeg = [float(np.rad2deg(v)) for v in qrad]
+                        self._targets_deg[robot] = qdeg
+                except Exception:
+                    pass
         elif kind == "shutdown_request":
             # Forward shutdown request to GUI thread
             if hasattr(self, '_shutdown_callback'):
@@ -171,4 +187,5 @@ class Controller:
         return list(self._targets_deg.get(robot, []))
 
     def get_last_cartesian_target(self, robot: str) -> Optional[tuple]:
-        return self._last_cartesian.get(robot)
+        # Prefer last successfully accepted target to initialize UI state
+        return self._last_cartesian_ok.get(robot)
