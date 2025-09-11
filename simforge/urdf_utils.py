@@ -5,8 +5,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
-from ikpy.chain import Chain
-from ikpy.urdf import URDF
+# ikpy removed; keep lightweight helpers only
 
 
 def parse_joint_limits(urdf_path: str | Path) -> list[dict]:
@@ -34,81 +33,16 @@ def select_end_effector_link(urdf_path: str | Path) -> Optional[str]:
 
 
 def get_transform_to_link(urdf_path: str, link_name: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Deprecated: ikpy removed. Return None so caller can fall back to flange.
+
+    In future, implement with Pinocchio if needed.
     """
-    Calculates the transformation from the base of the URDF to the specified link.
-    Returns a tuple of (position, quaternion_wxyz).
-    """
-    try:
-        # Use ikpy to parse the URDF and find the transform
-        temp_chain = Chain.from_urdf_file(urdf_path, last_link_vector=[0, 0, 1])
-        # Find the index of the link
-        link_names = [link.name for link in temp_chain.links]
-        if link_name not in link_names:
-            return None
-        
-        # Get the transformation matrix
-        # Create a zero-joint configuration, as we only care about the static transform
-        q_zero = np.zeros(len(temp_chain.links))
-        matrix = temp_chain.forward_kinematics(q_zero, full_kinematics=True)[link_names.index(link_name)]
+    return None
 
-        pos = matrix[:3, 3]
-        # Convert rotation matrix to quaternion
-        # (Assuming a standard conversion, could use a library like scipy)
-        # For simplicity, we'll use a basic conversion here
-        from .utils import rotation_matrix_to_quat_wxyz
-        quat = rotation_matrix_to_quat_wxyz(matrix[:3, :3])
-        return pos, quat
-    except Exception:
-        return None
-
-def merge_urdfs(robot_urdf_path: str, tool_urdf_path: str, attach_to_link: str, new_urdf_path: str):
-    """
-    Merges a tool URDF into a robot URDF and saves it to a new file.
-    The tool is attached to the specified link with a fixed joint.
-    """
-    robot_tree = ET.parse(robot_urdf_path)
-    robot_root = robot_tree.getroot()
-    tool_tree = ET.parse(tool_urdf_path)
-    tool_root = tool_tree.getroot()
-
-    # Get the base link of the tool
-    tool_base_link_element = tool_root.find("link")
-    if tool_base_link_element is None:
-        raise ValueError("Tool URDF must have at least one link.")
-    tool_base_link = tool_base_link_element.get("name")
-
-    # Add all links and joints from the tool to the robot
-    for link in tool_root.findall("link"):
-        robot_root.append(link)
-    for joint in tool_root.findall("joint"):
-        robot_root.append(joint)
-
-    # Create a new fixed joint to attach the tool
-    attachment_joint = ET.Element("joint", name=f"robot_tool_attachment_joint", type="fixed")
-    ET.SubElement(attachment_joint, "parent", link=attach_to_link)
-    ET.SubElement(attachment_joint, "child", link=tool_base_link)
-    ET.SubElement(attachment_joint, "origin", xyz="0 0 0", rpy="0 0 0")
-    
-    robot_root.append(attachment_joint)
-
-    # Write the merged URDF to a new file
-    robot_tree.write(new_urdf_path)
+def merge_urdfs(*args, **kwargs):
+    """Deprecated placeholder: ikpy-based URDF merge removed."""
+    raise NotImplementedError("URDF merge is not supported in this build.")
 
 
-def get_urdf_root_link_name(urdf_path: str | Path) -> Optional[str]:
-    """
-    Returns the root/base link name of a URDF by finding a link that is never a child of any joint.
-    """
-    try:
-        tree = ET.parse(str(urdf_path))
-        root = tree.getroot()
-        links = {link.get("name") for link in root.findall("link")}
-        children = {joint.find("child").attrib.get("link") for joint in root.findall("joint") if joint.find("child") is not None}
-        bases = [l for l in links if l not in children]
-        if bases:
-            return bases[0]
-        # Fallback to first link element
-        first_link = root.find("link")
-        return first_link.get("name") if first_link is not None else None
-    except Exception:
-        return None
+def get_urdf_root_link_name(*args, **kwargs) -> Optional[str]:
+    return None

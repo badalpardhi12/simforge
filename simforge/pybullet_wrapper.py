@@ -16,8 +16,7 @@ except Exception:
 
 # Suppress PyBullet warnings about missing inertial data
 warnings.filterwarnings("ignore", category=UserWarning, module="pybullet")
-# Suppress ikpy warnings about fixed links
-warnings.filterwarnings("ignore", message="Link .* is of type 'fixed' but set as active")
+# Reserved for prior solvers; no ikpy used now
 
 class PybulletPlanner:
     """A motion planner using OMPL with PyBullet for collision detection."""
