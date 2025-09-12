@@ -3,12 +3,11 @@ genesis-world>=0.3.3
 numpy>=1.24
 PyYAML>=6.0
 
-# Optional: install PyTorch manually per your backend (CUDA/MPS/CPU)
-# torch
+# Install PyTorch manually per your backend (CUDA/MPS/CPU)
 
-# Optional planning and Qt GUI extras
+# Optional planning and wxPython GUI extras
 ompl>=1.6
-PySide6>=6.6
+wxpython>=4.1
 
 
 pydantic

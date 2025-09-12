@@ -42,17 +42,9 @@ robots:
     end_effector_link: link_6
     # Either 'control' or legacy 'planning' keys are accepted for overrides:
     control:
-      planner: RRTConnect
-      planner_timeout: 1.0
-      planner_resolution: 0.02
-      planner_max_retry: 10
-      cartesian_waypoints: 200
-      joint_speed_limit: 0.5
       cartesian_speed_limit: 0.1
       default_tcp: [0, 0, 0, 1, 0, 0, 0]
-      strict_cartesian: true
       collision_check: true
-      ccd_substeps: 6
       ground_plane_z: 0.0
       # Slightly shrink all collision meshes to reduce false-positive self-collisions
       collision_mesh_shrink: 0.97
@@ -72,17 +64,9 @@ robots:
     end_effector_link: wrist_3_link
     # end_effector: ../assets/tools/simple_tool.urdf
     control:
-      planner: RRTConnect
-      planner_timeout: 1.0
-      planner_resolution: 0.02
-      planner_max_retry: 10
-      cartesian_waypoints: 200
-      joint_speed_limit: 0.5
       cartesian_speed_limit: 0.1
       default_tcp: [0, 0, 0, 1, 0, 0, 0]
-      strict_cartesian: true
       collision_check: true
-      ccd_substeps: 6
       ground_plane_z: 0.0
       # Slightly shrink all collision meshes to reduce false-positive self-collisions
       collision_mesh_shrink: 0.97
@@ -101,17 +85,9 @@ robots:
     initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
     end_effector_link: meca_axis_6_link
     control:
-      planner: RRTConnect
-      planner_timeout: 1.0
-      planner_resolution: 0.02
-      planner_max_retry: 10
-      cartesian_waypoints: 200
-      joint_speed_limit: 0.5
       cartesian_speed_limit: 0.1
       default_tcp: [0, 0, 0, 1, 0, 0, 0]
-      strict_cartesian: true
       collision_check: true
-      ccd_substeps: 6
       ground_plane_z: 0.0
       # Slightly shrink all collision meshes to reduce false-positive self-collisions
       collision_mesh_shrink: 0.97

@@ -8,7 +8,7 @@ scene:
 objects:
   - type: "plane"
     position: [0, 0, 0]
-    size: [5, 5]
+    size: [5, 5, 0.1]
   - type: "box"
     name: table1
     position: [-1.0, 0.0, 0.38]

@@ -29,7 +29,11 @@ class ColorFormatter(logging.Formatter):
         # Color only the levelname portion for readability
         color = _COLORS.get(record.levelno)
         if color and _stream_supports_color():
-            msg = msg.replace(record.levelname, f"{color}{record.levelname}{_RESET}", 1)
+            msg = msg.replace(
+                record.levelname, 
+                f"{color}{record.levelname}{_RESET}", 
+                1
+            )
         return msg
 
 
@@ -54,14 +58,15 @@ def setup_logging(debug: bool = False) -> logging.Logger:
     else:
         # Update formatter debug flag on existing handlers
         for h in root.handlers:
-            if isinstance(h.formatter, ColorFormatter):  # type: ignore[attr-defined]
+            if isinstance(h.formatter, ColorFormatter):
                 h.setFormatter(ColorFormatter(debug=debug))
 
     root.setLevel(level)
 
     # Keep Genesis' own console formatting, just reduce its verbosity and avoid propagation
     g = logging.getLogger("genesis")
-    g.setLevel(logging.INFO if debug else logging.WARNING)
+    # Force WARNING to suppress high-frequency internal logs even in debug mode
+    g.setLevel(logging.WARNING)
     g.propagate = False
     logging.getLogger("OpenGL").setLevel(logging.WARNING)
 
