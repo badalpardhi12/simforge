@@ -1,4 +1,3 @@
-import pytest
 from unittest.mock import Mock, patch
 from simforge.genesis_renderer import GenesisRenderer
 

@@ -1,5 +1,4 @@
-import pytest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 from simforge.movement_controller import MovementController, ControlMode
 from simforge.config_reader import SimforgeConfig, RobotConfig, SceneConfig
 

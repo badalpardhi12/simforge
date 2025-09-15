@@ -5,7 +5,7 @@ Clean implementation without legacy baggage.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 import yaml
 from pydantic import BaseModel, Field
 
@@ -19,13 +19,35 @@ class SceneConfig(BaseModel):
 
 
 class ControlConfig(BaseModel):
+    # execution
     joint_speed_limit: float = 1.0
     cartesian_speed_limit: float = 0.1
+    cartesian_units: str = "m"  # "m" or "mm"
+    # planning
+    planner: str = "RRTConnect"
+    planner_timeout: float = 3.0
+    planner_resolution: float = 0.02
+    planner_max_retry: int = 10
+    cartesian_waypoints: int = 200
+    strict_cartesian: bool = False
+    # collision
     collision_check: bool = True
-    planner_timeout: float = 1.0
+    self_collision_check: bool = True  # Allow disabling self-collision specifically
+    min_clearance_m: float = 0.0
+    collision_mesh_shrink: float = 1.0
+    world_allowed_pairs: List[Tuple[str, str]] = Field(default_factory=list)
+    # kinematics limits (fallbacks; prefer Pinocchio limits)
     max_joint_vel: float = 2.0
     max_joint_acc: float = 4.0
+    # ground
+    ground_plane_z: float = 0.0
 
+
+class ToolConfig(BaseModel):
+    urdf: str
+    attach_link: str
+    position: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    orientation_rpy: Tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 class RobotConfig(BaseModel):
     name: str
@@ -36,6 +58,8 @@ class RobotConfig(BaseModel):
     initial_joint_positions: Optional[List[float]] = None
     end_effector_link: Optional[str] = None
     control: Optional[ControlConfig] = None
+    parent: Optional[str] = None  # e.g., "obj:table1" or "robot:UR5e_1:wrist_3_link"
+    tool: Optional[ToolConfig] = None
 
 
 class ObjectConfig(BaseModel):
@@ -67,30 +91,43 @@ class SimforgeConfig(BaseModel):
     def from_yaml(path: str | Path) -> "SimforgeConfig":
         path = Path(path)
         data = yaml.safe_load(path.read_text()) or {}
-        
-        # Process robot includes
+
+        # Merge defaults.control → top-level control + each robot.control if not set
+        defaults = data.get("defaults", {})
+        default_ctrl = defaults.get("control", {}) if isinstance(defaults, dict) else {}
+        if "control" in data:
+            merged_top = {**default_ctrl, **(data["control"] or {})}
+            data["control"] = merged_top
+        elif default_ctrl:
+            data["control"] = default_ctrl
+
         processed_robots = []
         for entry in data.get("robots", []):
             if isinstance(entry, str):
-                # Include from file
                 inc_path = (path.parent / entry).resolve()
                 inc_data = yaml.safe_load(inc_path.read_text()) or {}
                 if "robots" in inc_data:
-                    processed_robots.extend(inc_data["robots"])
-            else:
-                # Support legacy 'pose' key mapping to base_position/base_orientation (rpy)
-                if isinstance(entry, dict) and "pose" in entry:
-                    pose = entry.pop("pose") or {}
-                    pos = pose.get("position")
-                    rpy = pose.get("rpy")
-                    if pos is not None:
-                        entry["base_position"] = tuple(pos)
-                    if rpy is not None:
-                        entry["base_orientation"] = tuple(rpy)
-                processed_robots.append(entry)
-        
+                    for r in inc_data["robots"]:
+                        processed_robots.append(r)
+                continue
+
+            if isinstance(entry, dict) and "pose" in entry:
+                pose = entry.pop("pose") or {}
+                pos = pose.get("position")
+                rpy = pose.get("rpy")
+                if pos is not None:
+                    entry["base_position"] = tuple(pos)
+                if rpy is not None:
+                    entry["base_orientation"] = tuple(rpy)
+            # robot.control merge with defaults.control
+            if default_ctrl:
+                rc = entry.get("control") or {}
+                entry["control"] = {**default_ctrl, **rc}
+
+            processed_robots.append(entry)
+
         data["robots"] = processed_robots
         return SimforgeConfig.model_validate(data)
 
 
-__all__ = ["SimforgeConfig", "RobotConfig", "ControlConfig", "SceneConfig", "ObjectConfig"]
+__all__ = ["SimforgeConfig", "RobotConfig", "ControlConfig", "SceneConfig", "ObjectConfig", "ToolConfig"]

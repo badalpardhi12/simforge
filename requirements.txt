@@ -9,8 +9,9 @@ PyYAML>=6.0
 ompl>=1.6
 wxpython>=4.1
 
-
 pydantic
 
 pybullet
-pin
+pinocchio>=2.6
+python-fcl>=0.7
+trimesh>=3.0

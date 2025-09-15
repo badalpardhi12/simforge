@@ -6,6 +6,7 @@ Compatible with macOS Apple Silicon.
 from __future__ import annotations
 
 import wx
+import numpy as np
 from typing import Dict, List
 
 from .config_reader import SimforgeConfig
@@ -58,12 +59,15 @@ class RobotControlFrame(wx.Frame):
             loading_dlg.Update(100, "Complete!")
             
         except Exception as e:
-            loading_dlg.Destroy()
+            if loading_dlg:
+                loading_dlg.Destroy()
+                loading_dlg = None
             wx.MessageBox(f"Failed to initialize: {e}", "Error", wx.OK | wx.ICON_ERROR)
             self.Destroy()
             return
         finally:
-            loading_dlg.Destroy()
+            if loading_dlg:
+                loading_dlg.Destroy()
         
         # Build GUI
         self._setup_gui()
@@ -159,11 +163,16 @@ class RobotControlFrame(wx.Frame):
         pos_fields = []
         ori_fields = []
         
-        for pos_label, ori_label in labels_and_fields:
+        # Set reasonable default positions based on typical robot workspace
+        # These are in the robot's base frame
+        default_positions = ["0.4", "0.4", "0.4"]  # x, y, z in meters - reachable for most robots
+        default_orientations = ["0.0", "0.0", "0.0"]  # roll, pitch, yaw in degrees
+        
+        for idx, (pos_label, ori_label) in enumerate(labels_and_fields):
             # Position label and field
             pos_lbl = wx.StaticText(tab, label=pos_label)
             pos_lbl.SetMinSize((50, -1))
-            pos_field = wx.TextCtrl(tab, value="0.0", size=(100, -1))
+            pos_field = wx.TextCtrl(tab, value=default_positions[idx], size=(100, -1))
             pos_field.SetFont(wx.Font(9, wx.FONTFAMILY_MODERN, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
             
             # Orientation label and field
@@ -228,11 +237,39 @@ class RobotControlFrame(wx.Frame):
         """Handle Cartesian move command."""
         fields = self.cart_fields[robot_name]
         try:
-            values = [float(field.GetValue()) for field in fields]
+            # Safely parse field values with validation
+            values = []
+            for i, field in enumerate(fields):
+                raw_value = field.GetValue().strip()
+                if not raw_value:
+                    # Use default values for empty fields
+                    default_vals = [0.4, 0.4, 0.4, 0.0, 0.0, 0.0]  # x,y,z,roll,pitch,yaw
+                    values.append(default_vals[i])
+                    self.logger.warning(f"Empty field {i}, using default {default_vals[i]}")
+                else:
+                    try:
+                        val = float(raw_value)
+                        if not np.isfinite(val):
+                            raise ValueError(f"Non-finite value: {val}")
+                        values.append(val)
+                    except ValueError as e:
+                        self.logger.error(f"Invalid value in field {i}: '{raw_value}' - {e}")
+                        wx.MessageBox(
+                            f"Invalid value in field {i}: '{raw_value}'\nPlease enter a valid number.",
+                            "Input Error",
+                            wx.OK | wx.ICON_ERROR
+                        )
+                        return
+            
             position = tuple(values[:3])  # x, y, z
             orientation = tuple(values[3:])  # roll, pitch, yaw
             
-            self.controller.move_cartesian(robot_name, position, orientation)
+            # Additional validation
+            if len(position) != 3 or len(orientation) != 3:
+                raise ValueError(f"Expected 6 values, got {len(values)}")
+            
+            self.controller.move_cartesian(robot_name, position, orientation, frame="base")
+
             self.status_bar.SetStatusText(
                 f"{robot_name} moving to {position} {orientation}"
             )
