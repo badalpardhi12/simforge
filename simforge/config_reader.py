@@ -119,10 +119,12 @@ class SimforgeConfig(BaseModel):
                     entry["base_position"] = tuple(pos)
                 if rpy is not None:
                     entry["base_orientation"] = tuple(rpy)
-            # robot.control merge with defaults.control
-            if default_ctrl:
+            # robot.control merge with defaults.control and global control
+            global_ctrl = data.get("control", {})
+            if default_ctrl or global_ctrl:
                 rc = entry.get("control") or {}
-                entry["control"] = {**default_ctrl, **rc}
+                merged_ctrl = {**default_ctrl, **global_ctrl, **rc}
+                entry["control"] = merged_ctrl
 
             processed_robots.append(entry)
 

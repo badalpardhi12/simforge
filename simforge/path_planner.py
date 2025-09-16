@@ -59,6 +59,9 @@ def ompl_rrt_connect_plan(
         bounds.setHigh(i, float(upper[i]))
     space.setBounds(bounds)
 
+    # Finer resolution so OMPL samples/validates denser along edges
+    space.setLongestValidSegmentFraction(1.0/200.0)   # ~0.5% segments
+
     si = ob.SpaceInformation(space)
 
     def _valid(s: ob.State) -> bool:
@@ -66,6 +69,7 @@ def ompl_rrt_connect_plan(
         return is_state_valid(q)
 
     si.setStateValidityChecker(ob.StateValidityCheckerFn(_valid))
+    si.setStateValidityCheckingResolution(0.005)      # 0.5% of extent
     si.setup()
 
     start = ob.State(space); goal = ob.State(space)
@@ -90,6 +94,12 @@ def ompl_rrt_connect_plan(
 
     states = path_geometric.getStates()
     waypoints = np.array([[s[i] for i in range(dof)] for s in states], dtype=np.float64)
+
+    # Post-check: validate all segments in the RRT path
+    for i in range(len(waypoints) - 1):
+        if not _check_segment_collision_free(waypoints[i], waypoints[i+1], is_state_valid, resolution=20):
+            return None
+
     times = _trap_times(waypoints, max_vel=1.0, max_acc=2.0)  # execution is re-scalable upstream
     return waypoints, times
 
@@ -138,12 +148,32 @@ def cartesian_linear_plan(
         q_next = solve_ik(q_prev, (pos_i, quat_i))
         if q_next is None or not is_state_valid(q_next):
             return None
+            
+        # CRITICAL: Check collision along the segment from q_prev to q_next
+        if not _check_segment_collision_free(q_prev, q_next, is_state_valid):
+            return None
+            
         way_q.append(q_next)
         q_prev = q_next
 
     waypoints = np.stack(way_q, axis=0)
     times = _trap_times(waypoints, max_vel=1.0, max_acc=2.0)
     return waypoints, times
+
+
+def _check_segment_collision_free(
+    q_start: np.ndarray,
+    q_end: np.ndarray,
+    is_state_valid: Callable[[np.ndarray], bool],
+    resolution: int = 10
+) -> bool:
+    """Check if the straight-line path between two configurations is collision-free."""
+    for i in range(1, resolution):
+        alpha = i / (resolution - 1)
+        q_intermediate = (1 - alpha) * q_start + alpha * q_end
+        if not is_state_valid(q_intermediate):
+            return False
+    return True
 
 
 # ---------- Simple joint-space linear planner ----------

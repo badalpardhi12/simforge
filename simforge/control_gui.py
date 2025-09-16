@@ -5,7 +5,13 @@ Compatible with macOS Apple Silicon.
 """
 from __future__ import annotations
 
-import wx
+try:
+    import wx
+    HAS_WX = True
+except ImportError:
+    HAS_WX = False
+    wx = None
+
 import numpy as np
 from typing import Dict, List
 
@@ -17,10 +23,24 @@ from .logging_utils import setup_logging
 JOINT_COUNT = 6
 
 
+def run_gui(config: SimforgeConfig, debug: bool = False) -> None:
+    """Run the GUI application if wxPython is available."""
+    if not HAS_WX:
+        raise ImportError("wxPython is required for GUI functionality. Install with: pip install wxpython")
+
+    app = wx.App()
+    frame = RobotControlFrame(config, debug)
+    frame.Show()
+    app.MainLoop()
+
+
 class RobotControlFrame(wx.Frame):
     """Main GUI frame for robot control."""
     
     def __init__(self, config: SimforgeConfig, debug: bool = False):
+        if not HAS_WX:
+            raise ImportError("wxPython is required for GUI functionality")
+
         super().__init__(
             parent=None, 
             title="Simforge Robot Control", 
@@ -29,8 +49,8 @@ class RobotControlFrame(wx.Frame):
         )
         self.config = config
         self.logger = setup_logging(debug)
-        self.joint_sliders: Dict[str, List[wx.Slider]] = {}
-        self.cart_fields: Dict[str, List[wx.TextCtrl]] = {}
+        self.joint_sliders: Dict[str, List[wx.Slider]] = {}  # type: ignore
+        self.cart_fields: Dict[str, List[wx.TextCtrl]] = {}  # type: ignore
         self._building = True
         self._running = True
         

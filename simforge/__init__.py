@@ -10,7 +10,10 @@ from pathlib import Path
 import logging
 
 from .config_reader import SimforgeConfig
-from .control_gui import run_gui
+try:
+    from .control_gui import run_gui
+except ImportError:
+    run_gui = None
 from .logging_utils import setup_logging
 
 
@@ -82,6 +85,10 @@ def cmd_run(config_path: str, debug: bool) -> None:
     logger = setup_logging(debug)
     cfg = SimforgeConfig.from_yaml(config_path)
     
+    if run_gui is None:
+        logger.error("GUI functionality not available. Install wxPython: pip install wxpython")
+        return
+    
     try:
         run_gui(cfg, debug=debug)
     except KeyboardInterrupt:
@@ -121,9 +128,4 @@ def main() -> None:
 
     args = parser.parse_args()
     args.func(args)
-
-    # Ensure Genesis logger stays quiet
-    g = logging.getLogger("genesis")
-    g.setLevel(logging.WARNING)
-    g.propagate = False
 

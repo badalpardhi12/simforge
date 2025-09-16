@@ -41,7 +41,7 @@ robots:
 
   - name: UR5e_1
     urdf: "assets/ur5e/ur5e.urdf"
-    pose: {position: [0.5, 0.5, 0.0], rpy: [0, 0, 0]}
+    pose: {position: [0.8, 0.8, 0.0], rpy: [0, 0, 0]}
     fixed_base: true
     initial_joint_positions: [0, -90, 0, -90, 0, 0]  # degrees
     end_effector_link: wrist_3_link
@@ -54,7 +54,7 @@ robots:
 
   - name: MECA500_1
     urdf: "assets/meca500/meca.urdf"
-    pose: {position: [0.5, -0.5, 0.0], rpy: [0, 0, 0]}
+    pose: {position: [0.8, -0.8, 0.0], rpy: [0, 0, 0]}
     fixed_base: true
     initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees (safe reach pose)
     end_effector_link: meca_axis_6_link

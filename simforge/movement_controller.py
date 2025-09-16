@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, ALL_COMPLETED
 
 from .config_reader import SimforgeConfig
 from .genesis_renderer import GenesisRenderer
@@ -19,6 +19,12 @@ from .ik_drake import DrakeIKCache, solve_ik_drake, DrakeIKOptions
 from .path_planner import ompl_rrt_connect_plan, cartesian_linear_plan
 from .collision_checker import CollisionChecker
 from .logging_utils import setup_logging
+from .transformations import (
+    rpy_to_quaternion,
+    rpy_to_rotation_matrix,
+    rotation_matrix_to_quaternion,
+    quaternion_multiply
+)
 
 
 class ControlMode(Enum):
@@ -81,6 +87,9 @@ class MovementController:
         # Drake IK caches
         self.drake_caches: Dict[str, DrakeIKCache] = {}
         
+        # Last known good joint states for other robots (to avoid zero fallback)
+        self._last_known_q: Dict[str, np.ndarray] = {}
+        
         # Threading
         self.command_queue: queue.Queue[Command] = queue.Queue()
         self.running = False
@@ -90,6 +99,11 @@ class MovementController:
         self.scene = None
         
         self._initialize_robots()
+        # After building per-robot checkers, register other robots as dynamic obstacles
+        self._register_env_robots()
+        
+        # Log collision checking status
+        self._log_collision_status()
 
     def _get_joint_limits(self, cache) -> Tuple[np.ndarray, np.ndarray]:
         lower = cache.lower
@@ -97,18 +111,80 @@ class MovementController:
         return lower, upper
 
     def _make_state_valid_fn(self, robot_name: str):
-        """Returns callable(q) -> bool using collision checking with FCL+Pinocchio if available."""
+        """World-aware collision validity:
+        - Uses this robot's CollisionChecker (FCL+Pinocchio) for self/world collisions
+        - Injects other robots as dynamic obstacles by updating their link transforms each check
+        """
         cc = self.collision_checkers.get(robot_name)
         mdl = self.pin_models.get(robot_name) if hasattr(self, "pin_models") else None
         dat = self.pin_datas.get(robot_name) if hasattr(self, "pin_datas") else None
 
-        if not (cc and mdl and dat):
-            # No collision checking available; stay permissive
-            return lambda q: True
+        if not (cc and cc.available and mdl and dat):
+            self.logger.warning(f"Collision checking disabled for {robot_name} - missing components")
+            return lambda q: True  # permissive fallback
+
+        # Capture other robots' models and bases once (updated each call for transforms)
+        state_logs = {}  # Fix scope bug - move above the loop
+        others: List[Tuple[str, Any, Any, Tuple[float,float,float], Tuple[float,float,float]]] = []
+        for r in self.config.robots:
+            if r.name == robot_name:
+                continue
+            mdl_o = self.pin_models.get(r.name)
+            dat_o = self.pin_datas.get(r.name)
+            if not (mdl_o and dat_o):
+                self.logger.error(f"Missing Pinocchio model/data for env robot {r.name} in {robot_name}'s checker")
+                continue
+            base_pos = tuple(r.base_position or (0.0, 0.0, 0.0))
+            base_rpy = tuple(r.base_orientation or (0.0, 0.0, 0.0))
+            others.append((r.name, mdl_o, dat_o, base_pos, base_rpy))
+            self.logger.warning(f"Added env robot {r.name} to {robot_name}'s collision checker")
+            state_logs = {}
 
         def _valid(q: np.ndarray) -> bool:
+            # 1) Update other robots' transforms into this checker's env using their current state
+            for name_o, mdl_o, dat_o, base_pos, base_rpy in others:
+                # CRITICAL: Always get the current actual state from Genesis
+                q_o = None
+                entity_o = self.robot_entities.get(name_o)
+                if entity_o is not None:
+                    try:
+                        q_o = self._get_robot_joints(entity_o, prefer_struct=True)
+                        if q_o is not None and len(q_o) > 0 and np.all(np.isfinite(q_o)):
+                            # self.logger.info(f"COLLISION ENV UPDATE: {name_o} at joints {np.rad2deg(q_o)}")
+                            state_logs[name_o] = f"Genesis joints: {np.round(np.rad2deg(q_o),2).tolist()} deg"
+                        else:
+                            q_o = None
+                    except Exception as e:
+                        self.logger.warning(f"Failed to read {name_o} joints from Genesis: {e}")
+                        q_o = None
+                
+                # Fallback to joint targets if Genesis read failed
+                if q_o is None or len(q_o) == 0:
+                    targets_deg = self.joint_targets.get(name_o, [])
+                    if targets_deg:
+                        q_o = np.array([np.deg2rad(d) for d in targets_deg], dtype=np.float64)
+                        self.logger.warning(f"Using {name_o} targets instead of Genesis state: {targets_deg} deg")
+                    else:
+                        # Skip this robot if no state available
+                        self.logger.error(f"No state available for env robot {name_o} - collision checking will be incomplete!")
+                        continue
+
+                # Clamp/pad to model size
+                if q_o.size != mdl_o.nq:
+                    qq = np.zeros(mdl_o.nq, dtype=np.float64)
+                    qq[:min(mdl_o.nq, q_o.size)] = q_o[:min(mdl_o.nq, q_o.size)]
+                    q_o = qq
+                try:
+                    cc.update_env_robot_from_pin(
+                        name_o, mdl_o, dat_o, q_o,
+                        base_position=base_pos,
+                        base_orientation_rpy=base_rpy
+                    )
+                except Exception as e:
+                    self.logger.debug(f"Env robot update failed for {name_o}: {e}")
+
+            # 2) Check candidate for this robot
             q = np.asarray(q, dtype=np.float64).flatten()
-            # Clamp/pad to model nq
             if q.size != mdl.nq:
                 qq = np.zeros(mdl.nq, dtype=np.float64)
                 qq[:min(mdl.nq, q.size)] = q[:min(mdl.nq, q.size)]
@@ -118,9 +194,12 @@ class MovementController:
             try:
                 return not cc.in_collision_from_pin(mdl, dat, q_use)
             except Exception as e:
-                self.logger.debug(f"Collision check error for {robot_name}: {e}")
-                # Fail-open to avoid false negatives blocking motion
-                return True
+                self.logger.warning(f"Collision check error for {robot_name}: {e}")
+                return False  # Fail closed instead of open - reject on collision check errors
+        
+        # log state of other robots
+        for rname, slog in state_logs.items():
+            self.logger.info(f"Env robot {rname} state: {slog}")
 
         return _valid
 
@@ -141,6 +220,21 @@ class MovementController:
                         tuple(obj.size),
                         tuple(obj.position),
                         tuple(obj.orientation_rpy),
+                    ))
+                elif obj.type == "plane":
+                    # Turn plane into a very thin box for collision checking
+                    # Center the box so its TOP face is exactly at ground_plane_z
+                    size = obj.size or [10.0, 10.0, 0.02]  # large XY, thin Z
+                    thickness = float(size[2])
+                    gz = float(ctrl.ground_plane_z)  # per-robot ground level
+                    # center the thin box so its top face is exactly at ground_plane_z
+                    plane_center = list(obj.position or [0.0, 0.0, 0.0])
+                    plane_center[2] = gz - thickness * 0.5
+                    world_boxes.append((
+                        obj.name or "plane",
+                        tuple(size),
+                        tuple(plane_center),
+                        tuple(obj.orientation_rpy or [0.0, 0.0, 0.0]),
                     ))
             world_allowed_pairs = []
             if robot_config.control and robot_config.control.world_allowed_pairs:
@@ -217,6 +311,37 @@ class MovementController:
         if (ctrl.cartesian_units or "m").lower() == "mm":
             return tuple(float(v)/1000.0 for v in pos_xyz)
         return tuple(float(v) for v in pos_xyz)
+
+    def _register_env_robots(self):
+        """Register every robot's geometry as environment obstacles in every other robot's checker."""
+        try:
+            for ra in self.config.robots:
+                cc_a = self.collision_checkers.get(ra.name)
+                if not cc_a:
+                    continue
+                for rb in self.config.robots:
+                    if rb.name == ra.name:
+                        continue
+                    try:
+                        cc_a.register_env_robot(rb.name, rb.urdf)
+                        self.logger.debug(f"Registered env robot '{rb.name}' into checker for '{ra.name}'")
+                    except Exception as e:
+                        self.logger.debug(f"Register env robot '{rb.name}' into '{ra.name}' checker failed: {e}")
+        except Exception as e:
+            self.logger.debug(f"_register_env_robots failed: {e}")
+
+    def _log_collision_status(self):
+        """Log collision checking status for debugging."""
+        for robot_name in self.robot_modes.keys():
+            cc = self.collision_checkers.get(robot_name)
+            if cc and cc.available:
+                env_robots = len(cc.env_robot_geoms)
+                world_objs = len(cc.env_objs)
+                robot_links = len(cc.robot_geoms)
+                self.logger.info(f"Collision checking ON for {robot_name}: "
+                                f"{robot_links} links, {world_objs} world objects, {env_robots} env robots")
+            else:
+                self.logger.warning(f"Collision checking OFF for {robot_name}")
 
     def build_scene(self) -> None:
         """Build the Genesis scene."""
@@ -439,7 +564,7 @@ class MovementController:
         roll, pitch, yaw = [np.deg2rad(x) for x in orientation_deg]
         self.logger.debug(f"RPY in radians: roll={roll}, pitch={pitch}, yaw={yaw}")
         
-        quat_wxyz = self._rpy_to_quaternion(roll, pitch, yaw)
+        quat_wxyz = rpy_to_quaternion(roll, pitch, yaw)
         self.logger.debug(f"Computed quaternion: {quat_wxyz}")
         
         # Validate quaternion magnitude
@@ -455,13 +580,13 @@ class MovementController:
         # If GUI frame == "base", interpret values directly in the robot's base frame (base_link),
         # which we align with Drake's base_frame in the IK cache. Otherwise (world), apply mapping.
         gui_frame = (cmd.frame or "base").lower()
-        R_des_bl = self._rpy_to_rotation_matrix(np.array([roll, pitch, yaw]))
+        R_des_bl = rpy_to_rotation_matrix(roll, pitch, yaw)
 
         if gui_frame == "base":
             # Directly use base frame inputs (no base_link->BASE offset)
             target_pos_base = np.array(pos_world_m, dtype=np.float64)
             R_des_base = R_des_bl
-            target_quat_base = tuple(self._rotation_matrix_to_quaternion(R_des_base))
+            target_quat_base = tuple(rotation_matrix_to_quaternion(R_des_base))
             self.logger.info(f"Base-frame target: {np.round(target_pos_base,4)}")
         else:
             # World-frame input: map world -> base_link -> Drake BASE if needed
@@ -487,14 +612,14 @@ class MovementController:
 
             # Orientation in BASE: R_base = R_base_bl * R_des_bl
             R_des_base = R_base_bl @ R_des_bl
-            target_quat_base = tuple(self._rotation_matrix_to_quaternion(R_des_base))
+            target_quat_base = tuple(rotation_matrix_to_quaternion(R_des_base))
 
             self.logger.info(f"World target: {pos_world_m}, Robot base_link@world: {robot_base_pos}")
             self.logger.info(f"base_link->BASE: R={np.round(R_base_bl,3).tolist()}, t={np.round(t_base_bl,4)}")
             self.logger.info(f"Target in BASE frame: {np.round(target_pos_base,4)}")
 
         # Min-Z guard in BASE (avoid infeasible near-ground wrist attitudes)
-        z_min = float(self.config.control_for(robot_name).ground_plane_z) + 0.08  # 8 cm above ground plane
+        z_min = float(self.config.control_for(robot_name).ground_plane_z) + 0.04  # 4 cm above ground plane
         if target_pos_base[2] < z_min:
             self.logger.warning(f"Clamping target Z from {target_pos_base[2]:.3f}m to {z_min:.3f}m in BASE to avoid near-ground singularities")
             target_pos_base[2] = z_min
@@ -580,8 +705,15 @@ class MovementController:
                 noise = rng.uniform(-0.2, 0.2, size=nq)
                 seeds.append(_clamp_to_limits(base + noise))
         
+        # Force update all robot states before building validity checker
+        self._update_all_robot_states()
+        
         # Build validity checker early so we can accept only collision-free IK goals
         is_valid = self._make_state_valid_fn(robot_name)
+        
+        # Debug: Test validity of current position
+        test_valid = is_valid(q_current)
+        self.logger.debug(f"Current position validity check: {test_valid}")
 
         cache = self.drake_caches[robot_name]
 
@@ -633,6 +765,9 @@ class MovementController:
                 if q_next is None:
                     break
                 q_curr = q_next
+                if not is_valid(q_curr):
+                    last_info = {"reason": "goal_in_collision", "seed_idx": i, "ori_mode": info.get("ori_mode")}
+                    break
                 if i == steps and is_valid(q_curr):
                     q_goal = q_curr
                     break
@@ -685,6 +820,23 @@ class MovementController:
         
         # Build planners in parallel: OMPL RRTConnect (joint-space) + Cartesian linear
         lower, upper = self._get_joint_limits(cache)
+        
+        # Debug joint limits for RRT
+        self.logger.debug(f"Joint limits for {robot_name}: lower={lower}, upper={upper}")
+        self.logger.debug(f"Current q for planning: {q_current}")
+        self.logger.debug(f"Goal q for planning: {q_goal}")
+        
+        # Clamp states to joint limits to prevent RRT bounds violations
+        q_current_clamped = np.clip(q_current, lower, upper)
+        q_goal_clamped = np.clip(q_goal, lower, upper)
+        
+        if not np.allclose(q_current, q_current_clamped, atol=1e-6):
+            self.logger.warning(f"Clamping current q to bounds: {q_current} -> {q_current_clamped}")
+            q_current = q_current_clamped
+            
+        if not np.allclose(q_goal, q_goal_clamped, atol=1e-6):
+            self.logger.warning(f"Clamping goal q to bounds: {q_goal} -> {q_goal_clamped}")
+            q_goal = q_goal_clamped
 
         # If start is invalid, try a tiny upward IK repair to clear surface/adjacent contacts
         if not is_valid(q_current):
@@ -781,18 +933,39 @@ class MovementController:
         with ThreadPoolExecutor(max_workers=2) as ex:
             fut_rrt = ex.submit(plan_rrt)
             fut_lin = ex.submit(plan_cart)
-            done, _ = wait({fut_rrt, fut_lin}, timeout=timeout, return_when=FIRST_COMPLETED)
+            done, _ = wait({fut_rrt, fut_lin}, timeout=timeout, return_when=ALL_COMPLETED)
 
-        result = None
-        for f in (fut_rrt, fut_lin):
-            if f.done():
-                result = f.result()
-                if result is not None:
-                    break
+        # Gather finished plans
+        plans = []
+        if fut_lin.done():
+            p = fut_lin.result()
+            if p is not None:
+                plans.append(("cartesian", *p))
+        if fut_rrt.done():
+            p = fut_rrt.result()
+            if p is not None:
+                plans.append(("rrt", *p))
 
-        if result is None:
-            self.logger.warning(f"Planning failed for {robot_name} within {timeout}s")
+        def _validate_path(way):
+            from simforge.path_planner import _check_segment_collision_free
+            for i in range(len(way)-1):
+                if not _check_segment_collision_free(way[i], way[i+1], is_valid, resolution=20):
+                    return False
+            return True
+
+        # Keep only validated plans
+        valid = [(name, way, t) for (name, way, t) in plans if _validate_path(way)]
+
+        if not valid:
+            self.logger.warning(f"Planning failed or produced colliding paths for {robot_name}")
             return
+
+        # Prefer cartesian if present
+        valid.sort(key=lambda x: 0 if x[0] == "cartesian" else 1)
+        plan_name, waypoints, times = valid[0]
+        self.logger.info(f"Selected {plan_name} plan for {robot_name}")
+        
+        result = (waypoints, times)
 
         waypoints, times = result  # radians + seconds
 
@@ -821,6 +994,18 @@ class MovementController:
                     q = way[-1]
                     self._set_robot_joints(entity, q.tolist(), robot_name)
                     self.active_traj.pop(robot_name, None)
+                    
+                    # Record as last safe state if collision-free
+                    cc = self.collision_checkers.get(robot_name)
+                    mdl = self.pin_models.get(robot_name)
+                    dat = self.pin_datas.get(robot_name)
+                    if cc and mdl and dat:
+                        try:
+                            q_array = np.array(q, dtype=np.float64)
+                            if not cc.in_collision_from_pin(mdl, dat, q_array):
+                                self._last_safe_q[robot_name] = q_array.copy()
+                        except Exception:
+                            pass
                     
                     # Log actual robot state by reading Genesis joints and computing FK
                     cache = self.drake_caches.get(robot_name)
@@ -868,6 +1053,46 @@ class MovementController:
                 q_rad = [np.deg2rad(deg) for deg in targets_deg]
                 self.logger.debug(f"Setting {robot_name} joints: {targets_deg} deg -> {q_rad} rad")
                 self._set_robot_joints(entity, q_rad, robot_name)
+                
+                # Record as last safe state if collision-free
+                cc = self.collision_checkers.get(robot_name)
+                mdl = self.pin_models.get(robot_name)
+                dat = self.pin_datas.get(robot_name)
+                if cc and mdl and dat:
+                    try:
+                        q_array = np.array(q_rad, dtype=np.float64)
+                        if not cc.in_collision_from_pin(mdl, dat, q_array):
+                            self._last_safe_q[robot_name] = q_array.copy()
+                    except Exception:
+                        pass
+                
+        # Update all robot states for collision checking after movement
+        self._update_all_robot_states()
+
+    def reset_to_last_safe(self, robot_name: str):
+        """Reset robot to last known safe configuration."""
+        q = self._last_safe_q.get(robot_name)
+        if q is not None:
+            entity = self.robot_entities.get(robot_name)
+            if entity is not None:
+                self._set_robot_joints(entity, q.tolist(), robot_name)
+                self.logger.info(f"Reset {robot_name} to last safe configuration")
+                return True
+        self.logger.warning(f"No safe configuration available for {robot_name}")
+        return False
+
+    def _update_all_robot_states(self):
+        """Update last known states for all robots by reading from Genesis."""
+        for robot_name in self.robot_entities.keys():
+            entity = self.robot_entities.get(robot_name)
+            if entity:
+                try:
+                    q_current = self._get_robot_joints(entity, prefer_struct=True)
+                    if q_current is not None and len(q_current) > 0 and np.all(np.isfinite(q_current)):
+                        self._last_known_q[robot_name] = np.array(q_current, dtype=np.float64)
+                        self.logger.debug(f"Updated state for {robot_name}: {q_current}")
+                except Exception as e:
+                    self.logger.debug(f"Failed to update state for {robot_name}: {e}")
 
     def _apply_q_to_entity(self, entity, q_rad) -> bool:
         """Best-effort application across Genesis builds; returns True if something applied.
@@ -970,85 +1195,6 @@ class MovementController:
             self.logger.error(f"Failed to read Genesis DOFs: {e}")
             return np.zeros(6, dtype=np.float32)
 
-    def _rpy_to_quaternion(
-        self, roll: float, pitch: float, yaw: float
-    ) -> Tuple[float, float, float, float]:
-        """Convert roll-pitch-yaw to quaternion (w, x, y, z)."""
-        # Pre-compute half angles
-        half_yaw = yaw * 0.5
-        half_pitch = pitch * 0.5
-        half_roll = roll * 0.5
-        
-        cy = np.cos(half_yaw)
-        sy = np.sin(half_yaw)
-        cp = np.cos(half_pitch)
-        sp = np.sin(half_pitch)
-        cr = np.cos(half_roll)
-        sr = np.sin(half_roll)
-        
-        w = cr * cp * cy + sr * sp * sy
-        x = sr * cp * cy - cr * sp * sy
-        y = cr * sp * cy + sr * cp * sy
-        z = cr * cp * sy - sr * sp * cy
-        
-        return (w, x, y, z)
-
-    def _rpy_to_rotation_matrix(self, rpy: np.ndarray) -> np.ndarray:
-        """Convert roll-pitch-yaw to rotation matrix."""
-        roll, pitch, yaw = rpy
-        cr = np.cos(roll)
-        sr = np.sin(roll)
-        cp = np.cos(pitch)
-        sp = np.sin(pitch)
-        cy = np.cos(yaw)
-        sy = np.sin(yaw)
-        
-        return np.array([
-            [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
-            [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
-            [-sp, cp*sr, cp*cr]
-        ])
-
-    def _rotation_matrix_to_quaternion(self, R: np.ndarray) -> np.ndarray:
-        """Convert rotation matrix to quaternion (w, x, y, z)."""
-        trace = np.trace(R)
-        if trace > 0:
-            s = 0.5 / np.sqrt(trace + 1.0)
-            w = 0.25 / s
-            x = (R[2, 1] - R[1, 2]) * s
-            y = (R[0, 2] - R[2, 0]) * s
-            z = (R[1, 0] - R[0, 1]) * s
-        else:
-            if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-                s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
-                w = (R[2, 1] - R[1, 2]) / s
-                x = 0.25 * s
-                y = (R[0, 1] + R[1, 0]) / s
-                z = (R[0, 2] + R[2, 0]) / s
-            elif R[1, 1] > R[2, 2]:
-                s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
-                w = (R[0, 2] - R[2, 0]) / s
-                x = (R[0, 1] + R[1, 0]) / s
-                y = 0.25 * s
-                z = (R[1, 2] + R[2, 1]) / s
-            else:
-                s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
-                w = (R[1, 0] - R[0, 1]) / s
-                x = (R[0, 2] + R[2, 0]) / s
-                y = (R[1, 2] + R[2, 1]) / s
-                z = 0.25 * s
-        return np.array([w, x, y, z])
-
-    def _quaternion_multiply(self, q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-        """Multiply two quaternions (w, x, y, z)."""
-        w1, x1, y1, z1 = q1
-        w2, x2, y2, z2 = q2
-        return np.array([
-            w1*w2 - x1*x2 - y1*y2 - z1*z2,
-            w1*x2 + x1*w2 + y1*z2 - z1*y2,
-            w1*y2 - x1*z2 + y1*w2 + z1*x2,
-            w1*z2 + x1*y2 - y1*x2 + z1*w2
-        ])
 
     # Public API methods
     def set_joint_position(self, robot: str, joint_idx: int, value_deg: float):

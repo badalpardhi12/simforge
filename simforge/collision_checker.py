@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import xml.etree.ElementTree as ET
 
+from .transformations import rpy_to_rotation_matrix
+
 try:
     import fcl
     HAS_FCL = True
@@ -23,16 +25,6 @@ try:
     HAS_PIN = True
 except Exception:
     HAS_PIN = False
-
-
-def _rpy_to_R(roll, pitch, yaw) -> np.ndarray:
-    cr, sr = np.cos(roll), np.sin(roll)
-    cp, sp = np.cos(pitch), np.sin(pitch)
-    cy, sy = np.cos(yaw), np.sin(yaw)
-    return np.array([
-        [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
-        [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
-        [ -sp ,         cp*sr   ,         cp*cr   ]], dtype=np.float64)
 
 
 @dataclass
@@ -68,11 +60,13 @@ class CollisionChecker:
 
         # Robot base pose in WORLD; all world objects will be re-expressed in this BASE frame
         self._base_t = np.array(base_position, dtype=np.float64)
-        self._base_R = _rpy_to_R(*base_orientation_rpy)
+        self._base_R = rpy_to_rotation_matrix(*base_orientation_rpy)
 
         self._shrink = float(collision_mesh_shrink)
         self.robot_geoms: Dict[str, List[_LinkGeom]] = {}
         self.env_objs: Dict[str, fcl.CollisionObject] = {}
+        # External robots registered as dynamic obstacles: name -> (link -> geoms)
+        self.env_robot_geoms: Dict[str, Dict[str, List[_LinkGeom]]] = {}
         self.allowed_link_pairs: Set[Tuple[str, str]] = set()
         self.allowed_world_pairs: Set[Tuple[str, str]] = set()
         self.ground_plane_z = float(ground_plane_z)
@@ -125,7 +119,7 @@ class CollisionChecker:
                     xyz = origin.get("xyz", "0 0 0").split()
                     rpy = origin.get("rpy", "0 0 0").split()
                     t_local = np.array([float(x) for x in xyz], dtype=np.float64)
-                    R_local = _rpy_to_R(*(float(a) for a in rpy))
+                    R_local = rpy_to_rotation_matrix(*(float(a) for a in rpy))
                 else:
                     t_local = np.zeros(3, dtype=np.float64)
                     R_local = np.eye(3)
@@ -185,11 +179,147 @@ class CollisionChecker:
         for name, size, pos, rpy in boxes:
             sx, sy, sz = [float(x) for x in size]
             bx = fcl.Box(sx, sy, sz)
-            Rw = _rpy_to_R(*rpy)
+            Rw = rpy_to_rotation_matrix(*rpy)
             tw = np.array(pos, dtype=np.float64)
             R_rel = Rb_T @ Rw
             t_rel = Rb_T @ (tw - tb)
             self.env_objs[f"obj:{name}"] = fcl.CollisionObject(bx, fcl.Transform(R_rel, t_rel))
+
+    # ---------- external robots registration and updates ----------
+    def register_env_robot(self, name: str, urdf_path: str) -> None:
+        """Register another robot's collision geometry as dynamic obstacles."""
+        if not self.available:
+            return
+        try:
+            self.env_robot_geoms[name] = self._build_geoms_from_urdf(urdf_path)
+            self.logger.debug(f"Registered env robot '{name}' with {len(self.env_robot_geoms[name])} links")
+        except Exception as e:
+            self.logger.warning(f"Failed to register env robot '{name}': {e}")
+
+    def _build_geoms_from_urdf(self, urdf_path: str) -> Dict[str, List[_LinkGeom]]:
+        """Load collision geometry from an arbitrary URDF into _LinkGeom map without altering self.robot_geoms."""
+        mapping: Dict[str, List[_LinkGeom]] = {}
+        try:
+            root = ET.parse(str(urdf_path)).getroot()
+        except Exception as e:
+            self.logger.warning(f"URDF parse failed (env robot): {e}")
+            return mapping
+
+        base_dir = Path(urdf_path).parent
+        for link in root.findall("link"):
+            lname = link.get("name", "")
+            L: List[_LinkGeom] = []
+            for coll in link.findall("collision"):
+                geom = coll.find("geometry")
+                if geom is None:
+                    continue
+                origin = coll.find("origin")
+                if origin is not None:
+                    xyz = origin.get("xyz", "0 0 0").split()
+                    rpy = origin.get("rpy", "0 0 0").split()
+                    t_local = np.array([float(x) for x in xyz], dtype=np.float64)
+                    R_local = rpy_to_rotation_matrix(*(float(a) for a in rpy))
+                else:
+                    t_local = np.zeros(3, dtype=np.float64)
+                    R_local = np.eye(3)
+
+                mesh = geom.find("mesh")
+                if mesh is not None:
+                    filename = mesh.get("filename", "")
+                    if not filename:
+                        continue
+                    mesh_path = (base_dir / filename).resolve()
+                    if not mesh_path.exists():
+                        self.logger.debug(f"[env] mesh not found: {mesh_path}")
+                        continue
+                    scale_attr = mesh.get("scale", None)
+                    scale_vec = np.ones(3, dtype=np.float64)
+                    if scale_attr:
+                        try:
+                            scale_vec = np.array([float(v) for v in scale_attr.split()], dtype=np.float64)
+                        except Exception:
+                            pass
+                    try:
+                        tm = trimesh.load(mesh_path, force="mesh", process=False)
+                        V = np.asarray(tm.vertices, dtype=np.float64)
+                        V = (V * scale_vec) * self._shrink
+                        F = np.asarray(tm.faces, dtype=np.int32)
+                        bvh = fcl.BVHModel()
+                        bvh.beginModel(V.shape[0], F.shape[0])
+                        bvh.addSubModel(V, F)
+                        bvh.endModel()
+                        co = fcl.CollisionObject(bvh, fcl.Transform(np.eye(3), np.zeros(3)))
+                        L.append(_LinkGeom(R_local, t_local, co))
+                    except Exception as e:
+                        self.logger.debug(f"[env] failed to load mesh {mesh_path}: {e}")
+                    continue
+
+                box = geom.find("box")
+                if box is not None:
+                    size_attr = box.get("size", None)
+                    if not size_attr:
+                        continue
+                    sx, sy, sz = [float(v) for v in size_attr.split()]
+                    bx = fcl.Box(sx*self._shrink, sy*self._shrink, sz*self._shrink)
+                    co = fcl.CollisionObject(bx, fcl.Transform(np.eye(3), np.zeros(3)))
+                    L.append(_LinkGeom(R_local, t_local, co))
+                    continue
+
+            if L:
+                mapping[lname] = L
+        return mapping
+
+    def update_env_robot_from_pin(
+        self,
+        name: str,
+        model: "pin.Model",
+        data: "pin.Data",
+        q: np.ndarray,
+        base_position: Tuple[float, float, float],
+        base_orientation_rpy: Tuple[float, float, float],
+    ) -> None:
+        """Update transforms of an already-registered env robot from its Pinocchio state."""
+        if not (self.available and HAS_PIN):
+            return
+        if name not in self.env_robot_geoms:
+            # Not registered; nothing to do.
+            return
+
+        local_data = model.createData()
+        pin.forwardKinematics(model, local_data, q)
+        pin.updateFramePlacements(model, local_data)
+
+        # This checker’s BASE pose in WORLD
+        Rb_T = self._base_R.T
+        tb = self._base_t
+        # External robot base (WORLD)
+        R_ext = rpy_to_rotation_matrix(*base_orientation_rpy)
+        t_ext = np.array(base_position, dtype=np.float64)
+
+        linkmap = self.env_robot_geoms[name]
+        for lname, geoms in linkmap.items():
+            fid = model.getFrameId(lname)
+            if fid != model.nframes:
+                M_link = local_data.oMf[fid]
+            else:
+                try:
+                    jid = model.getJointId(lname)
+                    M_link = local_data.oMi[jid]
+                except Exception:
+                    continue
+            R_link_ext = M_link.rotation
+            t_link_ext = M_link.translation
+
+            # Link in WORLD
+            R_world = R_ext @ R_link_ext
+            t_world = t_ext + R_ext @ t_link_ext
+
+            # Express in this robot's BASE frame
+            R_rel = Rb_T @ R_world
+            t_rel = Rb_T @ (t_world - tb)
+
+            for g in geoms:
+                g.obj.setTransform(fcl.Transform(R_rel, t_rel))
 
     # ---------- check collision given a Pinocchio state ----------
     def in_collision_from_pin(self, model: "pin.Model", data: "pin.Data", q: np.ndarray) -> bool:
@@ -202,7 +332,12 @@ class CollisionChecker:
         pin.forwardKinematics(model, local_data, q)
         pin.updateFramePlacements(model, local_data)
 
-        # update robot link geoms with (link * local) transforms
+        # This checker's BASE pose in WORLD
+        Rb_T = self._base_R.T
+        tb = self._base_t
+
+
+        # update robot link geoms with (link * local) transforms in BASE frame
         for lname, geoms in self.robot_geoms.items():
             # try frame first (most URDF importers create frames for links)
             fid = model.getFrameId(lname)
@@ -217,12 +352,19 @@ class CollisionChecker:
                     # if we cannot resolve this link, skip its geoms
                     continue
 
-            R_link = M_link.rotation
-            t_link = M_link.translation
+            R_link_w = M_link.rotation
+            t_link_w = M_link.translation
+
+            # For fixed-base Pinocchio models, frame placements are already in BASE
+            # (no additional base transform needed for this robot's own links)
+            R_link_b = R_link_w
+            t_link_b = t_link_w
+
+
             for g in geoms:
-                # world transform = link * local
-                R = R_link @ g.local_R
-                t = t_link + R_link @ g.local_t
+                # BASE transform = (link_in_BASE) * local_collision_origin
+                R = R_link_b @ g.local_R
+                t = t_link_b + R_link_b @ g.local_t
                 g.obj.setTransform(fcl.Transform(R, t))
 
         # self collisions
@@ -244,19 +386,36 @@ class CollisionChecker:
             for oname, env in self.env_objs.items():
                 if (lname, oname) in self.allowed_world_pairs:
                     continue
+                # Skip base link collisions with ground plane (base should sit on ground)
+                if ("base" in lname.lower() and "plane" in oname.lower()):
+                    continue
                 for oa in geoms:
                     req = fcl.CollisionRequest()
                     res = fcl.CollisionResult()
                     if fcl.collide(oa.obj, env, req, res) > 0:
                         return True
 
-        # ground plane quick check (optional)
+        # robot vs external robots (treated as environment obstacles)
+        if self.env_robot_geoms:
+            for lname, geoms in self.robot_geoms.items():
+                for env_robot, linkmap in self.env_robot_geoms.items():
+                    for elname, env_geoms in linkmap.items():
+                        for oa in geoms:
+                            for ob in env_geoms:
+                                req = fcl.CollisionRequest()
+                                res = fcl.CollisionResult()
+                                if fcl.collide(oa.obj, ob.obj, req, res) > 0:
+                                    return True
+
+        # ground plane quick check (optional) - t_link is already in BASE for fixed-base models
         if self.ground_plane_z != 0.0:
             for lname in self.robot_geoms.keys():
                 fid = model.getFrameId(lname)
                 if fid == len(model.frames):
                     continue
-                if float(local_data.oMf[fid].translation[2]) < self.ground_plane_z:
+                # For fixed-base models, link placements are already in BASE frame
+                t_link_b = local_data.oMf[fid].translation
+                if float(t_link_b[2]) < self.ground_plane_z - 1e-3:  # small tolerance
                     return True
 
         return False
