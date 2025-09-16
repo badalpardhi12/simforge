@@ -17,9 +17,13 @@ dependencies = [
   "pydantic>=2.0",
   "xxhash",
   "pybullet",
-  "pinocchio>=2.6",
+  "pin",
   "python-fcl>=0.7",
-  "trimesh>=3.0"
+  "trimesh>=3.0",
+  "ompl>=1.6",
+  "wxpython>=4.1",
+  "drake",
+  "torch"
 ]
 
 [project.urls]

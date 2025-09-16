@@ -189,8 +189,9 @@
     <limit effort="10.0" velocity="8.72665" lower="-3.14159" upper="3.14159" />
   </joint>
 
+</robot>
   <!-- Gripper-->
-  <link name="meca_gripper_link">
+  <!-- <link name="meca_gripper_link">
     <visual>
       <origin xyz="0 0 0" rpy="1.5708 0 0" />
       <geometry>
@@ -210,10 +211,10 @@
     <origin xyz="0 0 0" rpy="0 0 0" />
     <parent link="meca_axis_6_link" />
     <child link="meca_gripper_link" />
-  </joint>
+  </joint> -->
   
   <!-- Gripper Finger 1-->
-  <link name="meca_gripper_finger1">
+  <!-- <link name="meca_gripper_finger1">
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
@@ -233,10 +234,10 @@
     <origin xyz=".01395 .0125 -.0170205" rpy="-1.570796 0 0" />
     <parent link="meca_gripper_link" />
     <child link="meca_gripper_finger1" />
-  </joint>
+  </joint> -->
   
   <!-- Gripper Finger 2-->
-  <link name="meca_gripper_finger2">
+  <!-- <link name="meca_gripper_finger2">
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
@@ -257,4 +258,4 @@
     <parent link="meca_gripper_link" />
     <child link="meca_gripper_finger2" />
   </joint>
-</robot>
+</robot> -->

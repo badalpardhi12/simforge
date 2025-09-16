@@ -1,8 +1,5 @@
-"""Backward-compatible shim exposing the reorganized controller package."""
-from __future__ import annotations
-
-from .controller import (
-    MovementController,
+"""Controllers package exposing movement control primitives."""
+from .commands import (
     ControlMode,
     Command,
     SetJointCommand,
@@ -10,6 +7,7 @@ from .controller import (
     CartesianMoveCommand,
     SwitchModeCommand,
 )
+from .controller import MovementController
 
 __all__ = [
     "MovementController",

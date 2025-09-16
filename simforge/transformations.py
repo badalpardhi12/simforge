@@ -116,3 +116,20 @@ def quaternion_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
         w1*y2 - x1*z2 + y1*w2 + z1*x2,
         w1*z2 + x1*y2 - y1*x2 + z1*w2
     ])
+
+
+def quaternion_to_rotation_matrix(q: np.ndarray | Tuple[float, float, float, float]) -> np.ndarray:
+    """Convert quaternion (w, x, y, z) to a rotation matrix."""
+    w, x, y, z = map(float, q)
+    n = w*w + x*x + y*y + z*z
+    if n <= 0.0:
+        return np.eye(3, dtype=np.float64)
+    s = 2.0 / n
+    wx, wy, wz = s * w * x, s * w * y, s * w * z
+    xx, xy, xz = s * x * x, s * x * y, s * x * z
+    yy, yz, zz = s * y * y, s * y * z, s * z * z
+    return np.array([
+        [1.0 - (yy + zz), xy - wz, xz + wy],
+        [xy + wz, 1.0 - (xx + zz), yz - wx],
+        [xz - wy, yz + wx, 1.0 - (xx + yy)],
+    ], dtype=np.float64)

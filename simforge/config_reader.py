@@ -36,6 +36,8 @@ class ControlConfig(BaseModel):
     min_clearance_m: float = 0.0
     collision_mesh_shrink: float = 1.0
     world_allowed_pairs: List[Tuple[str, str]] = Field(default_factory=list)
+    ik_pos_tolerance_m: float = 2.5e-4  # 0.25 mm default
+    ik_rot_tolerance_deg: float = 0.1  # tighter than quarter degree
     # kinematics limits (fallbacks; prefer Pinocchio limits)
     max_joint_vel: float = 2.0
     max_joint_acc: float = 4.0

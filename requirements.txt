@@ -12,6 +12,6 @@ wxpython>=4.1
 pydantic
 
 pybullet
-pinocchio>=2.6
+pin
 python-fcl>=0.7
 trimesh>=3.0

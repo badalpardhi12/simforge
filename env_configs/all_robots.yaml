@@ -22,7 +22,7 @@ defaults:
       - ["link_6", "obj:table1"]                 # TX2_60_1 EE link (prefix stripped in code)
       - ["wrist_3_link", "obj:table1"]           # UR5e_1 wrist 3
       - ["meca_axis_6_link", "obj:table1"]      # MECA500 axis 6 link (matches end_effector_link)
-    collision_mesh_shrink: 0.97
+    collision_mesh_shrink: 1.0
 
 robots:
   # You can inline a robot OR include an existing robot yaml and override fields.
@@ -64,3 +64,4 @@ robots:
       collision_check: true
       self_collision_check: true  # Re-enable with conservative adjacent pairs
       ground_plane_z: 0.0
+      collision_mesh_shrink: 0.85
