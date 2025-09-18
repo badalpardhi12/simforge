@@ -16,7 +16,6 @@ dependencies = [
   "PyYAML>=6.0",
   "pydantic>=2.0",
   "xxhash",
-  "pybullet",
   "pin",
   "python-fcl>=0.7",
   "trimesh>=3.0",

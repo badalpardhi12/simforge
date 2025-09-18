@@ -38,6 +38,8 @@ robots:
       collision_check: true
       self_collision_check: true  # Re-enable with conservative adjacent pairs
       ground_plane_z: 0.0
+      ik_pos_tolerance_m: 1e-3
+      ik_rot_tolerance_deg: 1.0
 
   - name: UR5e_1
     urdf: "assets/ur5e/ur5e.urdf"
@@ -51,6 +53,8 @@ robots:
       collision_check: true
       self_collision_check: true  # Re-enable with conservative adjacent pairs
       ground_plane_z: 0.0
+      ik_pos_tolerance_m: 1e-3
+      ik_rot_tolerance_deg: 1.0
 
   - name: MECA500_1
     urdf: "assets/meca500/meca.urdf"
@@ -65,3 +69,5 @@ robots:
       self_collision_check: true  # Re-enable with conservative adjacent pairs
       ground_plane_z: 0.0
       collision_mesh_shrink: 0.85
+      ik_pos_tolerance_m: 1e-3
+      ik_rot_tolerance_deg: 1.0

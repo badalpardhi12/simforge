@@ -313,6 +313,7 @@ class MovementController:
 
         runtime.last_target_pose = None
         runtime.last_planned_q = None
+        runtime.pose_refine_attempts = 0
         plan = plan_cartesian_move(
             runtime,
             cmd,
@@ -351,6 +352,7 @@ class MovementController:
                     runtime.active_traj = None
                     self._record_safe_state(runtime, q)
                     runtime.pending_pose_validation = True
+                    runtime.pose_refine_attempts = 0
                 continue
 
             if runtime.joint_targets:
@@ -409,39 +411,83 @@ class MovementController:
 
                 if runtime.last_target_pose is not None:
                     target_pos, target_quat = runtime.last_target_pose
-                    pos_err = float(np.linalg.norm(np.asarray(pos) - target_pos))
+                    pos_diff = np.asarray(pos) - target_pos
+                    pos_l2 = float(np.linalg.norm(pos_diff))
+                    pos_linf = float(np.max(np.abs(pos_diff)))
                     R_ach = rot.matrix()
                     R_des = quaternion_to_rotation_matrix(target_quat)
                     R_err = R_ach.T @ R_des
                     cos_theta = float(np.clip((np.trace(R_err) - 1.0) * 0.5, -1.0, 1.0))
                     ang_err_deg = float(np.degrees(np.arccos(cos_theta)))
 
-                    if pos_err > ctrl.ik_pos_tolerance_m or ang_err_deg > ctrl.ik_rot_tolerance_deg:
-                        self.logger.warning(
-                            f"{runtime.name} pose error exceeds tolerance: "
-                            f"pos_err={pos_err*1000:.3f}mm (limit {ctrl.ik_pos_tolerance_m*1000:.3f}mm), "
-                            f"ang_err={ang_err_deg:.3f}° (limit {ctrl.ik_rot_tolerance_deg:.3f}°)"
-                        )
+                    eps = 1e-6
+                    if pos_linf > ctrl.ik_pos_tolerance_m + eps or ang_err_deg > ctrl.ik_rot_tolerance_deg + eps:
+                        refine_result = None
+                        if runtime.pose_refine_attempts < ctrl.ik_refine_max_attempts:
+                            runtime.pose_refine_attempts += 1
+                            refine_result = self._refine_pose(runtime, actual, target_pos, target_quat)
+                        if refine_result is not None:
+                            pos_linf_ref, pos_l2_ref, ang_err_ref = refine_result
+                            if (
+                                pos_linf_ref <= ctrl.ik_pos_tolerance_m + eps
+                                and ang_err_ref <= ctrl.ik_rot_tolerance_deg + eps
+                            ):
+                                runtime.pending_pose_validation = False
+                                runtime.pose_refine_attempts = 0
+                                self.logger.info(
+                                    f"{runtime.name} pose refine succeeded: pos_linf={pos_linf_ref*1000:.3f}mm, "
+                                    f"pos_l2={pos_l2_ref*1000:.3f}mm, ang_err={ang_err_ref:.3f}°"
+                                )
+                                return False
+                            else:
+                                self.logger.warning(
+                                    f"{runtime.name} pose refine still out of bounds: "
+                                    f"pos_linf={pos_linf_ref*1000:.3f}mm (limit {ctrl.ik_pos_tolerance_m*1000:.3f}mm), "
+                                    f"ang_err={ang_err_ref:.3f}°"
+                                )
+                                return True
+                        runtime.pose_refine_attempts = 0
+                        if runtime.last_safe_q is not None:
+                            self.logger.warning(
+                                f"{runtime.name} pose error exceeds tolerance: "
+                                f"pos_linf={pos_linf*1000:.3f}mm (limit {ctrl.ik_pos_tolerance_m*1000:.3f}mm), "
+                                f"pos_l2={pos_l2*1000:.3f}mm, "
+                                f"ang_err={ang_err_deg:.3f}° (limit {ctrl.ik_rot_tolerance_deg:.3f}°)"
+                            )
+                            set_robot_joints(runtime.entity, runtime.last_safe_q.tolist(), len(runtime.last_safe_q), self.logger)
+                            runtime.joint_targets = rad_to_deg_list(runtime.last_safe_q)
+                            runtime.pending_pose_validation = False
+                        else:
+                            self.logger.warning(
+                                f"{runtime.name} pose error exceeds tolerance but no safe state to restore"
+                            )
+                            runtime.pending_pose_validation = False
+                        return False
                     else:
                         self.logger.info(
-                            f"{runtime.name} pose error: pos_err={pos_err*1000:.3f}mm, "
-                            f"ang_err={ang_err_deg:.3f}°"
+                            f"{runtime.name} pose error: pos_linf={pos_linf*1000:.3f}mm, "
+                            f"pos_l2={pos_l2*1000:.3f}mm, ang_err={ang_err_deg:.3f}°"
                         )
+                        runtime.pose_refine_attempts = 0
 
                 if runtime.last_planned_q is not None and runtime.last_planned_q.size > 0:
                     planned_q = runtime.last_planned_q
                     n = min(planned_q.size, actual.size)
                     joint_err = float(np.linalg.norm(actual[:n] - planned_q[:n]))
-                    if joint_err > 1e-3:
+                    joint_tol = 5e-3  # ~0.29°
+                    if joint_err > joint_tol:
                         if runtime.last_safe_q is not None:
                             self.logger.warning(
                                 f"{runtime.name} joint deviation from plan = {joint_err:.4f} rad; restoring last safe configuration"
                             )
                             set_robot_joints(runtime.entity, runtime.last_safe_q.tolist(), len(runtime.last_safe_q), self.logger)
+                            runtime.joint_targets = rad_to_deg_list(runtime.last_safe_q)
+                            runtime.pending_pose_validation = False
                         else:
                             self.logger.warning(
                                 f"{runtime.name} joint deviation from plan = {joint_err:.4f} rad; no safe state to restore"
                             )
+                            runtime.pending_pose_validation = False
                         return False
                     else:
                         self.logger.debug(
@@ -451,6 +497,76 @@ class MovementController:
         except Exception as exc:
             self.logger.error(f"Failed to compute actual FK pose for {runtime.name}: {exc}")
         return False
+
+    def _refine_pose(
+        self,
+        runtime: RobotRuntime,
+        current_q: np.ndarray,
+        target_pos: np.ndarray,
+        target_quat: np.ndarray,
+    ) -> bool:
+        cache = runtime.drake_cache
+        if cache is None:
+            return False
+
+        ctrl = self.config.control_for(runtime.name)
+        attempts = max(1, int(ctrl.ik_refine_max_attempts))
+        pos_tol = min(float(ctrl.ik_refine_pos_tolerance_m), float(ctrl.ik_pos_tolerance_m))
+        rot_tol = min(float(ctrl.ik_refine_rot_tolerance_deg), float(ctrl.ik_rot_tolerance_deg))
+
+        seed = np.array(current_q, dtype=np.float64)
+        target_pos = np.asarray(target_pos, dtype=np.float64)
+        target_quat = np.asarray(target_quat, dtype=np.float64)
+        success_q = None
+        for attempt in range(attempts):
+            q_ref, info = solve_ik_drake(
+                cache,
+                q_seed=seed,
+                target_pos_base_m=tuple(target_pos),
+                target_quat_base_wxyz=tuple(target_quat),
+                is_state_valid=lambda q: True,
+                opts=DrakeIKOptions(
+                    pos_tolerance_m=pos_tol,
+                    rot_tolerance_deg=rot_tol,
+                    max_random_seeds=4,
+                    seed_noise_rad=0.1,
+                    center_bias_weight=1e-2,
+                    seed_stick_weight=2e-2,
+                ),
+            )
+            if q_ref is not None:
+                success_q = q_ref
+                break
+            if info.get("last_q") is not None:
+                seed = np.array(info["last_q"], dtype=np.float64)
+
+        if success_q is None:
+            self.logger.warning(f"{runtime.name} IK refine failed after {attempts} attempts")
+            return None
+
+        # Evaluate the refined pose using Drake before applying
+        plant_context = cache.plant.CreateDefaultContext()
+        cache.plant.SetPositions(plant_context, success_q)
+        pose = cache.plant.CalcRelativeTransform(plant_context, cache.base_frame, cache.ee_frame)
+        pos = pose.translation()
+        rot = pose.rotation()
+        pos_diff = pos - target_pos
+        pos_linf = float(np.max(np.abs(pos_diff)))
+        pos_l2 = float(np.linalg.norm(pos_diff))
+        R_err = rot.matrix().T @ quaternion_to_rotation_matrix(target_quat)
+        cos_theta = float(np.clip((np.trace(R_err) - 1.0) * 0.5, -1.0, 1.0))
+        ang_err = float(np.degrees(np.arccos(cos_theta)))
+
+        set_robot_joints(runtime.entity, success_q.tolist(), len(success_q), self.logger)
+        runtime.joint_targets = rad_to_deg_list(success_q)
+        runtime.last_safe_q = success_q
+        runtime.last_planned_q = success_q
+
+        self.logger.info(
+            f"{runtime.name} refined pose with tighter tolerances (pos_tol={pos_tol*1000:.2f}mm, rot_tol={rot_tol:.2f}°); "
+            f"pos_linf={pos_linf*1000:.3f}mm, ang_err={ang_err:.3f}°"
+        )
+        return pos_linf, pos_l2, ang_err
 
     # ------------------------------------------------------------------
     # Public API

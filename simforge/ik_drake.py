@@ -11,7 +11,7 @@ from pydrake.geometry import SceneGraph
 from pydrake.math import RigidTransform, RotationMatrix
 from pydrake.multibody.tree import Frame
 from pydrake.multibody.inverse_kinematics import InverseKinematics
-from pydrake.solvers import Solve
+from pydrake.solvers import Solve, SnoptSolver
 
 @dataclass
 class DrakeIKOptions:
@@ -190,8 +190,15 @@ def solve_ik_drake(
 
             # Initial guess & solve
             ik.prog().SetInitialGuess(q, s)
+            prog = ik.prog()
+            snopt = SnoptSolver()
+            if snopt.available():
+                prog.SetSolverOption(snopt.solver_id(), "Major feasibility tolerance", 1e-7)
+                prog.SetSolverOption(snopt.solver_id(), "Major optimality tolerance", 1e-7)
+                prog.SetSolverOption(snopt.solver_id(), "Minor feasibility tolerance", 1e-8)
+                prog.SetSolverOption(snopt.solver_id(), "Linesearch tolerance", 1e-8)
             try:
-                result = Solve(ik.prog())
+                result = Solve(prog)
             except Exception as e:
                 # Guard against Drake/SNOPT exceptions (e.g., degenerate quaternion paths)
                 last_info = {"reason": "solver_exception", "error": str(e), "seed_idx": idx, "ori_mode": ori_mode}

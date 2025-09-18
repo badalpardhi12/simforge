@@ -200,6 +200,9 @@ def plan_cartesian_move(
 
     q_goal = None
     last_info = {}
+    pos_tol = float(ctrl.ik_pos_tolerance_m)
+    rot_tol = float(ctrl.ik_rot_tolerance_deg)
+
     q_try, info = solve_ik_drake(
         cache,
         q_seed=q_current,
@@ -207,8 +210,8 @@ def plan_cartesian_move(
         target_quat_base_wxyz=tuple(quat_wxyz),
         is_state_valid=is_valid,
         opts=DrakeIKOptions(
-            pos_tolerance_m=float(ctrl.ik_pos_tolerance_m),
-            rot_tolerance_deg=float(ctrl.ik_rot_tolerance_deg),
+            pos_tolerance_m=pos_tol,
+            rot_tolerance_deg=rot_tol,
             max_random_seeds=16,
             seed_noise_rad=0.35,
             center_bias_weight=1e-2,
@@ -232,8 +235,8 @@ def plan_cartesian_move(
                 target_quat_base_wxyz=tuple(quat_wxyz),
                 is_state_valid=is_valid,
                 opts=DrakeIKOptions(
-                    pos_tolerance_m=float(ctrl.ik_pos_tolerance_m),
-                    rot_tolerance_deg=float(max(ctrl.ik_rot_tolerance_deg, 0.5)),
+                    pos_tolerance_m=pos_tol,
+                    rot_tolerance_deg=float(max(rot_tol, 0.5)),
                     max_random_seeds=8,
                     seed_noise_rad=0.25,
                     center_bias_weight=5e-3,
@@ -292,6 +295,7 @@ def plan_cartesian_move(
     )
     logger.info(f"IK achieved: pos={tuple(achieved_pos)} RPY={achieved_rpy_deg}")
 
+    theta_deg = None
     try:
         R_ach = achieved_rot.matrix()
         R_err = R_ach.T @ (R_des_base)
@@ -305,6 +309,30 @@ def plan_cartesian_move(
         )
     except Exception as exc:
         logger.debug(f"Geodesic orientation error computation failed: {exc}")
+
+    pos_diff = np.asarray(achieved_pos) - target_pos_base
+    pos_err = float(np.linalg.norm(pos_diff))
+    pos_linf = float(np.max(np.abs(pos_diff)))
+    rot_err = float(theta_deg) if theta_deg is not None else float("nan")
+
+    logger.debug(
+        f"[{runtime.name}] IK pose diff: pos_linf={pos_linf*1000:.4f}mm, pos_l2={pos_err*1000:.4f}mm, "
+        f"ang_err={rot_err:.4f}°"
+    )
+
+    eps = 1e-6
+    pos_tol = float(ctrl.ik_pos_tolerance_m)
+    rot_tol = float(ctrl.ik_rot_tolerance_deg)
+    if pos_linf > pos_tol + eps or (
+        theta_deg is not None and theta_deg > rot_tol + eps
+    ):
+        logger.error(
+            f"IK solution violates tolerance for {runtime.name}: "
+            f"pos_linf={pos_linf*1000:.3f}mm (limit {pos_tol*1000:.3f}mm), "
+            f"pos_l2={pos_err*1000:.3f}mm, "
+            f"ang_err={rot_err:.3f}° (limit {rot_tol:.3f}°)"
+        )
+        return None
 
     lower = cache.lower
     upper = cache.upper
@@ -335,8 +363,8 @@ def plan_cartesian_move(
                 target_quat_base_wxyz=quat_repair_wxyz,
                 is_state_valid=is_valid,
                 opts=DrakeIKOptions(
-                    pos_tolerance_m=float(ctrl.ik_pos_tolerance_m),
-                    rot_tolerance_deg=float(max(ctrl.ik_rot_tolerance_deg, 0.5)),
+                    pos_tolerance_m=pos_tol,
+                    rot_tolerance_deg=float(max(rot_tol, 0.5)),
                     max_random_seeds=4,
                     seed_noise_rad=0.1,
                     center_bias_weight=1e-3,
@@ -361,7 +389,7 @@ def plan_cartesian_move(
         logger.info(
             f"[{runtime.name}] Launching RRTConnect (timeout={timeout:.2f}s, range={float(ctrl.planner_resolution):.3f})"
         )
-        return ompl_rrt_connect_plan(
+        result = ompl_rrt_connect_plan(
             q_current,
             q_goal,
             lower,
@@ -371,6 +399,12 @@ def plan_cartesian_move(
             range_rad=float(ctrl.planner_resolution),
             simplify=True,
         )
+        if result is None:
+            logger.warning(
+                f"[{runtime.name}] RRTConnect returned no path (start_valid={is_valid(q_current)}, "
+                f"goal_valid={is_valid(q_goal)})"
+            )
+        return result
 
     plant_context = cache.plant.CreateDefaultContext()
     cache.plant.SetPositions(plant_context, q_current)
@@ -400,8 +434,8 @@ def plan_cartesian_move(
             target_quat_base_wxyz=tuple(quat),
             is_state_valid=is_valid,
             opts=DrakeIKOptions(
-                pos_tolerance_m=float(ctrl.ik_pos_tolerance_m),
-                rot_tolerance_deg=float(ctrl.ik_rot_tolerance_deg),
+                pos_tolerance_m=pos_tol,
+                rot_tolerance_deg=rot_tol,
                 max_random_seeds=4,
                 seed_noise_rad=0.25,
                 center_bias_weight=5e-3,
@@ -414,7 +448,7 @@ def plan_cartesian_move(
         logger.info(
             f"[{runtime.name}] Launching Cartesian linear planner with {num_waypoints} waypoints"
         )
-        return cartesian_linear_plan(
+        result = cartesian_linear_plan(
             start_q=q_current,
             start_pose_se3=start_pose_tuple,
             target_pose_se3=target_pose_tuple,
@@ -422,6 +456,11 @@ def plan_cartesian_move(
             is_state_valid=is_valid,
             num_waypoints=num_waypoints,
         )
+        if result is None:
+            logger.warning(
+                f"[{runtime.name}] Cartesian planner failed (likely IK or collision along linear path)"
+            )
+        return result
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         future_rrt = executor.submit(plan_rrt)
@@ -429,14 +468,14 @@ def plan_cartesian_move(
         wait({future_rrt, future_lin}, timeout=timeout, return_when=ALL_COMPLETED)
 
     plans = []
-    if future_lin.done():
-        result = future_lin.result()
-        if result is not None:
-            plans.append(("cartesian", *result))
-        else:
-            logger.info(f"[{runtime.name}] Cartesian planner returned no solution")
-    else:
-        logger.warning(f"[{runtime.name}] Cartesian planner timed out")
+    # if future_lin.done():
+    #     result = future_lin.result()
+    #     if result is not None:
+    #         plans.append(("cartesian", *result))
+    #     else:
+    #         logger.info(f"[{runtime.name}] Cartesian planner returned no solution")
+    # else:
+    #     logger.warning(f"[{runtime.name}] Cartesian planner timed out")
     if future_rrt.done():
         result = future_rrt.result()
         if result is not None:
