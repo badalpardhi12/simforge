@@ -14,6 +14,12 @@ objects:
     position: [-1.0, 0.0, 0.38]
     orientation_rpy: [0, 0, 0]
     size: [1.2, 0.8, 0.76]
+  - type: "sphere"
+    name: ref_sphere
+    position: [0.4, 0.0, 0.3]
+    size: [0.05, 0.05, 0.05]
+    collision_enabled: false
+    dynamic: false
 
 # Defaults applied to every robot unless overridden below
 defaults:

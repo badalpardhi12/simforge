@@ -13,7 +13,7 @@ except ImportError:
     wx = None
 
 import numpy as np
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from .config_reader import SimforgeConfig
 from .movement_controller import MovementController, ControlMode
@@ -44,13 +44,15 @@ class RobotControlFrame(wx.Frame):
         super().__init__(
             parent=None, 
             title="Simforge Robot Control", 
-            size=(600, 650),
+            size=(600, 700),
             style=wx.DEFAULT_FRAME_STYLE & ~(wx.RESIZE_BORDER | wx.MAXIMIZE_BOX)
         )
         self.config = config
         self.logger = setup_logging(debug)
         self.joint_sliders: Dict[str, List[wx.Slider]] = {}  # type: ignore
         self.cart_fields: Dict[str, List[wx.TextCtrl]] = {}  # type: ignore
+        self.cart_frame_choice: Dict[str, wx.Choice] = {}  # type: ignore
+        self.cart_frame_map: Dict[str, Dict[str, str]] = {}
         self._building = True
         self._running = True
         
@@ -211,6 +213,23 @@ class RobotControlFrame(wx.Frame):
             ori_fields.append(ori_field)
         
         cart_box.Add(cart_grid, 0, wx.EXPAND | wx.ALL, 15)
+
+        frame_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        frame_label = wx.StaticText(tab, label="Reference Frame:")
+        frame_label.SetMinSize((120, -1))
+        frames = self.controller.get_reference_frames(robot_name)
+        frame_choices = [label for _, label in frames]
+        frame_choice = wx.Choice(tab, choices=frame_choices or ["Robot Base"])
+        if frame_choice.GetCount() > 0:
+            frame_choice.SetSelection(0)
+        self.cart_frame_choice[robot_name] = frame_choice
+        self.cart_frame_map[robot_name] = {
+            label: key for key, label in frames
+        } if frames else {"Robot Base": "base"}
+
+        frame_sizer.Add(frame_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
+        frame_sizer.Add(frame_choice, 0, wx.ALIGN_CENTER_VERTICAL)
+        cart_box.Add(frame_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 10)
         
         # Action button with better styling
         button_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -283,18 +302,27 @@ class RobotControlFrame(wx.Frame):
             
             position = tuple(values[:3])  # x, y, z
             orientation = tuple(values[3:])  # roll, pitch, yaw
-            
+
             # Additional validation
             if len(position) != 3 or len(orientation) != 3:
                 raise ValueError(f"Expected 6 values, got {len(values)}")
-            
-            self.controller.move_cartesian(robot_name, position, orientation, frame="base")
+
+            frame_key = "base"
+            frame_choice = self.cart_frame_choice.get(robot_name)
+            frame_map = self.cart_frame_map.get(robot_name, {})
+            if frame_choice and frame_choice.GetCount() > 0:
+                if frame_choice.GetSelection() == wx.NOT_FOUND:
+                    frame_choice.SetSelection(0)
+                selected_label = frame_choice.GetStringSelection()
+                frame_key = frame_map.get(selected_label, frame_key)
+
+            self.controller.move_cartesian(robot_name, position, orientation, frame=frame_key)
 
             self.status_bar.SetStatusText(
-                f"{robot_name} moving to {position} {orientation}"
+                f"{robot_name} moving to {position} {orientation} (frame={frame_key})"
             )
             self.logger.info(
-                f"Cartesian move: {robot_name} -> pos={position}, rpy={orientation}"
+                f"Cartesian move: {robot_name} -> pos={position}, rpy={orientation}, frame={frame_key}"
             )
             
         except ValueError:

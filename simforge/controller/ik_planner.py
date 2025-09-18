@@ -11,8 +11,64 @@ from ..transformations import (
     rotation_matrix_to_quaternion,
     rpy_to_quaternion,
     rpy_to_rotation_matrix,
+    quaternion_to_rotation_matrix,
+    quaternion_multiply,
 )
 from .utils import clamp_vector, rad_to_deg_list, to_meters
+
+
+def _normalize_quaternion(quat: np.ndarray) -> np.ndarray:
+    q = np.asarray(quat, dtype=np.float64)
+    norm = np.linalg.norm(q)
+    if norm < 1e-12:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    return q / norm
+
+
+def _frame_pose_world(config, frame_key: str, logger) -> Tuple[np.ndarray, np.ndarray]:
+    key = (frame_key or "").lower()
+    if key == "world" or key == "":
+        return np.zeros(3, dtype=np.float64), np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    if key.startswith("obj:"):
+        obj_name = key.split(":", 1)[1]
+        for obj in config.objects:
+            name = (obj.name or "").lower()
+            if name == obj_name:
+                pos = np.array(obj.position or (0.0, 0.0, 0.0), dtype=np.float64)
+                rpy = np.array(obj.orientation_rpy or (0.0, 0.0, 0.0), dtype=np.float64)
+                roll, pitch, yaw = np.deg2rad(rpy)
+                quat = _normalize_quaternion(rpy_to_quaternion(roll, pitch, yaw))
+                return pos, quat
+        logger.warning(f"Unknown reference frame '{frame_key}', using world frame")
+    return np.zeros(3, dtype=np.float64), np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+
+def _pose_in_base(robot_config, config, frame_key: str, pos_local: np.ndarray, quat_local: np.ndarray, logger) -> Tuple[np.ndarray, np.ndarray]:
+    pos_local = np.asarray(pos_local, dtype=np.float64)
+    quat_local = _normalize_quaternion(quat_local)
+
+    key = (frame_key or "base").lower()
+    if key == "base":
+        return pos_local, quaternion_to_rotation_matrix(quat_local)
+
+    frame_pos, frame_quat = _frame_pose_world(config, key, logger)
+    frame_quat = _normalize_quaternion(frame_quat)
+    R_frame = quaternion_to_rotation_matrix(frame_quat)
+    pos_world = R_frame @ pos_local + frame_pos
+    quat_world = quaternion_multiply(frame_quat, quat_local)
+    quat_world = _normalize_quaternion(quat_world)
+    R_world = quaternion_to_rotation_matrix(quat_world)
+
+    base_pos = np.array(robot_config.base_position or (0.0, 0.0, 0.0), dtype=np.float64)
+    base_rpy = np.array(robot_config.base_orientation or (0.0, 0.0, 0.0), dtype=np.float64)
+    roll_b, pitch_b, yaw_b = np.deg2rad(base_rpy)
+    base_quat = _normalize_quaternion(rpy_to_quaternion(roll_b, pitch_b, yaw_b))
+    R_world_base = quaternion_to_rotation_matrix(base_quat)
+    R_base_world = R_world_base.T
+
+    pos_base = R_base_world @ (pos_world - base_pos)
+    R_base = R_base_world @ R_world
+    return pos_base, R_base
 
 
 def _coerce_q_dim(cache, q: np.ndarray) -> np.ndarray:
@@ -72,7 +128,7 @@ def plan_cartesian_move(
         logger.warning("No valid joint state found, using zeros")
 
     q_current = _coerce_q_dim(cache, q_current)
-    pos_world_m = to_meters(ctrl, command.position)
+    pos_local = np.array(to_meters(ctrl, command.position), dtype=np.float64)
     orientation_deg = command.orientation_deg
     if any(not np.isfinite(val) for val in orientation_deg):
         logger.warning(
@@ -80,44 +136,32 @@ def plan_cartesian_move(
         )
         orientation_deg = (0.0, 0.0, 0.0)
     roll, pitch, yaw = [np.deg2rad(x) for x in orientation_deg]
-    quat_wxyz = rpy_to_quaternion(roll, pitch, yaw)
-    quat_mag = np.linalg.norm(quat_wxyz)
-    if quat_mag < 1e-10:
-        logger.error("Invalid quaternion magnitude; using identity quaternion")
-        quat_wxyz = (1.0, 0.0, 0.0, 0.0)
+    quat_local = _normalize_quaternion(np.array(rpy_to_quaternion(roll, pitch, yaw), dtype=np.float64))
+    R_local = quaternion_to_rotation_matrix(quat_local)
+
+    frame_key = command.frame or "base"
+    frame_key_norm = frame_key.lower()
+
+    if frame_key_norm == "base":
+        target_pos_base = pos_local.copy()
+        R_des_base = R_local
     else:
-        quat_wxyz = tuple(q / quat_mag for q in quat_wxyz)
-
-    gui_frame = (command.frame or "base").lower()
-    R_des_bl = rpy_to_rotation_matrix(roll, pitch, yaw)
-
-    if gui_frame == "base":
-        target_pos_base = np.array(pos_world_m, dtype=np.float64)
-        R_des_base = R_des_bl
-        target_quat_base = tuple(rotation_matrix_to_quaternion(R_des_base))
-    else:
-        robot_base_pos = np.array(robot_config.base_position or [0.0, 0.0, 0.0])
-        p_bl = np.array(pos_world_m, dtype=np.float64) - robot_base_pos
-        plant_ctx_tmp = cache.plant.CreateDefaultContext()
-        frame_base = cache.base_frame
-        try:
-            frame_bl = cache.plant.GetFrameByName(getattr(cache, "base_link", "base_link"))
-        except Exception:
-            frame_bl = cache.plant.GetFrameByName("base_link")
-        T_base_bl = cache.plant.CalcRelativeTransform(plant_ctx_tmp, frame_base, frame_bl)
-        R_base_bl = T_base_bl.rotation().matrix()
-        t_base_bl = T_base_bl.translation()
-        target_pos_base = R_base_bl @ p_bl + t_base_bl
-        R_des_base = R_base_bl @ R_des_bl
-        target_quat_base = tuple(rotation_matrix_to_quaternion(R_des_base))
-
-        logger.info(
-            f"World target: {pos_world_m}, base_link->BASE translation {np.round(t_base_bl, 4)}"
+        target_pos_base, R_des_base = _pose_in_base(
+            robot_config,
+            config,
+            frame_key_norm,
+            pos_local,
+            quat_local,
+            logger,
         )
 
+    target_quat_vec = np.array(rotation_matrix_to_quaternion(R_des_base), dtype=np.float64)
+    target_quat_vec = _normalize_quaternion(target_quat_vec)
+    target_quat_base = tuple(target_quat_vec)
+
     logger.info(
-        f"[{runtime.name}] Target in BASE frame: pos={np.round(target_pos_base,4)}, "
-        f"quat_wxyz={np.round(target_quat_base,4)}"
+        f"[{runtime.name}] Target in BASE frame (frame={frame_key_norm}): pos={np.round(target_pos_base,4)}, "
+        f"quat_wxyz={np.round(target_quat_vec,4)}"
     )
 
     z_min = float(ctrl.ground_plane_z) + 0.04
@@ -206,7 +250,7 @@ def plan_cartesian_move(
         cache,
         q_seed=q_current,
         target_pos_base_m=tuple(target_pos_base),
-        target_quat_base_wxyz=tuple(quat_wxyz),
+        target_quat_base_wxyz=target_quat_base,
         is_state_valid=is_valid,
         opts=DrakeIKOptions(
             pos_tolerance_m=pos_tol,
@@ -231,7 +275,7 @@ def plan_cartesian_move(
                 cache,
                 q_seed=q_curr,
                 target_pos_base_m=tuple(wp),
-                target_quat_base_wxyz=tuple(quat_wxyz),
+                target_quat_base_wxyz=target_quat_base,
                 is_state_valid=is_valid,
                 opts=DrakeIKOptions(
                     pos_tolerance_m=pos_tol,
@@ -410,7 +454,7 @@ def plan_cartesian_move(
 
     runtime.last_target_pose = (
         np.array(target_pos_base, dtype=np.float64),
-        np.array(quat_wxyz, dtype=np.float64),
+        np.array(target_quat_base, dtype=np.float64),
     )
     runtime.last_planned_q = waypoints[-1].copy()
 

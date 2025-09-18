@@ -25,7 +25,12 @@ from . import scene_builder
 from .robot_io import get_robot_joints, set_robot_joints
 from .utils import deg_to_rad_list, rad_to_deg_list
 from .ik_planner import plan_cartesian_move
-from ..transformations import quaternion_to_rotation_matrix
+from ..transformations import (
+    quaternion_to_rotation_matrix,
+    quaternion_multiply,
+    rpy_to_quaternion,
+    rpy_to_rotation_matrix,
+)
 
 
 class _RuntimeMirror(dict):
@@ -83,6 +88,9 @@ class MovementController:
         self._last_known_q: Dict[str, np.ndarray] = {}
         self._sync_legacy_views()
 
+        self._object_frames: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        self._build_object_frames()
+
         self.command_queue: queue.Queue[Command] = queue.Queue()
         self.running = False
         self.thread: Optional[threading.Thread] = None
@@ -132,6 +140,7 @@ class MovementController:
     def build_scene(self) -> None:
         self.scene = scene_builder.build_scene(self.renderer, self.config, self.robots, self.logger)
         self._sync_legacy_views()
+        self._build_object_frames()
 
     # ------------------------------------------------------------------
     # Thread lifecycle
@@ -238,6 +247,31 @@ class MovementController:
                 self._last_known_q[name] = runtime.last_known_q
             else:
                 self._last_known_q.pop(name, None)
+
+    @staticmethod
+    def _normalize_quaternion(quat: np.ndarray) -> np.ndarray:
+        q = np.asarray(quat, dtype=np.float64)
+        norm = np.linalg.norm(q)
+        if norm < 1e-12:
+            return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        return q / norm
+
+    def _build_object_frames(self) -> None:
+        self._object_frames.clear()
+        self._object_frames["world"] = (
+            np.zeros(3, dtype=np.float64),
+            np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        )
+        for obj in self.config.objects:
+            if not obj.name:
+                continue
+            pos = np.array(obj.position or (0.0, 0.0, 0.0), dtype=np.float64)
+            rpy = np.array(obj.orientation_rpy or (0.0, 0.0, 0.0), dtype=np.float64)
+            roll, pitch, yaw = np.deg2rad(rpy)
+            quat = self._normalize_quaternion(
+                np.array(rpy_to_quaternion(roll, pitch, yaw), dtype=np.float64)
+            )
+            self._object_frames[f"obj:{obj.name.lower()}"] = (pos, quat)
 
     # ------------------------------------------------------------------
     # IK sanity check
@@ -576,6 +610,17 @@ class MovementController:
 
     def set_joint_targets(self, robot: str, values_deg: List[float]) -> None:
         self.command_queue.put(SetJointTargetsCommand(robot, values_deg))
+
+    def get_reference_frames(self, robot: str) -> List[Tuple[str, str]]:
+        self._build_object_frames()
+        frames: List[Tuple[str, str]] = [("base", "Robot Base"), ("world", "World")]
+        for key, (pos, quat) in self._object_frames.items():
+            if key == "world":
+                continue
+            label = key.split(":", 1)[1]
+            original = next((obj.name for obj in self.config.objects if obj.name and obj.name.lower() == label), label)
+            frames.append((key, original))
+        return frames
 
     def move_cartesian(
         self,

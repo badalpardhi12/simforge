@@ -74,6 +74,7 @@ class ObjectConfig(BaseModel):
     orientation_rpy: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     size: Optional[Tuple[float, float, float]] = None
     collision_enabled: bool = True
+    dynamic: bool = True
 
 
 class SimforgeConfig(BaseModel):

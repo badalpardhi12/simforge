@@ -30,6 +30,18 @@ def build_scene(renderer, config, runtimes: Dict[str, "RobotRuntime"], logger):
                     pos=obj.position,
                     size=obj.size,
                     euler=obj.orientation_rpy,
+                    is_free=obj.dynamic,
+                    fixed=not obj.dynamic,
+                )
+            )
+        elif obj.type == "sphere":
+            radius = float(obj.size[0]) if obj.size else 0.05
+            scene.add_entity(
+                renderer.morphs.Sphere(
+                    pos=obj.position,
+                    radius=radius,
+                    is_free=obj.dynamic,
+                    fixed=not obj.dynamic,
                 )
             )
 

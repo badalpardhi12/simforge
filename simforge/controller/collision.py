@@ -21,6 +21,8 @@ def create_collision_checker(
 
     world_boxes: List[Tuple[str, Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]] = []
     for obj in config.objects:
+        if obj.collision_enabled is False:
+            continue
         if obj.type == "box" and obj.size:
             world_boxes.append(
                 (
