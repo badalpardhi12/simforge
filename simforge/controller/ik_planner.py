@@ -1,13 +1,12 @@
 """Inverse kinematics and motion planning helpers."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
 import time
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, List
 import numpy as np
 
 from ..ik_drake import DrakeIKOptions, solve_ik_drake
-from ..path_planner import cartesian_linear_plan, ompl_rrt_connect_plan
+from ..path_planner import ompl_parallel_plans, default_joint_planner_specs
 from ..transformations import (
     rotation_matrix_to_quaternion,
     rpy_to_quaternion,
@@ -383,134 +382,30 @@ def plan_cartesian_move(
             return None
 
     timeout = float(ctrl.planner_timeout)
-    num_waypoints = int(ctrl.cartesian_waypoints)
 
-    def plan_rrt():
-        logger.info(
-            f"[{runtime.name}] Launching RRTConnect (timeout={timeout:.2f}s, range={float(ctrl.planner_resolution):.3f})"
-        )
-        result = ompl_rrt_connect_plan(
-            q_current,
-            q_goal,
-            lower,
-            upper,
-            is_state_valid=is_valid,
-            timeout_s=timeout,
-            range_rad=float(ctrl.planner_resolution),
-            simplify=True,
-        )
-        if result is None:
-            logger.warning(
-                f"[{runtime.name}] RRTConnect returned no path (start_valid={is_valid(q_current)}, "
-                f"goal_valid={is_valid(q_goal)})"
-            )
-        return result
+    planner_specs = default_joint_planner_specs(float(ctrl.planner_resolution))
+    if not planner_specs:
+        logger.error(f"[{runtime.name}] OMPL planners unavailable")
+        return None
 
-    plant_context = cache.plant.CreateDefaultContext()
-    cache.plant.SetPositions(plant_context, q_current)
-    start_pose = cache.plant.CalcRelativeTransform(
-        plant_context, cache.base_frame, cache.ee_frame
+    plans = ompl_parallel_plans(
+        planner_specs,
+        q_current,
+        q_goal,
+        lower,
+        upper,
+        is_state_valid=is_valid,
+        timeout_s=timeout,
+        simplify=True,
     )
-    start_pos = start_pose.translation()
-    start_rot = start_pose.rotation()
-    start_quat = start_rot.ToQuaternion()
-    start_pose_tuple = (
-        start_pos,
-        (
-            start_quat.w(),
-            start_quat.x(),
-            start_quat.y(),
-            start_quat.z(),
-        ),
-    )
-    target_pose_tuple = (target_pos_base, tuple(quat_wxyz))
-
-    def _ik(q_seed, pose):
-        pos, quat = pose
-        result, _ = solve_ik_drake(
-            cache,
-            q_seed=q_seed,
-            target_pos_base_m=tuple(pos),
-            target_quat_base_wxyz=tuple(quat),
-            is_state_valid=is_valid,
-            opts=DrakeIKOptions(
-                pos_tolerance_m=pos_tol,
-                rot_tolerance_deg=rot_tol,
-                max_random_seeds=4,
-                seed_noise_rad=0.25,
-                center_bias_weight=5e-3,
-                seed_stick_weight=5e-3,
-            ),
-        )
-        return result
-
-    def plan_cart():
-        logger.info(
-            f"[{runtime.name}] Launching Cartesian linear planner with {num_waypoints} waypoints"
-        )
-        result = cartesian_linear_plan(
-            start_q=q_current,
-            start_pose_se3=start_pose_tuple,
-            target_pose_se3=target_pose_tuple,
-            solve_ik=_ik,
-            is_state_valid=is_valid,
-            num_waypoints=num_waypoints,
-        )
-        if result is None:
-            logger.warning(
-                f"[{runtime.name}] Cartesian planner failed (likely IK or collision along linear path)"
-            )
-        return result
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future_rrt = executor.submit(plan_rrt)
-        future_lin = executor.submit(plan_cart)
-        wait({future_rrt, future_lin}, timeout=timeout, return_when=ALL_COMPLETED)
-
-    plans = []
-    # if future_lin.done():
-    #     result = future_lin.result()
-    #     if result is not None:
-    #         plans.append(("cartesian", *result))
-    #     else:
-    #         logger.info(f"[{runtime.name}] Cartesian planner returned no solution")
-    # else:
-    #     logger.warning(f"[{runtime.name}] Cartesian planner timed out")
-    if future_rrt.done():
-        result = future_rrt.result()
-        if result is not None:
-            plans.append(("rrt", *result))
-        else:
-            logger.info(f"[{runtime.name}] RRT planner returned no solution")
-    else:
-        logger.warning(f"[{runtime.name}] RRT planner timed out")
-
-    def _validate_path(way):
-        from ..path_planner import _check_segment_collision_free
-
-        for i in range(len(way) - 1):
-            if not _check_segment_collision_free(way[i], way[i + 1], is_valid, resolution=20):
-                logger.debug(
-                    f"[{runtime.name}] Path segment {i}->{i+1} failed collision validation"
-                )
-                return False
-        return True
 
     if not plans:
-        logger.warning(f"[{runtime.name}] No planners produced a path")
+        logger.warning(f"[{runtime.name}] No OMPL planners produced a path")
         return None
 
-    valid = [item for item in plans if _validate_path(item[1])]
-    if not valid:
-        logger.warning(
-            f"Planning failed or produced colliding paths for {runtime.name}; candidates={[(name, way.shape[0]) for name, way, _ in plans]}"
-        )
-        return None
-
-    valid.sort(key=lambda x: 0 if x[0] == "cartesian" else 1)
-    plan_name, waypoints, times = valid[0]
+    plan_name, waypoints, times, cost = plans[0]
     logger.info(
-        f"Selected {plan_name} plan for {runtime.name} ({waypoints.shape[0]} waypoints, {times[-1]:.2f}s duration)"
+        f"Selected {plan_name} plan for {runtime.name} ({waypoints.shape[0]} waypoints, {times[-1]:.2f}s duration, cost={cost:.3f})"
     )
 
     runtime.last_target_pose = (

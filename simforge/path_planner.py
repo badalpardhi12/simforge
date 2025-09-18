@@ -1,8 +1,8 @@
 # path_planner.py
-"""OMPL-based planners + time parameterization + Cartesian linear planner."""
+"""OMPL-based planners + time parameterization."""
 from __future__ import annotations
 
-from typing import Callable, List, Tuple, Optional
+from typing import Callable, List, Tuple, Optional, TYPE_CHECKING, Any
 import numpy as np
 
 try:
@@ -37,21 +37,14 @@ def _trap_times(waypoints: np.ndarray, max_vel: float, max_acc: float) -> np.nda
     return np.linspace(0.0, total_time, waypoints.shape[0]).astype(np.float32)
 
 
-# ---------- OMPL Joint-space RRT-Connect ----------
-def ompl_rrt_connect_plan(
-    q_start: np.ndarray,
-    q_goal: np.ndarray,
+# ---------- Core OMPL helpers ----------
+
+def _create_space_information(
     lower: np.ndarray,
     upper: np.ndarray,
     is_state_valid: Callable[[np.ndarray], bool],
-    timeout_s: float = 3.0,
-    range_rad: float = 0.2,
-    simplify: bool = True,
-) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Joint-space RRT-Connect (returns (waypoints[N,DoF], times[N]))"""
-    if not HAS_OMPL:
-        return None
-    dof = int(q_start.shape[0])
+) -> Tuple[int, ob.SpaceInformation]:
+    dof = int(lower.shape[0])
     space = ob.RealVectorStateSpace(dof)
     bounds = ob.RealVectorBounds(dof)
     for i in range(dof):
@@ -71,94 +64,7 @@ def ompl_rrt_connect_plan(
     si.setStateValidityChecker(ob.StateValidityCheckerFn(_valid))
     si.setStateValidityCheckingResolution(0.005)      # 0.5% of extent
     si.setup()
-
-    start = ob.State(space); goal = ob.State(space)
-    for i in range(dof):
-        start[i] = float(q_start[i])
-        goal[i]  = float(q_goal[i])
-
-    pdef = ob.ProblemDefinition(si)
-    pdef.setStartAndGoalStates(start, goal)
-
-    planner = og.RRTConnect(si)
-    planner.setRange(range_rad)
-    planner.setProblemDefinition(pdef)
-    planner.setup()
-
-    if not planner.solve(timeout_s):
-        return None
-
-    path_geometric = pdef.getSolutionPath()
-    if simplify:
-        og.PathSimplifier(si).simplifyMax(path_geometric)
-
-    states = path_geometric.getStates()
-    waypoints = np.array([[s[i] for i in range(dof)] for s in states], dtype=np.float64)
-
-    # Post-check: validate all segments in the RRT path
-    for i in range(len(waypoints) - 1):
-        if not _check_segment_collision_free(waypoints[i], waypoints[i+1], is_state_valid, resolution=20):
-            return None
-
-    times = _trap_times(waypoints, max_vel=1.0, max_acc=2.0)  # execution is re-scalable upstream
-    return waypoints, times
-
-
-# ---------- Cartesian straight-line via per-waypoint IK ----------
-def cartesian_linear_plan(
-    start_q: np.ndarray,
-    start_pose_se3: Tuple[np.ndarray, np.ndarray],  # (pos(3), quat_wxyz(4))
-    target_pose_se3: Tuple[np.ndarray, np.ndarray],  # (pos(3), quat_wxyz(4))
-    solve_ik: Callable[[np.ndarray, Tuple[np.ndarray, np.ndarray]], Optional[np.ndarray]],
-    is_state_valid: Callable[[np.ndarray], bool],
-    num_waypoints: int = 200,
-) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Straight-line EEF path → per-waypoint IK → collision check."""
-    pos_start, quat_start = start_pose_se3
-    pos_goal, quat_goal = target_pose_se3
-    pos_start = np.asarray(pos_start, dtype=np.float64)
-    quat_start = np.asarray(quat_start, dtype=np.float64)
-    pos_goal = np.asarray(pos_goal, dtype=np.float64)
-    quat_goal = np.asarray(quat_goal, dtype=np.float64)
-
-    # Build linear interpolation in SE3: linear in XYZ + SLERP in quat (wxyz)
-    way_q: List[np.ndarray] = [start_q.copy()]
-    q_prev = start_q.copy()
-
-    def _slerp(q1: np.ndarray, q2: np.ndarray, t: float) -> np.ndarray:
-        q1 = q1 / np.linalg.norm(q1); q2 = q2 / np.linalg.norm(q2)
-        dot = float(np.dot(q1, q2))
-        if dot < 0.0: q2 = -q2; dot = -dot
-        if dot > 0.9995:
-            out = q1 + t * (q2 - q1)
-            return out / np.linalg.norm(out)
-        theta0 = np.arccos(np.clip(dot, -1.0, 1.0))
-        sin0 = np.sin(theta0)
-        theta = theta0 * t
-        s0 = np.sin(theta0 - theta) / sin0
-        s1 = np.sin(theta) / sin0
-        return s0 * q1 + s1 * q2
-
-    # Interpolate from start to goal
-    for i in range(1, num_waypoints):
-        a = i / (num_waypoints - 1)
-        pos_i = (1 - a) * pos_start + a * pos_goal
-        quat_i = _slerp(quat_start, quat_goal, a)
-
-        q_next = solve_ik(q_prev, (pos_i, quat_i))
-        if q_next is None or not is_state_valid(q_next):
-            return None
-            
-        # CRITICAL: Check collision along the segment from q_prev to q_next
-        if not _check_segment_collision_free(q_prev, q_next, is_state_valid):
-            return None
-            
-        way_q.append(q_next)
-        q_prev = q_next
-
-    waypoints = np.stack(way_q, axis=0)
-    times = _trap_times(waypoints, max_vel=1.0, max_acc=2.0)
-    return waypoints, times
+    return dof, si
 
 
 def _check_segment_collision_free(
@@ -188,8 +94,128 @@ def plan_joint_path(
     return waypoints, times
 
 
+def ompl_plan_with_factory(
+    planner_name: str,
+    planner_factory: Callable[[ob.SpaceInformation], og.Planner],
+    q_start: np.ndarray,
+    q_goal: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    is_state_valid: Callable[[np.ndarray], bool],
+    timeout_s: float = 3.0,
+    simplify: bool = True,
+    configure: Optional[Callable[[og.Planner], None]] = None,
+) -> Optional[Tuple[str, np.ndarray, np.ndarray, float]]:
+    if not HAS_OMPL:
+        return None
+
+    dof, si = _create_space_information(lower, upper, is_state_valid)
+    space = si.getStateSpace()
+
+    start = ob.State(space)
+    goal = ob.State(space)
+    for i in range(dof):
+        start[i] = float(q_start[i])
+        goal[i] = float(q_goal[i])
+
+    pdef = ob.ProblemDefinition(si)
+    pdef.setStartAndGoalStates(start, goal)
+
+    planner = planner_factory(si)
+    if configure is not None:
+        configure(planner)
+    planner.setProblemDefinition(pdef)
+    planner.setup()
+
+    if not planner.solve(timeout_s):
+        return None
+
+    path_geometric = pdef.getSolutionPath()
+    if simplify and hasattr(og, "PathSimplifier"):
+        og.PathSimplifier(si).simplifyMax(path_geometric)
+
+    states = path_geometric.getStates()
+    waypoints = np.array([[s[i] for i in range(dof)] for s in states], dtype=np.float64)
+
+    for i in range(len(waypoints) - 1):
+        if not _check_segment_collision_free(waypoints[i], waypoints[i + 1], is_state_valid, resolution=20):
+            return None
+
+    times = _trap_times(waypoints, max_vel=1.0, max_acc=2.0)
+    cost = float(path_geometric.length()) if hasattr(path_geometric, "length") else float(np.sum(np.linalg.norm(np.diff(waypoints, axis=0), axis=1)))
+    return planner_name, waypoints, times, cost
+
+
+if TYPE_CHECKING and HAS_OMPL:
+    PlannerCallable = Callable[[ob.SpaceInformation], ob.Planner]
+    PlannerConfig = Optional[Callable[[ob.Planner], None]]
+else:
+    PlannerCallable = Callable[[Any], Any]
+    PlannerConfig = Optional[Callable[[Any], None]]
+
+PlannerSpec = Tuple[str, PlannerCallable, PlannerConfig]
+
+
+def ompl_parallel_plans(
+    planner_specs: List[PlannerSpec],
+    q_start: np.ndarray,
+    q_goal: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    is_state_valid: Callable[[np.ndarray], bool],
+    timeout_s: float = 3.0,
+    simplify: bool = True,
+) -> List[Tuple[str, np.ndarray, np.ndarray, float]]:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results: List[Tuple[str, np.ndarray, np.ndarray, float]] = []
+    if not HAS_OMPL:
+        return results
+
+    def _run(spec: PlannerSpec):
+        name, factory, config = spec
+        return ompl_plan_with_factory(
+            name,
+            factory,
+            q_start,
+            q_goal,
+            lower,
+            upper,
+            is_state_valid,
+            timeout_s=timeout_s,
+            simplify=simplify,
+            configure=config,
+        )
+
+    with ThreadPoolExecutor(max_workers=len(planner_specs)) as executor:
+        future_map = {executor.submit(_run, spec): spec[0] for spec in planner_specs}
+        for fut in as_completed(future_map):
+            res = fut.result()
+            if res is not None:
+                results.append(res)
+
+    results.sort(key=lambda item: item[3])
+    return results
+
+
+def default_joint_planner_specs(range_rad: float) -> List[PlannerSpec]:
+    if not HAS_OMPL:
+        return []
+    return [
+        (
+            "RRTConnect",
+            lambda si: og.RRTConnect(si),
+            lambda planner: planner.setRange(range_rad),
+        ),
+        ("BITstar", lambda si: og.BITstar(si), None),
+        ("InformedRRTstar", lambda si: og.InformedRRTstar(si), None),
+        ("PRMstar", lambda si: og.PRMstar(si), None),
+    ]
+
+
 __all__ = [
-    "ompl_rrt_connect_plan",
-    "cartesian_linear_plan",
+    "ompl_plan_with_factory",
+    "ompl_parallel_plans",
+    "default_joint_planner_specs",
     "plan_joint_path",
 ]

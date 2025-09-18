@@ -55,8 +55,8 @@ graph LR
   - `solve_ik_drake(...)`: robust IK with multi-seed strategy and orientation modes (strict/relaxed/position-only). Guards against invalid quaternions and solver exceptions; clamps to joint limits.
 
 - `simforge/path_planner.py`
-  - `ompl_rrt_connect_plan(...)`: joint-space RRT-Connect using OMPL, with bounds, resolution, and post-plan path validation.
-  - `cartesian_linear_plan(...)`: EEF straight-line interpolation in SE(3) (linear in XYZ + SLERP for quaternion), per-waypoint IK via Drake + collision validation between successive waypoints.
+  - `ompl_plan_with_factory(...)`: shared helper to run a single OMPL planner instance and return joint waypoints + timing.
+  - `ompl_parallel_plans(...)`: launches multiple OMPL planners in parallel (RRTConnect, BIT*, Informed RRT*, PRM*) and picks the shortest valid path.
   - `_trap_times(...)`: trapezoidal time-parameterization (scalar) to produce waypoint timestamps.
   - `_check_segment_collision_free(...)`: validates straight-line segments in joint space.
 
