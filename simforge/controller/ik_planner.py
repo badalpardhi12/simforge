@@ -1,8 +1,8 @@
 """Inverse kinematics and motion planning helpers."""
 from __future__ import annotations
 
-import time
-from typing import Callable, Optional, Tuple, List
+from dataclasses import dataclass
+from typing import Callable, Optional, Tuple
 import numpy as np
 
 from ..ik_drake import DrakeIKOptions, solve_ik_drake
@@ -14,7 +14,25 @@ from ..transformations import (
     quaternion_to_rotation_matrix,
     quaternion_multiply,
 )
-from .utils import clamp_vector, rad_to_deg_list, to_meters
+from .utils import clamp_vector, to_meters
+
+
+@dataclass
+class _TargetPose:
+    position: np.ndarray
+    quat_wxyz: np.ndarray
+    R_des: np.ndarray
+    orientation_deg: Tuple[float, float, float]
+    frame: str
+
+
+@dataclass
+class _IKMetrics:
+    pos_linf: float
+    pos_err: float
+    rot_err: float
+    info: dict
+    slack_used: bool = False
 
 
 def _normalize_quaternion(quat: np.ndarray) -> np.ndarray:
@@ -81,6 +99,302 @@ def _coerce_q_dim(cache, q: np.ndarray) -> np.ndarray:
     return np.concatenate([q, np.zeros(nq - q.shape[0], dtype=np.float64)], axis=0)
 
 
+def _initial_joint_state(runtime, cache, read_actual_joints, logger) -> np.ndarray:
+    raw = read_actual_joints()
+    if raw is None:
+        actual = np.empty(0, dtype=np.float64)
+    else:
+        actual = np.asarray(raw, dtype=np.float64).flatten()
+    nq = cache.plant.num_positions()
+    if actual.size >= nq:
+        logger.info(f"[{runtime.name}] Using Genesis joint state ({actual.size} dof) for planning")
+        return actual[:nq]
+    if actual.size > 0:
+        q = np.zeros(nq, dtype=np.float64)
+        q[: actual.size] = actual
+        logger.info(f"[{runtime.name}] Using partial Genesis joint state ({actual.size} dof) for planning")
+        return q
+    if runtime.joint_targets:
+        logger.info(
+            f"[{runtime.name}] Genesis joints unavailable; falling back to GUI targets {runtime.joint_targets} deg"
+        )
+        return np.array([np.deg2rad(d) for d in runtime.joint_targets], dtype=np.float64)
+    logger.warning(f"[{runtime.name}] No valid joint state found, using zeros")
+    return np.zeros(nq, dtype=np.float64)
+
+
+def _ik_slack(ctrl) -> float:
+    slack = getattr(ctrl, "ik_tolerance_slack", None)
+    if slack is None or slack < 1.0:
+        return 1.002
+    return float(slack)
+
+
+def _resolve_target_pose(robot_config, config, ctrl, command, logger) -> _TargetPose:
+    pos_local = np.array(to_meters(ctrl, command.position), dtype=np.float64)
+    orientation_deg = command.orientation_deg
+    if any(not np.isfinite(val) for val in orientation_deg):
+        logger.warning(f"Invalid orientation values detected: {orientation_deg}, using (0,0,0)")
+        orientation_deg = (0.0, 0.0, 0.0)
+    roll, pitch, yaw = [np.deg2rad(x) for x in orientation_deg]
+    quat_local = _normalize_quaternion(np.array(rpy_to_quaternion(roll, pitch, yaw), dtype=np.float64))
+
+    frame_key = (command.frame or "base").lower()
+    if frame_key == "base":
+        target_pos_base = pos_local.copy()
+        R_des_base = quaternion_to_rotation_matrix(quat_local)
+    else:
+        target_pos_base, R_des_base = _pose_in_base(
+            robot_config,
+            config,
+            frame_key,
+            pos_local,
+            quat_local,
+            logger,
+        )
+
+    z_min = float(ctrl.ground_plane_z) + 0.04
+    if target_pos_base[2] < z_min - 1e-6:
+        logger.error(
+            f"Requested Z {target_pos_base[2]:.3f}m is below safe clearance {z_min:.3f}m. Aborting Cartesian move."
+        )
+        raise ValueError("target_below_ground")
+    if target_pos_base[2] < z_min:
+        target_pos_base[2] = z_min
+
+    target_quat = np.array(rotation_matrix_to_quaternion(R_des_base), dtype=np.float64)
+    target_quat = _normalize_quaternion(target_quat)
+    logger.info(
+        f"[{robot_config.name}] Target in BASE frame (frame={frame_key}): pos={np.round(target_pos_base,4)}, "
+        f"quat_wxyz={np.round(target_quat,4)}"
+    )
+
+    return _TargetPose(
+        position=target_pos_base,
+        quat_wxyz=target_quat,
+        R_des=R_des_base,
+        orientation_deg=tuple(float(x) for x in orientation_deg),
+        frame=frame_key,
+    )
+
+
+def _current_pose(cache, q) -> Tuple[np.ndarray, Tuple[float, float, float]]:
+    context = cache.plant.CreateDefaultContext()
+    cache.plant.SetPositions(context, q)
+    ee_pose = cache.plant.CalcRelativeTransform(context, cache.base_frame, cache.ee_frame)
+    pos = ee_pose.translation()
+    rpy = ee_pose.rotation().ToRollPitchYaw()
+    return pos, (
+        np.rad2deg(rpy.roll_angle()),
+        np.rad2deg(rpy.pitch_angle()),
+        np.rad2deg(rpy.yaw_angle()),
+    )
+
+
+def _progressive_ik(cache, q_start, target, is_valid, pos_tol, rot_tol, logger):
+    start_pos, _ = _current_pose(cache, q_start)
+    q_curr = q_start.copy()
+    steps = 20
+    for i in range(1, steps + 1):
+        wp = start_pos + (i / steps) * (target.position - start_pos)
+        q_next, info = solve_ik_drake(
+            cache,
+            q_seed=q_curr,
+            target_pos_base_m=tuple(wp),
+            target_quat_base_wxyz=tuple(target.quat_wxyz),
+            is_state_valid=is_valid,
+            opts=DrakeIKOptions(
+                pos_tolerance_m=pos_tol,
+                rot_tolerance_deg=float(max(rot_tol, 0.5)),
+                max_random_seeds=8,
+                seed_noise_rad=0.25,
+                center_bias_weight=5e-3,
+                seed_stick_weight=5e-3,
+            ),
+        )
+        if q_next is None:
+            logger.debug("Progressive IK failed at step %d/%d: %s", i, steps, info)
+            return None, info
+        q_curr = q_next
+        if not is_valid(q_curr):
+            logger.warning(
+                "Progressive IK produced in-collision waypoint (%d/%d) - GOAL IN COLLISION!", i, steps
+            )
+            return None, {"reason": "goal_in_collision", "seed_idx": i, "ori_mode": info.get("ori_mode")}
+    if not is_valid(q_curr):
+        logger.warning("Progressive IK produced in-collision goal - GOAL IN COLLISION!")
+        return None, {"reason": "goal_in_collision"}
+    return q_curr, {"reason": "progressive_success"}
+
+
+def _evaluate_pose(cache, q_goal, target) -> Tuple[_IKMetrics, np.ndarray, Tuple[float, float, float]]:
+    context = cache.plant.CreateDefaultContext()
+    cache.plant.SetPositions(context, q_goal)
+    achieved_pose = cache.plant.CalcRelativeTransform(context, cache.base_frame, cache.ee_frame)
+    achieved_pos = achieved_pose.translation()
+    achieved_rot = achieved_pose.rotation()
+    achieved_rpy = achieved_rot.ToRollPitchYaw()
+    achieved_rpy_deg = (
+        np.rad2deg(achieved_rpy.roll_angle()),
+        np.rad2deg(achieved_rpy.pitch_angle()),
+        np.rad2deg(achieved_rpy.yaw_angle()),
+    )
+
+    R_ach = achieved_rot.matrix()
+    R_err = R_ach.T @ target.R_des
+    tr = float(np.trace(R_err))
+    tr_clamped = max(-1.0, min(3.0, tr))
+    cos_theta = (tr_clamped - 1.0) / 2.0
+    cos_theta = max(-1.0, min(1.0, cos_theta))
+    theta_deg = float(np.degrees(np.arccos(cos_theta)))
+
+    pos_diff = achieved_pos - target.position
+    pos_err = float(np.linalg.norm(pos_diff))
+    pos_linf = float(np.max(np.abs(pos_diff)))
+
+    metrics = _IKMetrics(
+        pos_linf=pos_linf,
+        pos_err=pos_err,
+        rot_err=theta_deg,
+        info={},
+    )
+    return metrics, achieved_pos, achieved_rpy_deg
+
+
+def _within_tolerance(metrics: _IKMetrics, pos_tol: float, rot_tol: float) -> bool:
+    if metrics.pos_linf > pos_tol + 1e-6:
+        return False
+    if metrics.rot_err is not None and metrics.rot_err > rot_tol + 1e-6:
+        return False
+    return True
+
+
+def _solve_cartesian_ik(cache, q_seed, target, ctrl, is_valid, logger, robot_name: str):
+    pos_tol = float(ctrl.ik_pos_tolerance_m)
+    rot_tol = float(ctrl.ik_rot_tolerance_deg)
+
+    q_goal, info = solve_ik_drake(
+        cache,
+        q_seed=q_seed,
+        target_pos_base_m=tuple(target.position),
+        target_quat_base_wxyz=tuple(target.quat_wxyz),
+        is_state_valid=is_valid,
+        opts=DrakeIKOptions(
+            pos_tolerance_m=pos_tol,
+            rot_tolerance_deg=rot_tol,
+            max_random_seeds=16,
+            seed_noise_rad=0.35,
+            center_bias_weight=1e-2,
+            seed_stick_weight=5e-3,
+        ),
+    )
+
+    if q_goal is None:
+        logger.info("Single-shot IK failed, trying progressive IK...")
+        q_goal, info = _progressive_ik(cache, q_seed, target, is_valid, pos_tol, rot_tol, logger)
+        if q_goal is None:
+            return None, None, None, info or {}
+
+    metrics, achieved_pos, achieved_rpy = _evaluate_pose(cache, q_goal, target)
+    metrics.info = info or {}
+    logger.info(f"IK achieved: pos={tuple(achieved_pos)} RPY={achieved_rpy}")
+    logger.info(
+        "Orientation geodesic error = %.3f° (mode=%s)",
+        metrics.rot_err,
+        metrics.info.get("ori_mode", "n/a"),
+    )
+
+    if _within_tolerance(metrics, pos_tol, rot_tol):
+        return q_goal, metrics, achieved_pos, metrics.info
+
+    slack = _ik_slack(ctrl)
+    if _within_tolerance(metrics, pos_tol * slack, rot_tol * slack):
+        metrics.slack_used = True
+        logger.warning(
+            "IK solution for %s used tolerance slack (%.3fx): pos_linf=%.4fmm, ang_err=%.4f°",
+            robot_name,
+            slack,
+            metrics.pos_linf * 1000.0,
+            metrics.rot_err,
+        )
+        return q_goal, metrics, achieved_pos, metrics.info
+
+    logger.info("Retrying IK with relaxed tolerances (slack %.3fx)", slack)
+    q_retry, retry_info = solve_ik_drake(
+        cache,
+        q_seed=q_goal,
+        target_pos_base_m=tuple(target.position),
+        target_quat_base_wxyz=tuple(target.quat_wxyz),
+        is_state_valid=is_valid,
+        opts=DrakeIKOptions(
+            pos_tolerance_m=pos_tol * slack,
+            rot_tolerance_deg=rot_tol * slack,
+            max_random_seeds=8,
+            seed_noise_rad=0.25,
+            center_bias_weight=5e-3,
+            seed_stick_weight=5e-3,
+        ),
+    )
+
+    if q_retry is not None:
+        metrics_retry, achieved_pos, achieved_rpy = _evaluate_pose(cache, q_retry, target)
+        metrics_retry.info = retry_info or {}
+        if _within_tolerance(metrics_retry, pos_tol * slack, rot_tol * slack):
+            metrics_retry.slack_used = True
+            logger.warning(
+                "IK solution for %s accepted with relaxed tolerance: pos_linf=%.4fmm, ang_err=%.4f°",
+                robot_name,
+                metrics_retry.pos_linf * 1000.0,
+                metrics_retry.rot_err,
+            )
+            return q_retry, metrics_retry, achieved_pos, metrics_retry.info
+
+    logger.error(
+        "IK tolerance violated: pos_linf=%.3fmm (limit %.3fmm), ang_err=%.3f° (limit %.3f°)",
+        metrics.pos_linf * 1000.0,
+        pos_tol * 1000.0,
+        metrics.rot_err,
+        rot_tol,
+    )
+    return None, metrics, achieved_pos, metrics.info
+
+
+def _repair_start_state(cache, q_current, is_valid, pos_tol, rot_tol, logger):
+    if is_valid(q_current):
+        return q_current
+    try:
+        context = cache.plant.CreateDefaultContext()
+        cache.plant.SetPositions(context, q_current)
+        ee_pose = cache.plant.CalcRelativeTransform(context, cache.base_frame, cache.ee_frame)
+        pos_repair = ee_pose.translation().copy()
+        pos_repair[2] += 0.03
+        rot = ee_pose.rotation()
+        quat = rot.ToQuaternion()
+        q_repair, _ = solve_ik_drake(
+            cache,
+            q_seed=q_current,
+            target_pos_base_m=tuple(pos_repair),
+            target_quat_base_wxyz=(quat.w(), quat.x(), quat.y(), quat.z()),
+            is_state_valid=is_valid,
+            opts=DrakeIKOptions(
+                pos_tolerance_m=pos_tol,
+                rot_tolerance_deg=float(max(rot_tol, 0.5)),
+                max_random_seeds=4,
+                seed_noise_rad=0.1,
+                center_bias_weight=1e-3,
+                seed_stick_weight=1e-2,
+            ),
+        )
+        if q_repair is not None and is_valid(q_repair):
+            logger.debug("Start state invalid; applied +3cm Z IK repair to clear collisions.")
+            return q_repair
+        logger.error("Start state is invalid and repair IK failed; aborting planning")
+        return None
+    except Exception as exc:
+        logger.error("Start state repair errored: %s", exc)
+        return None
+
+
 def plan_cartesian_move(
     runtime,
     command,
@@ -111,322 +425,55 @@ def plan_cartesian_move(
         f"gui_rpy_deg={tuple(command.orientation_deg)}, frame={command.frame or 'base'}"
     )
 
-    actual_joints = read_actual_joints()
-    if actual_joints.size >= 6:
-        q_current = np.zeros(cache.plant.num_positions())
-        q_current[: actual_joints.size] = actual_joints
-        logger.info(
-            f"[{runtime.name}] Using Genesis joint state ({actual_joints.size} dof) for planning"
-        )
-    elif runtime.joint_targets:
-        q_current = np.array([np.deg2rad(d) for d in runtime.joint_targets], dtype=np.float64)
-        logger.info(
-            f"[{runtime.name}] Genesis joints unavailable; falling back to GUI targets {runtime.joint_targets} deg"
-        )
-    else:
-        q_current = np.zeros(cache.plant.num_positions())
-        logger.warning("No valid joint state found, using zeros")
+    q_current = _coerce_q_dim(cache, _initial_joint_state(runtime, cache, read_actual_joints, logger))
+    try:
+        target = _resolve_target_pose(robot_config, config, ctrl, command, logger)
+    except ValueError:
+        return None
 
-    q_current = _coerce_q_dim(cache, q_current)
-    pos_local = np.array(to_meters(ctrl, command.position), dtype=np.float64)
-    orientation_deg = command.orientation_deg
-    if any(not np.isfinite(val) for val in orientation_deg):
-        logger.warning(
-            f"Invalid orientation values detected: {orientation_deg}, using (0,0,0)"
-        )
-        orientation_deg = (0.0, 0.0, 0.0)
-    roll, pitch, yaw = [np.deg2rad(x) for x in orientation_deg]
-    quat_local = _normalize_quaternion(np.array(rpy_to_quaternion(roll, pitch, yaw), dtype=np.float64))
-    R_local = quaternion_to_rotation_matrix(quat_local)
-
-    frame_key = command.frame or "base"
-    frame_key_norm = frame_key.lower()
-
-    if frame_key_norm == "base":
-        target_pos_base = pos_local.copy()
-        R_des_base = R_local
-    else:
-        target_pos_base, R_des_base = _pose_in_base(
-            robot_config,
-            config,
-            frame_key_norm,
-            pos_local,
-            quat_local,
-            logger,
-        )
-
-    target_quat_vec = np.array(rotation_matrix_to_quaternion(R_des_base), dtype=np.float64)
-    target_quat_vec = _normalize_quaternion(target_quat_vec)
-    target_quat_base = tuple(target_quat_vec)
-
-    logger.info(
-        f"[{runtime.name}] Target in BASE frame (frame={frame_key_norm}): pos={np.round(target_pos_base,4)}, "
-        f"quat_wxyz={np.round(target_quat_vec,4)}"
-    )
-
-    z_min = float(ctrl.ground_plane_z) + 0.04
-    if target_pos_base[2] < z_min:
-        logger.warning(
-            f"Clamping target Z from {target_pos_base[2]:.3f}m to {z_min:.3f}m to avoid near-ground singularities"
-        )
-        target_pos_base[2] = z_min
-
-    # FK for logging
-    plant_context = cache.plant.CreateDefaultContext()
-    cache.plant.SetPositions(plant_context, q_current)
-    ee_pose = cache.plant.CalcRelativeTransform(plant_context, cache.base_frame, cache.ee_frame)
-    current_pos = ee_pose.translation()
-    current_rot = ee_pose.rotation()
-    current_rpy = current_rot.ToRollPitchYaw()
-    current_rpy_deg = (
-        np.rad2deg(current_rpy.roll_angle()),
-        np.rad2deg(current_rpy.pitch_angle()),
-        np.rad2deg(current_rpy.yaw_angle()),
-    )
-
-    start_gap = float(np.linalg.norm(np.array(target_pos_base) - current_pos))
-    if target_pos_base[2] < 0.1:
-        logger.warning(
-            f"Target Z={target_pos_base[2]:.3f}m may be too low (below robot base)"
-        )
-    if float(np.linalg.norm(target_pos_base)) > 1.5:
+    current_pos, current_rpy_deg = _current_pose(cache, q_current)
+    gap = float(np.linalg.norm(target.position - current_pos))
+    if target.position[2] < 0.1:
+        logger.warning(f"Target Z={target.position[2]:.3f}m may be too low (below robot base)")
+    if float(np.linalg.norm(target.position)) > 1.5:
         logger.warning("Target distance may exceed workspace")
 
     logger.info(
-        f"IK: Current EE at {tuple(current_pos)} RPY={current_rpy_deg}; target {tuple(target_pos_base)} RPY={orientation_deg}"
+        f"IK: Current EE at {tuple(current_pos)} RPY={current_rpy_deg}; target {tuple(target.position)} RPY={target.orientation_deg}"
     )
-    logger.info(f"IK: Distance to target = {start_gap:.3f}m")
-
-    def _clamp_to_limits(vec: np.ndarray) -> np.ndarray:
-        lower, upper = cache.lower, cache.upper
-        nq = cache.plant.num_positions()
-        vec = np.asarray(vec, dtype=np.float64).flatten()
-        if vec.shape[0] > nq:
-            vec = vec[:nq]
-        if vec.shape[0] < nq:
-            vec = np.concatenate([vec, np.zeros(nq - vec.shape[0])], axis=0)
-        return clamp_vector(vec, lower, upper)
-
-    seeds = [q_current.copy()]
-    nq = cache.plant.num_positions()
-    zero_config = np.zeros(nq, dtype=np.float64)
-    seeds.append(_clamp_to_limits(zero_config))
-    if nq >= 6:
-        elbow_up = np.array([0.0, -np.pi / 3, np.pi / 3, -np.pi / 3, -np.pi / 3, 0.0], dtype=np.float64)
-        elbow_down = np.array([0.0, np.pi / 4, -np.pi / 4, np.pi / 4, np.pi / 4, 0.0], dtype=np.float64)
-        home_pose = np.array([0.0, -np.pi / 6, np.pi / 4, 0.0, np.pi / 3, 0.0], dtype=np.float64)
-        seeds.extend([
-            _clamp_to_limits(elbow_up),
-            _clamp_to_limits(elbow_down),
-            _clamp_to_limits(home_pose),
-        ])
-    try:
-        target_angle = float(np.arctan2(target_pos_base[1], target_pos_base[0]))
-        if nq >= 1:
-            biased = q_current.copy()
-            biased[0] = target_angle
-            seeds.append(_clamp_to_limits(biased))
-    except Exception:
-        pass
-
-    rng = np.random.RandomState(42)
-    for base in [q_current, zero_config]:
-        for _ in range(6):
-            noise = rng.uniform(-0.2, 0.2, size=nq)
-            seeds.append(_clamp_to_limits(base + noise))
-
-    logger.debug(f"[{runtime.name}] IK seed count: {len(seeds)} (base nq={nq})")
+    logger.info(f"IK: Distance to target = {gap:.3f}m")
 
     update_all_states()
     is_valid = build_state_valid()
     logger.debug(f"Current position validity check: {is_valid(q_current)}")
 
-    q_goal = None
-    last_info = {}
-    pos_tol = float(ctrl.ik_pos_tolerance_m)
-    rot_tol = float(ctrl.ik_rot_tolerance_deg)
-
-    q_try, info = solve_ik_drake(
-        cache,
-        q_seed=q_current,
-        target_pos_base_m=tuple(target_pos_base),
-        target_quat_base_wxyz=target_quat_base,
-        is_state_valid=is_valid,
-        opts=DrakeIKOptions(
-            pos_tolerance_m=pos_tol,
-            rot_tolerance_deg=rot_tol,
-            max_random_seeds=16,
-            seed_noise_rad=0.35,
-            center_bias_weight=1e-2,
-            seed_stick_weight=5e-3,
-        ),
+    q_goal, metrics, achieved_pos, ik_info = _solve_cartesian_ik(
+        cache, q_current, target, ctrl, is_valid, logger, runtime.name
     )
-    last_info = info
-    if q_try is not None:
-        q_goal = q_try
-    else:
-        logger.info("Single-shot IK failed, trying progressive IK...")
-        start_pos = current_pos
-        q_curr = q_current.copy()
-        steps = 20
-        for i in range(1, steps + 1):
-            wp = start_pos + (i / steps) * (np.array(target_pos_base) - start_pos)
-            q_next, info = solve_ik_drake(
-                cache,
-                q_seed=q_curr,
-                target_pos_base_m=tuple(wp),
-                target_quat_base_wxyz=target_quat_base,
-                is_state_valid=is_valid,
-                opts=DrakeIKOptions(
-                    pos_tolerance_m=pos_tol,
-                    rot_tolerance_deg=float(max(rot_tol, 0.5)),
-                    max_random_seeds=8,
-                    seed_noise_rad=0.25,
-                    center_bias_weight=5e-3,
-                    seed_stick_weight=5e-3,
-                ),
-            )
-            last_info = info
-            if q_next is None:
-                logger.debug(
-                    f"[{runtime.name}] Progressive IK failed at step {i}/{steps}: {info}"
-                )
-                break
-            q_curr = q_next
-            if not is_valid(q_curr):
-                last_info = {
-                    "reason": "goal_in_collision",
-                    "seed_idx": i,
-                    "ori_mode": info.get("ori_mode"),
-                }
-                logger.debug(
-                    f"[{runtime.name}] Progressive IK produced in-collision waypoint ({i}/{steps})"
-                )
-                break
-            if i == steps and is_valid(q_curr):
-                q_goal = q_curr
-                break
-        if q_goal is not None and not is_valid(q_goal):
-            logger.debug("Progressive IK produced in-collision goal")
-            q_goal = None
-
     logger.info(f"IK result: success={q_goal is not None}")
     if q_goal is None:
-        if last_info.get("reason") == "did_not_converge":
-            logger.error(
-                "IK failed to converge to the requested pose after %d seeds (pos_err=%.3fm, rot_err=%.3frad)."
-                % (len(seeds), last_info.get("pos_err", 0), last_info.get("rot_err", 0))
-            )
-        else:
-            logger.error(
-                f"IK failed for {runtime.name} after {len(seeds)} seeds: {last_info or {'reason': 'unknown'}}"
-            )
+        logger.error(f"IK failed for {runtime.name}: {ik_info or 'unknown reason'}")
         return None
 
-    plant_context_check = cache.plant.CreateDefaultContext()
-    cache.plant.SetPositions(plant_context_check, q_goal)
-    achieved_pose = cache.plant.CalcRelativeTransform(
-        plant_context_check, cache.base_frame, cache.ee_frame
-    )
-    achieved_pos = achieved_pose.translation()
-    achieved_rot = achieved_pose.rotation()
-    achieved_rpy = achieved_rot.ToRollPitchYaw()
-    achieved_rpy_deg = (
-        np.rad2deg(achieved_rpy.roll_angle()),
-        np.rad2deg(achieved_rpy.pitch_angle()),
-        np.rad2deg(achieved_rpy.yaw_angle()),
-    )
-    logger.info(f"IK achieved: pos={tuple(achieved_pos)} RPY={achieved_rpy_deg}")
-
-    theta_deg = None
-    try:
-        R_ach = achieved_rot.matrix()
-        R_err = R_ach.T @ (R_des_base)
-        tr = float(np.trace(R_err))
-        tr_clamped = max(-1.0, min(3.0, tr))
-        cos_theta = (tr_clamped - 1.0) / 2.0
-        cos_theta = max(-1.0, min(1.0, cos_theta))
-        theta_deg = float(np.degrees(np.arccos(cos_theta)))
-        logger.info(
-            f"Orientation geodesic error = {theta_deg:.3f}° (mode={last_info.get('ori_mode')})"
+    if metrics and metrics.slack_used:
+        logger.debug(
+            f"[{runtime.name}] IK accepted with slack: pos_linf={metrics.pos_linf*1000:.3f}mm, ang_err={metrics.rot_err:.3f}°"
         )
-    except Exception as exc:
-        logger.debug(f"Geodesic orientation error computation failed: {exc}")
 
-    pos_diff = np.asarray(achieved_pos) - target_pos_base
-    pos_err = float(np.linalg.norm(pos_diff))
-    pos_linf = float(np.max(np.abs(pos_diff)))
-    rot_err = float(theta_deg) if theta_deg is not None else float("nan")
-
-    logger.debug(
-        f"[{runtime.name}] IK pose diff: pos_linf={pos_linf*1000:.4f}mm, pos_l2={pos_err*1000:.4f}mm, "
-        f"ang_err={rot_err:.4f}°"
-    )
-
-    eps = 1e-6
-    pos_tol = float(ctrl.ik_pos_tolerance_m)
-    rot_tol = float(ctrl.ik_rot_tolerance_deg)
-    if pos_linf > pos_tol + eps or (
-        theta_deg is not None and theta_deg > rot_tol + eps
-    ):
-        logger.error(
-            f"IK solution violates tolerance for {runtime.name}: "
-            f"pos_linf={pos_linf*1000:.3f}mm (limit {pos_tol*1000:.3f}mm), "
-            f"pos_l2={pos_err*1000:.3f}mm, "
-            f"ang_err={rot_err:.3f}° (limit {rot_tol:.3f}°)"
-        )
+    if not is_valid(q_goal):
+        logger.error(f"[{runtime.name}] IK solution is in collision (environment/ground)")
         return None
 
-    lower = cache.lower
-    upper = cache.upper
+    lower, upper = cache.lower, cache.upper
     q_current = clamp_vector(q_current, lower, upper)
     q_goal = clamp_vector(q_goal, lower, upper)
 
-    if not is_valid(q_current):
-        try:
-            plant_context = cache.plant.CreateDefaultContext()
-            cache.plant.SetPositions(plant_context, q_current)
-            ee_pose = cache.plant.CalcRelativeTransform(
-                plant_context, cache.base_frame, cache.ee_frame
-            )
-            pos_repair = ee_pose.translation().copy()
-            pos_repair[2] += 0.03
-            rot = ee_pose.rotation()
-            quat_repair = rot.ToQuaternion()
-            quat_repair_wxyz = (
-                quat_repair.w(),
-                quat_repair.x(),
-                quat_repair.y(),
-                quat_repair.z(),
-            )
-            q_repair, _ = solve_ik_drake(
-                cache,
-                q_seed=q_current,
-                target_pos_base_m=tuple(pos_repair),
-                target_quat_base_wxyz=quat_repair_wxyz,
-                is_state_valid=is_valid,
-                opts=DrakeIKOptions(
-                    pos_tolerance_m=pos_tol,
-                    rot_tolerance_deg=float(max(rot_tol, 0.5)),
-                    max_random_seeds=4,
-                    seed_noise_rad=0.1,
-                    center_bias_weight=1e-3,
-                    seed_stick_weight=1e-2,
-                ),
-            )
-            if q_repair is not None and is_valid(q_repair):
-                logger.debug("Start state invalid; applied +3cm Z IK repair to clear collisions.")
-                q_current = q_repair
-            else:
-                logger.error("Start state is invalid and repair IK failed; aborting planning")
-                return None
-        except Exception as exc:
-            logger.debug(f"Start repair IK failed: {exc}")
-            logger.error("Start state is invalid and repair IK errored; aborting planning")
-            return None
+    repaired = _repair_start_state(cache, q_current, is_valid, float(ctrl.ik_pos_tolerance_m), float(ctrl.ik_rot_tolerance_deg), logger)
+    if repaired is None:
+        return None
+    q_current = repaired
 
     timeout = float(ctrl.planner_timeout)
-
     planner_specs = default_joint_planner_specs(float(ctrl.planner_resolution))
     if not planner_specs:
         logger.error(f"[{runtime.name}] OMPL planners unavailable")
@@ -452,10 +499,7 @@ def plan_cartesian_move(
         f"Selected {plan_name} plan for {runtime.name} ({waypoints.shape[0]} waypoints, {times[-1]:.2f}s duration, cost={cost:.3f})"
     )
 
-    runtime.last_target_pose = (
-        np.array(target_pos_base, dtype=np.float64),
-        np.array(target_quat_base, dtype=np.float64),
-    )
+    runtime.last_target_pose = (np.array(target.position, dtype=np.float64), np.array(target.quat_wxyz, dtype=np.float64))
     runtime.last_planned_q = waypoints[-1].copy()
 
     return waypoints, times

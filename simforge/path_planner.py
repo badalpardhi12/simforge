@@ -34,7 +34,51 @@ def _trap_times(waypoints: np.ndarray, max_vel: float, max_acc: float) -> np.nda
         t_const = d_const / max_vel
         total_time = 2 * t_acc + t_const
 
-    return np.linspace(0.0, total_time, waypoints.shape[0]).astype(np.float32)
+    cum_dist = np.concatenate(([0.0], np.cumsum(seg_dist)))
+    time_scale = cum_dist / total_dist
+    times = (time_scale * total_time).astype(np.float32)
+    times[-1] = float(total_time)
+    return times
+
+
+def _densify_waypoints(
+    waypoints: np.ndarray,
+    *,
+    max_joint_step: float = 0.02,
+    min_points: int = 20,
+) -> np.ndarray:
+    if waypoints.shape[0] <= 1:
+        return waypoints
+
+    samples = [waypoints[0]]
+    for i in range(1, waypoints.shape[0]):
+        prev = waypoints[i - 1]
+        nxt = waypoints[i]
+        diff = nxt - prev
+        seg_len = float(np.linalg.norm(diff, ord=np.inf))
+        steps = max(1, int(np.ceil(seg_len / max_joint_step)))
+        for s in range(1, steps + 1):
+            alpha = s / steps
+            samples.append(prev + alpha * diff)
+
+    arr = np.vstack(samples)
+    if arr.shape[0] >= min_points:
+        return arr
+
+    # Resample to ensure minimum point count using path length parameterisation
+    cumulative = np.zeros(arr.shape[0], dtype=np.float64)
+    for i in range(1, arr.shape[0]):
+        cumulative[i] = cumulative[i - 1] + float(np.linalg.norm(arr[i] - arr[i - 1], ord=np.inf))
+
+    total = cumulative[-1]
+    if total < 1e-9:
+        return np.linspace(arr[0], arr[-1], min_points)
+
+    target_d = np.linspace(0.0, total, min_points)
+    resampled = np.empty((min_points, arr.shape[1]), dtype=np.float64)
+    for j in range(arr.shape[1]):
+        resampled[:, j] = np.interp(target_d, cumulative, arr[:, j])
+    return resampled
 
 
 # ---------- Core OMPL helpers ----------
@@ -131,14 +175,35 @@ def ompl_plan_with_factory(
         return None
 
     path_geometric = pdef.getSolutionPath()
+    if path_geometric is None:
+        return None
     if simplify and hasattr(og, "PathSimplifier"):
-        og.PathSimplifier(si).simplifyMax(path_geometric)
+        try:
+            og.PathSimplifier(si).simplifyMax(path_geometric)
+        except Exception:
+            # Fall back to the raw path if simplification fails (e.g., approximate solutions)
+            pass
 
     states = path_geometric.getStates()
     waypoints = np.array([[s[i] for i in range(dof)] for s in states], dtype=np.float64)
 
+    if waypoints.size == 0:
+        return None
+
+    if np.linalg.norm(waypoints[-1] - q_goal, ord=np.inf) > 1e-6:
+        waypoints = np.vstack([waypoints, q_goal.copy()])
+
     for i in range(len(waypoints) - 1):
         if not _check_segment_collision_free(waypoints[i], waypoints[i + 1], is_state_valid, resolution=20):
+            return None
+
+    waypoints = _densify_waypoints(waypoints)
+    waypoints[-1] = q_goal.copy()
+
+    for i in range(len(waypoints) - 1):
+        if not is_state_valid(waypoints[i]) or not is_state_valid(waypoints[i + 1]):
+            return None
+        if not _check_segment_collision_free(waypoints[i], waypoints[i + 1], is_state_valid, resolution=10):
             return None
 
     times = _trap_times(waypoints, max_vel=1.0, max_acc=2.0)

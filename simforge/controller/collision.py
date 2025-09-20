@@ -9,17 +9,19 @@ from ..collision_checker import CollisionChecker
 if TYPE_CHECKING:
     from ..config_reader import SimforgeConfig
     from .robot_runtime import RobotRuntime
+    from ..tooling import ToolManager
 
 
 def create_collision_checker(
     robot_config,
     config: "SimforgeConfig",
     logger,
+    tool_manager: Optional["ToolManager"] = None,
 ) -> Optional[CollisionChecker]:
     """Build a ``CollisionChecker`` for the given robot configuration."""
     ctrl = config.control_for(robot_config.name)
 
-    world_boxes: List[Tuple[str, Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]] = []
+    world_boxes: List[Tuple[str, Any, Tuple[float, float, float], Tuple[float, float, float]]] = []
     for obj in config.objects:
         if obj.collision_enabled is False:
             continue
@@ -30,6 +32,16 @@ def create_collision_checker(
                     tuple(obj.size),
                     tuple(obj.position),
                     tuple(obj.orientation_rpy),
+                )
+            )
+        elif obj.type == "sphere" and obj.size:
+            radius = float(obj.size[0])
+            world_boxes.append(
+                (
+                    obj.name or "sphere",
+                    {"type": "sphere", "radius": radius},
+                    tuple(obj.position),
+                    tuple(obj.orientation_rpy or (0.0, 0.0, 0.0)),
                 )
             )
         elif obj.type == "plane":
@@ -63,6 +75,9 @@ def create_collision_checker(
     allowed_link_pairs = None
     if not ctrl.self_collision_check:
         allowed_link_pairs = []
+        
+    # Note: if robot has tool, the URDF should already be the combined one
+    # from controller initialization, so no need to add tool geometries separately
 
     try:
         return CollisionChecker(
@@ -91,9 +106,19 @@ def register_env_robots(robots: Dict[str, "RobotRuntime"], logger) -> None:
             if runtime_a.name == runtime_b.name:
                 continue
             try:
-                checker.register_env_robot(runtime_b.name, runtime_b.config.urdf)
-                logger.debug(
-                    f"Registered env robot '{runtime_b.name}' into checker for '{runtime_a.name}'"
+                # Use the actual URDF that was used for collision checking
+                # (which might be the combined URDF with tool if tool is attached)
+                urdf_to_register = runtime_b.config.urdf
+                # Check if runtime_b has a combined URDF with tool
+                from pathlib import Path
+                combined_path = Path(runtime_b.config.urdf).parent / f"{Path(runtime_b.config.urdf).stem}_with_tool.urdf"
+                if runtime_b.config.tool and combined_path.exists():
+                    urdf_to_register = str(combined_path)
+                    logger.info(f"Using combined URDF for env robot {runtime_b.name}: {combined_path}")
+                    
+                checker.register_env_robot(runtime_b.name, urdf_to_register)
+                logger.info(
+                    f"Registered env robot '{runtime_b.name}' (urdf: {urdf_to_register}) into checker for '{runtime_a.name}'"
                 )
             except Exception as exc:
                 logger.debug(
@@ -176,6 +201,7 @@ def make_state_valid_fn(
                     base_position=base_pos,
                     base_orientation_rpy=base_rpy,
                 )
+                # logger.debug(f"Updated env robot {name_o} at base {base_pos} with q={q_o[:3] if len(q_o) > 3 else q_o}")
             except Exception as exc:
                 logger.debug(f"Env robot update failed for {name_o}: {exc}")
 
@@ -187,7 +213,10 @@ def make_state_valid_fn(
         else:
             q_use = q
         try:
-            return not checker.in_collision_from_pin(mdl, dat, q_use)
+            in_collision = checker.in_collision_from_pin(mdl, dat, q_use)
+            if in_collision:
+                logger.debug(f"[{runtime.name}] State in collision at q={q_use[:3] if len(q_use) > 3 else q_use}")
+            return not in_collision
         except Exception as exc:
             logger.warning(f"Collision check error for {runtime.name}: {exc}")
             return False

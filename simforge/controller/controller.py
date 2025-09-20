@@ -11,6 +11,7 @@ from ..config_reader import SimforgeConfig
 from ..genesis_renderer import GenesisRenderer
 from ..logging_utils import setup_logging
 from ..ik_drake import DrakeIKCache, DrakeIKOptions, solve_ik_drake
+from ..tooling import ToolManager
 from .commands import (
     Command,
     ControlMode,
@@ -62,6 +63,9 @@ class MovementController:
         self.config = config
         self.logger = setup_logging(debug)
         self.renderer = GenesisRenderer(config.scene.backend, self.logger)
+        
+        # Initialize tool manager
+        self.tool_manager = ToolManager(self.logger)
 
         self.robots: Dict[str, RobotRuntime] = {}
         for robot_config in self.config.robots:
@@ -101,16 +105,62 @@ class MovementController:
     # ------------------------------------------------------------------
     def _initialize_runtime(self, runtime: RobotRuntime) -> None:
         runtime.mode = ControlMode.JOINT
-        runtime.collision_checker = collision.create_collision_checker(
-            runtime.config, self.config, self.logger
-        )
+        
+        # If robot has a tool, create combined URDF first for collision checking
+        if runtime.config.tool and self.tool_manager:
+            from ..tooling import ToolDefinition
+            from pathlib import Path
+            
+            tool_def = ToolDefinition(
+                name=f"{runtime.name}_tool",
+                urdf_path=runtime.config.tool.urdf,
+                tcp_offset=runtime.config.tool.tcp_offset,
+                attach_offset=(
+                    runtime.config.tool.position[0],
+                    runtime.config.tool.position[1],
+                    runtime.config.tool.position[2],
+                    runtime.config.tool.orientation_rpy[0],
+                    runtime.config.tool.orientation_rpy[1],
+                    runtime.config.tool.orientation_rpy[2]
+                ) if runtime.config.tool else None
+            )
+            self.tool_manager.register_tool(tool_def)
+            
+            # Create combined URDF for collision checking
+            output_path = Path(runtime.config.urdf).parent / f"{Path(runtime.config.urdf).stem}_with_tool.urdf"
+            combined_urdf = self.tool_manager.attach_tool_to_robot_urdf(
+                runtime.config.urdf,
+                tool_def.name,
+                runtime.config.end_effector_link,
+                str(output_path)
+            )
+            
+            # Create a modified config with the combined URDF for collision checking
+            import copy
+            modified_config = copy.deepcopy(runtime.config)
+            modified_config.urdf = combined_urdf
+            runtime.collision_checker = collision.create_collision_checker(
+                modified_config, self.config, self.logger, None  # No need to pass tool_manager since URDF already has tool
+            )
+        else:
+            runtime.collision_checker = collision.create_collision_checker(
+                runtime.config, self.config, self.logger, self.tool_manager
+            )
         runtime.state_valid_cache = None
 
-        # Build IK cache
+        # Build IK cache - use combined URDF if tool is attached
+        urdf_for_ik = runtime.config.urdf
+        if runtime.config.tool and self.tool_manager:
+            from pathlib import Path
+            combined_path = Path(runtime.config.urdf).parent / f"{Path(runtime.config.urdf).stem}_with_tool.urdf"
+            if combined_path.exists():
+                urdf_for_ik = str(combined_path)
+                self.logger.info(f"Using combined URDF with tool for IK cache: {urdf_for_ik}")
+        
         try:
-            base_link = "meca_base_link" if "meca" in runtime.config.urdf.lower() else "base_link"
+            base_link = "meca_base_link" if "meca" in urdf_for_ik.lower() else "base_link"
             runtime.drake_cache = DrakeIKCache(
-                runtime.config.urdf,
+                urdf_for_ik,
                 base_link=base_link,
                 ee_link=runtime.config.end_effector_link,
             )
@@ -119,11 +169,19 @@ class MovementController:
             self.logger.warning(f"Failed to load Drake IK cache for {runtime.name}: {exc}")
             runtime.drake_cache = None
 
-        # Pinocchio models for collision
+        # Pinocchio models for collision - use combined URDF if tool is attached
+        urdf_for_pinocchio = runtime.config.urdf
+        if runtime.config.tool and self.tool_manager:
+            from pathlib import Path
+            combined_path = Path(runtime.config.urdf).parent / f"{Path(runtime.config.urdf).stem}_with_tool.urdf"
+            if combined_path.exists():
+                urdf_for_pinocchio = str(combined_path)
+                self.logger.info(f"Using combined URDF with tool for Pinocchio: {urdf_for_pinocchio}")
+        
         try:
             import pinocchio as pin
 
-            mdl = pin.buildModelFromUrdf(runtime.config.urdf)
+            mdl = pin.buildModelFromUrdf(urdf_for_pinocchio)
             dat = mdl.createData()
             runtime.pin_model = mdl
             runtime.pin_data = dat
@@ -138,7 +196,7 @@ class MovementController:
     # Scene management
     # ------------------------------------------------------------------
     def build_scene(self) -> None:
-        self.scene = scene_builder.build_scene(self.renderer, self.config, self.robots, self.logger)
+        self.scene = scene_builder.build_scene(self.renderer, self.config, self.robots, self.logger, self.tool_manager)
         self._sync_legacy_views()
         self._build_object_frames()
 
@@ -404,7 +462,10 @@ class MovementController:
         if checker and mdl and dat:
             try:
                 q_array = np.array(q, dtype=np.float64)
-                if not checker.in_collision_from_pin(mdl, dat, q_array):
+                in_collision = checker.in_collision_from_pin(mdl, dat, q_array)
+                if in_collision:
+                    logger.warning(f"[{runtime.name}] Recording collision state (this shouldn't happen)")
+                else:
                     runtime.last_safe_q = q_array.copy()
             except Exception:
                 pass

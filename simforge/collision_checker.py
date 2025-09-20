@@ -53,6 +53,7 @@ class CollisionChecker:
     ) -> None:
         self.logger = logger
         self.urdf_path = Path(urdf_path)
+        self.ground_plane_z = float(ground_plane_z)
         self.available = HAS_FCL and HAS_TRIMESH
         if not self.available:
             self.logger.warning("FCL/trimesh not available - collision checking disabled")
@@ -69,7 +70,6 @@ class CollisionChecker:
         self.env_robot_geoms: Dict[str, Dict[str, List[_LinkGeom]]] = {}
         self.allowed_link_pairs: Set[Tuple[str, str]] = set()
         self.allowed_world_pairs: Set[Tuple[str, str]] = set()
-        self.ground_plane_z = float(ground_plane_z)
 
         if allowed_link_pairs:
             for a, b in allowed_link_pairs:
@@ -169,6 +169,23 @@ class CollisionChecker:
                     L.append(_LinkGeom(R_local, t_local, co))
                     continue
 
+                cylinder = geom.find("cylinder")
+                if cylinder is not None:
+                    radius = float(cylinder.get("radius", "0.01")) * self._shrink
+                    length = float(cylinder.get("length", "0.1")) * self._shrink
+                    cy = fcl.Cylinder(radius, length)
+                    co = fcl.CollisionObject(cy, fcl.Transform(np.eye(3), np.zeros(3)))
+                    L.append(_LinkGeom(R_local, t_local, co))
+                    continue
+
+                sphere = geom.find("sphere")
+                if sphere is not None:
+                    radius = float(sphere.get("radius", "0.01")) * self._shrink
+                    sp = fcl.Sphere(radius)
+                    co = fcl.CollisionObject(sp, fcl.Transform(np.eye(3), np.zeros(3)))
+                    L.append(_LinkGeom(R_local, t_local, co))
+                    continue
+
             if L:
                 self.robot_geoms[lname] = L
 
@@ -176,14 +193,19 @@ class CollisionChecker:
         # Express world boxes in the robot BASE frame used by Pinocchio/IK/OMPL
         Rb_T = self._base_R.T
         tb = self._base_t
-        for name, size, pos, rpy in boxes:
-            sx, sy, sz = [float(x) for x in size]
-            bx = fcl.Box(sx, sy, sz)
+        for name, shape_info, pos, rpy in boxes:
+            if isinstance(shape_info, dict) and shape_info.get("type") == "sphere":
+                radius = float(shape_info.get("radius", 0.0))
+                geom = fcl.Sphere(radius)
+            else:
+                sx, sy, sz = [float(x) for x in shape_info]
+                geom = fcl.Box(sx, sy, sz)
+
             Rw = rpy_to_rotation_matrix(*rpy)
             tw = np.array(pos, dtype=np.float64)
             R_rel = Rb_T @ Rw
             t_rel = Rb_T @ (tw - tb)
-            self.env_objs[f"obj:{name}"] = fcl.CollisionObject(bx, fcl.Transform(R_rel, t_rel))
+            self.env_objs[f"obj:{name}"] = fcl.CollisionObject(geom, fcl.Transform(R_rel, t_rel))
 
     # ---------- external robots registration and updates ----------
     def register_env_robot(self, name: str, urdf_path: str) -> None:
@@ -192,7 +214,9 @@ class CollisionChecker:
             return
         try:
             self.env_robot_geoms[name] = self._build_geoms_from_urdf(urdf_path)
-            self.logger.debug(f"Registered env robot '{name}' with {len(self.env_robot_geoms[name])} links")
+            # Count links to verify tool is included
+            link_count = len(self.env_robot_geoms[name])
+            self.logger.info(f"Registered environment robot: {name} with {link_count} links from {urdf_path}")
         except Exception as e:
             self.logger.warning(f"Failed to register env robot '{name}': {e}")
 
@@ -265,6 +289,23 @@ class CollisionChecker:
                     L.append(_LinkGeom(R_local, t_local, co))
                     continue
 
+                cylinder = geom.find("cylinder")
+                if cylinder is not None:
+                    radius = float(cylinder.get("radius", "0.01")) * self._shrink
+                    length = float(cylinder.get("length", "0.1")) * self._shrink
+                    cy = fcl.Cylinder(radius, length)
+                    co = fcl.CollisionObject(cy, fcl.Transform(np.eye(3), np.zeros(3)))
+                    L.append(_LinkGeom(R_local, t_local, co))
+                    continue
+
+                sphere = geom.find("sphere")
+                if sphere is not None:
+                    radius = float(sphere.get("radius", "0.01")) * self._shrink
+                    sp = fcl.Sphere(radius)
+                    co = fcl.CollisionObject(sp, fcl.Transform(np.eye(3), np.zeros(3)))
+                    L.append(_LinkGeom(R_local, t_local, co))
+                    continue
+
             if L:
                 mapping[lname] = L
         return mapping
@@ -310,15 +351,19 @@ class CollisionChecker:
             R_link_ext = M_link.rotation
             t_link_ext = M_link.translation
 
-            # Link in WORLD
+            # Link frame in WORLD coordinates
             R_world = R_ext @ R_link_ext
             t_world = t_ext + R_ext @ t_link_ext
 
-            # Express in this robot's BASE frame
-            R_rel = Rb_T @ R_world
-            t_rel = Rb_T @ (t_world - tb)
-
             for g in geoms:
+                # Apply the collision origin (local transform) before re-expressing
+                R_geom_world = R_world @ g.local_R
+                t_geom_world = t_world + R_world @ g.local_t
+
+                # Express geometry in this robot's BASE frame
+                R_rel = Rb_T @ R_geom_world
+                t_rel = Rb_T @ (t_geom_world - tb)
+
                 g.obj.setTransform(fcl.Transform(R_rel, t_rel))
 
     # ---------- check collision given a Pinocchio state ----------
@@ -405,7 +450,13 @@ class CollisionChecker:
                                 req = fcl.CollisionRequest()
                                 res = fcl.CollisionResult()
                                 if fcl.collide(oa.obj, ob.obj, req, res) > 0:
-                                    return True
+                                    # Log tool collisions specifically
+                                    if "tool" in lname.lower() or "tool" in elname.lower():
+                                        self.logger.warning(f"TOOL COLLISION DETECTED: {lname} <-> {env_robot}/{elname}")
+                                        return True
+                                    else:
+                                        self.logger.debug(f"Non-tool collision: {lname} <-> {env_robot}/{elname}")
+                                        return True
 
         # ground plane quick check (optional) - t_link is already in BASE for fixed-base models
         if self.ground_plane_z != 0.0:

@@ -50,9 +50,10 @@ class ControlConfig(BaseModel):
 
 class ToolConfig(BaseModel):
     urdf: str
-    attach_link: str
+    attach_link: Optional[str] = None  # Made optional - will use end_effector_link if not specified
     position: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     orientation_rpy: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    tcp_offset: Optional[Tuple[float, float, float, float, float, float, float]] = None
 
 class RobotConfig(BaseModel):
     name: str
@@ -77,11 +78,20 @@ class ObjectConfig(BaseModel):
     dynamic: bool = True
 
 
+class ToolDefinition(BaseModel):
+    """Global tool definition that can be referenced by robots."""
+    name: str
+    urdf: str
+    tcp_offset: Optional[Tuple[float, float, float, float, float, float, float]] = None
+    attach_offset: Optional[Tuple[float, float, float, float, float, float]] = None
+
+
 class SimforgeConfig(BaseModel):
     scene: SceneConfig = Field(default_factory=SceneConfig)
     robots: List[RobotConfig] = Field(default_factory=list)
     objects: List[ObjectConfig] = Field(default_factory=list)
     control: ControlConfig = Field(default_factory=ControlConfig)
+    tools: List[ToolDefinition] = Field(default_factory=list)
 
     def control_for(self, robot_name: str) -> ControlConfig:
         robot = next((r for r in self.robots if r.name == robot_name), None)
@@ -135,7 +145,15 @@ class SimforgeConfig(BaseModel):
             processed_robots.append(entry)
 
         data["robots"] = processed_robots
+        
+        # Process tools if present
+        tools = []
+        for tool_data in data.get("tools", []):
+            if isinstance(tool_data, dict):
+                tools.append(tool_data)
+        data["tools"] = tools
+        
         return SimforgeConfig.model_validate(data)
 
 
-__all__ = ["SimforgeConfig", "RobotConfig", "ControlConfig", "SceneConfig", "ObjectConfig", "ToolConfig"]
+__all__ = ["SimforgeConfig", "RobotConfig", "ControlConfig", "SceneConfig", "ObjectConfig", "ToolConfig", "ToolDefinition"]

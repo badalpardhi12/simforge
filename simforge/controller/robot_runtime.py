@@ -58,6 +58,8 @@ class RobotRuntime:
     last_planned_q: Optional[np.ndarray] = None
     pending_pose_validation: bool = False
     pose_refine_attempts: int = 0
+    tool_name: Optional[str] = None
+    tool_tcp_offset: Optional[Tuple[np.ndarray, np.ndarray]] = None  # (position, quaternion)
 
     def has_collision_checker(self) -> bool:
         return bool(self.collision_checker and getattr(self.collision_checker, "available", False))
