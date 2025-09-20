@@ -35,6 +35,17 @@ class _IKMetrics:
     slack_used: bool = False
 
 
+@dataclass
+class CartesianPlanResult:
+    plan_name: str
+    waypoints: np.ndarray
+    times: np.ndarray
+    cost: float
+    target_pos: np.ndarray
+    target_quat: np.ndarray
+    q_goal: np.ndarray
+
+
 def _normalize_quaternion(quat: np.ndarray) -> np.ndarray:
     q = np.asarray(quat, dtype=np.float64)
     norm = np.linalg.norm(q)
@@ -403,10 +414,11 @@ def plan_cartesian_move(
     read_actual_joints: Callable[[], np.ndarray],
     update_all_states: Callable[[], None],
     build_state_valid: Callable[[], Callable[[np.ndarray], bool]],
-) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    apply_runtime: bool = True,
+) -> Optional[CartesianPlanResult]:
     """Plan a Cartesian move for ``runtime``.
 
-    Returns ``(waypoints, times)`` in radians and seconds when successful.
+    Returns a :class:`CartesianPlanResult` when successful.
     """
     cache = runtime.drake_cache
     if cache is None:
@@ -499,10 +511,21 @@ def plan_cartesian_move(
         f"Selected {plan_name} plan for {runtime.name} ({waypoints.shape[0]} waypoints, {times[-1]:.2f}s duration, cost={cost:.3f})"
     )
 
-    runtime.last_target_pose = (np.array(target.position, dtype=np.float64), np.array(target.quat_wxyz, dtype=np.float64))
-    runtime.last_planned_q = waypoints[-1].copy()
+    result = CartesianPlanResult(
+        plan_name=plan_name,
+        waypoints=waypoints,
+        times=times,
+        cost=cost,
+        target_pos=np.array(target.position, dtype=np.float64),
+        target_quat=np.array(target.quat_wxyz, dtype=np.float64),
+        q_goal=q_goal.copy(),
+    )
 
-    return waypoints, times
+    if apply_runtime:
+        runtime.last_target_pose = (result.target_pos.copy(), result.target_quat.copy())
+        runtime.last_planned_q = result.q_goal.copy()
+
+    return result
 
 
-__all__ = ["plan_cartesian_move"]
+__all__ = ["plan_cartesian_move", "CartesianPlanResult"]

@@ -46,6 +46,15 @@ def build_scene(renderer, config, runtimes: Dict[str, "RobotRuntime"], logger, t
                     fixed=not obj.dynamic,
                 )
             )
+        elif obj.type == "urdf" and obj.urdf:
+            scene.add_entity(
+                renderer.morphs.URDF(
+                    file=obj.urdf,
+                    pos=obj.position,
+                    euler=obj.orientation_rpy,
+                    fixed=not obj.dynamic,
+                )
+            )
 
     # Robots
     for robot in config.robots:

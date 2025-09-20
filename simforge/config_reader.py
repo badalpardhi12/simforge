@@ -74,6 +74,7 @@ class ObjectConfig(BaseModel):
     position: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     orientation_rpy: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     size: Optional[Tuple[float, float, float]] = None
+    urdf: Optional[str] = None
     collision_enabled: bool = True
     dynamic: bool = True
 

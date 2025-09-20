@@ -4,6 +4,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 
@@ -25,7 +26,7 @@ from . import collision
 from . import scene_builder
 from .robot_io import get_robot_joints, set_robot_joints
 from .utils import deg_to_rad_list, rad_to_deg_list
-from .ik_planner import plan_cartesian_move
+from .ik_planner import plan_cartesian_move, CartesianPlanResult
 from ..transformations import (
     quaternion_to_rotation_matrix,
     quaternion_multiply,
@@ -99,6 +100,8 @@ class MovementController:
         self.running = False
         self.thread: Optional[threading.Thread] = None
         self.scene = None
+        self._planning_executor = ThreadPoolExecutor(max_workers=2)
+        self._pending_plans: Dict[str, Tuple[Future, RobotRuntime]] = {}
 
     # ------------------------------------------------------------------
     # Initialization helpers
@@ -215,6 +218,7 @@ class MovementController:
         self.running = False
         if self.thread:
             self.thread.join(timeout=2.0)
+        self._planning_executor.shutdown(wait=False)
         self.logger.info("Movement controller stopped")
 
     def _control_loop(self) -> None:
@@ -229,6 +233,7 @@ class MovementController:
                 pass
 
             self._update_robots()
+            self._drain_planning_futures()
 
             if self.scene:
                 try:
@@ -267,6 +272,42 @@ class MovementController:
                     self.logger.debug(f"Updated state for {runtime.name}: {q_current}")
             except Exception as exc:
                 self.logger.debug(f"Failed to update state for {runtime.name}: {exc}")
+        self._sync_legacy_views()
+
+    def _drain_planning_futures(self) -> None:
+        if not self._pending_plans:
+            return
+        completed: List[str] = []
+        for name, (future, runtime) in self._pending_plans.items():
+            if not future.done():
+                continue
+            completed.append(name)
+            try:
+                result = future.result()
+            except Exception as exc:
+                self.logger.error(f"[{name}] Cartesian planning failed: {exc}")
+                continue
+
+            if result is None:
+                self.logger.error(f"[{name}] Cartesian planning returned no path")
+                continue
+
+            self._apply_cartesian_plan(runtime, result)
+
+        for name in completed:
+            self._pending_plans.pop(name, None)
+
+    def _apply_cartesian_plan(self, runtime: RobotRuntime, result: CartesianPlanResult) -> None:
+        runtime.last_target_pose = (result.target_pos.copy(), result.target_quat.copy())
+        runtime.last_planned_q = result.q_goal.copy()
+        runtime.active_traj = ActiveTrajectory(
+            waypoints=result.waypoints,
+            times=result.times,
+            start_time=time.time(),
+        )
+        self.logger.info(
+            f"Cartesian move planned: {runtime.name} ({result.waypoints.shape[0]} waypoints, {result.times[-1]:.2f}s duration)"
+        )
         self._sync_legacy_views()
 
     def _get_last_known_state(self, robot: str) -> Optional[np.ndarray]:
@@ -400,30 +441,66 @@ class MovementController:
             self.logger.error(f"No IK cache for robot {runtime.name}")
             return
 
+        if runtime.name in self._pending_plans:
+            self.logger.warning(f"[{runtime.name}] Cartesian planning already in progress")
+            return
+
+        actual = self._read_robot_joints(runtime, prefer_struct=True)
+        if actual is None:
+            actual = np.zeros(0, dtype=np.float64)
+        else:
+            actual = np.asarray(actual, dtype=np.float64)
+            if actual.size > 0:
+                runtime.last_known_q = actual.copy()
+
+        snapshots: Dict[str, np.ndarray] = {}
+        for name, other in self.robots.items():
+            if other.last_known_q is not None:
+                snapshots[name] = other.last_known_q.copy()
+            elif other.joint_targets:
+                snapshots[name] = np.array([np.deg2rad(d) for d in other.joint_targets], dtype=np.float64)
+
+        if runtime.last_known_q is not None:
+            snapshots[runtime.name] = runtime.last_known_q.copy()
+        elif actual.size > 0:
+            snapshots[runtime.name] = actual.copy()
+        else:
+            snapshots[runtime.name] = np.zeros(runtime.drake_cache.plant.num_positions(), dtype=np.float64)
+
+        def _snapshot_getter(name: str) -> Optional[np.ndarray]:
+            q = snapshots.get(name)
+            if q is None:
+                return None
+            return q.copy()
+
+        runtime.state_valid_cache = collision.make_state_valid_fn(
+            runtime,
+            self.robots,
+            self.logger,
+            _snapshot_getter,
+        )
+
         def read_actual_joints() -> np.ndarray:
-            return self._read_robot_joints(runtime, prefer_struct=True)
+            return snapshots[runtime.name].copy()
 
         runtime.last_target_pose = None
         runtime.last_planned_q = None
         runtime.pose_refine_attempts = 0
-        plan = plan_cartesian_move(
+
+        future = self._planning_executor.submit(
+            plan_cartesian_move,
             runtime,
             cmd,
             self.config,
             self.logger,
             read_actual_joints,
-            self._update_all_robot_states,
-            lambda: runtime.state_valid_cache or self._build_state_valid(runtime),
+            lambda: None,
+            lambda: runtime.state_valid_cache,
+            False,
         )
-        if plan is None:
-            return
 
-        waypoints, times = plan
-        runtime.active_traj = ActiveTrajectory(waypoints=waypoints, times=times, start_time=time.time())
-        self.logger.info(
-            f"Cartesian move planned: {runtime.name} ({waypoints.shape[0]} waypoints, {times[-1]:.2f}s duration)"
-        )
-        self._sync_legacy_views()
+        self._pending_plans[runtime.name] = (future, runtime)
+        self.logger.info(f"[{runtime.name}] Cartesian planning dispatched to worker thread")
 
     # ------------------------------------------------------------------
     # Robot updates

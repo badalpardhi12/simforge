@@ -29,10 +29,21 @@ except Exception:
 
 @dataclass
 class _LinkGeom:
-    # per-collision geometry for a link: local transform relative to link frame
+    """Collision geometry anchored to a link."""
+
     local_R: np.ndarray
     local_t: np.ndarray
-    obj: fcl.CollisionObject
+    geom: "fcl.CollisionGeometry"
+    obj: Optional[fcl.CollisionObject] = None
+
+    def collision_object(self) -> fcl.CollisionObject:
+        if self.obj is None:
+            try:
+                self.geom.thisown = False  # avoid double free when object is destroyed
+            except AttributeError:
+                pass
+            self.obj = fcl.CollisionObject(self.geom, fcl.Transform(np.eye(3), np.zeros(3)))
+        return self.obj
 
 
 class CollisionChecker:
@@ -50,6 +61,7 @@ class CollisionChecker:
         world_boxes: Optional[Iterable[Tuple[str, Tuple[float,float,float], Tuple[float,float,float], Tuple[float,float,float]]]] = None,
         ground_plane_z: float = 0.0,
         collision_mesh_shrink: float = 1.0,
+        world_meshes: Optional[Iterable[Tuple[str, str, Tuple[float, float, float], Tuple[float, float, float]]]] = None,
     ) -> None:
         self.logger = logger
         self.urdf_path = Path(urdf_path)
@@ -79,8 +91,11 @@ class CollisionChecker:
                 # keep order (robotLink, obj:name)
                 self.allowed_world_pairs.add((a, b))
 
+        self.world_mesh_geoms: Dict[str, List[_LinkGeom]] = {}
+        self._world_geom_refs: List[fcl.CollisionGeometry] = []
+
         self._load_urdf()
-        self._load_world(world_boxes or [])
+        self._load_world(world_boxes or [], world_meshes or [])
 
     # ---------- URDF loader with <origin> and mesh <scale> ----------
     def _load_urdf(self) -> None:
@@ -144,15 +159,13 @@ class CollisionChecker:
                     try:
                         tm = trimesh.load(mesh_path, force="mesh", process=False)  # keep raw coords
                         V = np.asarray(tm.vertices, dtype=np.float64)
-                        # apply scale (per-axis) and shrink (uniform)
                         V = (V * scale_vec) * self._shrink
                         F = np.asarray(tm.faces, dtype=np.int32)
                         bvh = fcl.BVHModel()
                         bvh.beginModel(V.shape[0], F.shape[0])
                         bvh.addSubModel(V, F)
                         bvh.endModel()
-                        co = fcl.CollisionObject(bvh, fcl.Transform(np.eye(3), np.zeros(3)))
-                        L.append(_LinkGeom(R_local, t_local, co))
+                        L.append(_LinkGeom(R_local, t_local, bvh))
                     except Exception as e:
                         self.logger.debug(f"failed to load mesh {mesh_path}: {e}")
                     continue
@@ -165,8 +178,7 @@ class CollisionChecker:
                         continue
                     sx, sy, sz = [float(v) for v in size_attr.split()]
                     bx = fcl.Box(sx*self._shrink, sy*self._shrink, sz*self._shrink)
-                    co = fcl.CollisionObject(bx, fcl.Transform(np.eye(3), np.zeros(3)))
-                    L.append(_LinkGeom(R_local, t_local, co))
+                    L.append(_LinkGeom(R_local, t_local, bx))
                     continue
 
                 cylinder = geom.find("cylinder")
@@ -174,22 +186,20 @@ class CollisionChecker:
                     radius = float(cylinder.get("radius", "0.01")) * self._shrink
                     length = float(cylinder.get("length", "0.1")) * self._shrink
                     cy = fcl.Cylinder(radius, length)
-                    co = fcl.CollisionObject(cy, fcl.Transform(np.eye(3), np.zeros(3)))
-                    L.append(_LinkGeom(R_local, t_local, co))
+                    L.append(_LinkGeom(R_local, t_local, cy))
                     continue
 
                 sphere = geom.find("sphere")
                 if sphere is not None:
                     radius = float(sphere.get("radius", "0.01")) * self._shrink
                     sp = fcl.Sphere(radius)
-                    co = fcl.CollisionObject(sp, fcl.Transform(np.eye(3), np.zeros(3)))
-                    L.append(_LinkGeom(R_local, t_local, co))
+                    L.append(_LinkGeom(R_local, t_local, sp))
                     continue
 
             if L:
                 self.robot_geoms[lname] = L
 
-    def _load_world(self, boxes):
+    def _load_world(self, boxes, meshes):
         # Express world boxes in the robot BASE frame used by Pinocchio/IK/OMPL
         Rb_T = self._base_R.T
         tb = self._base_t
@@ -205,7 +215,39 @@ class CollisionChecker:
             tw = np.array(pos, dtype=np.float64)
             R_rel = Rb_T @ Rw
             t_rel = Rb_T @ (tw - tb)
-            self.env_objs[f"obj:{name}"] = fcl.CollisionObject(geom, fcl.Transform(R_rel, t_rel))
+            try:
+                geom.thisown = False
+            except AttributeError:
+                pass
+            co = fcl.CollisionObject(geom, fcl.Transform(R_rel, t_rel))
+            self._world_geom_refs.append(geom)
+            self.env_objs[f"obj:{name}"] = co
+
+        for name, urdf_path, pos, rpy in meshes:
+            try:
+                env_geoms = self._build_geoms_from_urdf(urdf_path)
+            except Exception as exc:
+                self.logger.warning(f"Failed to load world URDF '{urdf_path}': {exc}")
+                continue
+
+            Rw = rpy_to_rotation_matrix(*rpy)
+            tw = np.array(pos, dtype=np.float64)
+            R_rel_base = Rb_T @ Rw
+            t_rel_base = Rb_T @ (tw - tb)
+
+            stored_geoms: List[_LinkGeom] = []
+            for link, geoms in env_geoms.items():
+                for geom in geoms:
+                    obj_name = f"obj:{name}:{link}"
+                    R_obj = R_rel_base @ geom.local_R
+                    t_obj = t_rel_base + R_rel_base @ geom.local_t
+                    co = geom.collision_object()
+                    co.setTransform(fcl.Transform(R_obj, t_obj))
+                    self.env_objs[obj_name] = co
+                    stored_geoms.append(geom)
+
+            if stored_geoms:
+                self.world_mesh_geoms[name] = stored_geoms
 
     # ---------- external robots registration and updates ----------
     def register_env_robot(self, name: str, urdf_path: str) -> None:
@@ -272,8 +314,7 @@ class CollisionChecker:
                         bvh.beginModel(V.shape[0], F.shape[0])
                         bvh.addSubModel(V, F)
                         bvh.endModel()
-                        co = fcl.CollisionObject(bvh, fcl.Transform(np.eye(3), np.zeros(3)))
-                        L.append(_LinkGeom(R_local, t_local, co))
+                        L.append(_LinkGeom(R_local, t_local, bvh))
                     except Exception as e:
                         self.logger.debug(f"[env] failed to load mesh {mesh_path}: {e}")
                     continue
@@ -285,8 +326,7 @@ class CollisionChecker:
                         continue
                     sx, sy, sz = [float(v) for v in size_attr.split()]
                     bx = fcl.Box(sx*self._shrink, sy*self._shrink, sz*self._shrink)
-                    co = fcl.CollisionObject(bx, fcl.Transform(np.eye(3), np.zeros(3)))
-                    L.append(_LinkGeom(R_local, t_local, co))
+                    L.append(_LinkGeom(R_local, t_local, bx))
                     continue
 
                 cylinder = geom.find("cylinder")
@@ -356,15 +396,14 @@ class CollisionChecker:
             t_world = t_ext + R_ext @ t_link_ext
 
             for g in geoms:
-                # Apply the collision origin (local transform) before re-expressing
                 R_geom_world = R_world @ g.local_R
                 t_geom_world = t_world + R_world @ g.local_t
 
-                # Express geometry in this robot's BASE frame
                 R_rel = Rb_T @ R_geom_world
                 t_rel = Rb_T @ (t_geom_world - tb)
 
-                g.obj.setTransform(fcl.Transform(R_rel, t_rel))
+                obj = g.collision_object()
+                obj.setTransform(fcl.Transform(R_rel, t_rel))
 
     # ---------- check collision given a Pinocchio state ----------
     def in_collision_from_pin(self, model: "pin.Model", data: "pin.Data", q: np.ndarray) -> bool:
@@ -407,10 +446,10 @@ class CollisionChecker:
 
 
             for g in geoms:
-                # BASE transform = (link_in_BASE) * local_collision_origin
                 R = R_link_b @ g.local_R
                 t = t_link_b + R_link_b @ g.local_t
-                g.obj.setTransform(fcl.Transform(R, t))
+                obj = g.collision_object()
+                obj.setTransform(fcl.Transform(R, t))
 
         # self collisions
         lnames = list(self.robot_geoms.keys())
@@ -420,10 +459,12 @@ class CollisionChecker:
                 if tuple(sorted((a, b))) in self.allowed_link_pairs:
                     continue
                 for oa in self.robot_geoms[a]:
+                    oa_obj = oa.collision_object()
                     for ob in self.robot_geoms[b]:
+                        ob_obj = ob.collision_object()
                         req = fcl.CollisionRequest()
                         res = fcl.CollisionResult()
-                        if fcl.collide(oa.obj, ob.obj, req, res) > 0:
+                        if fcl.collide(oa_obj, ob_obj, req, res) > 0:
                             return True
 
         # robot vs world
@@ -435,9 +476,10 @@ class CollisionChecker:
                 if ("base" in lname.lower() and "plane" in oname.lower()):
                     continue
                 for oa in geoms:
+                    oa_obj = oa.collision_object()
                     req = fcl.CollisionRequest()
                     res = fcl.CollisionResult()
-                    if fcl.collide(oa.obj, env, req, res) > 0:
+                    if fcl.collide(oa_obj, env, req, res) > 0:
                         return True
 
         # robot vs external robots (treated as environment obstacles)
@@ -446,10 +488,12 @@ class CollisionChecker:
                 for env_robot, linkmap in self.env_robot_geoms.items():
                     for elname, env_geoms in linkmap.items():
                         for oa in geoms:
+                            oa_obj = oa.collision_object()
                             for ob in env_geoms:
+                                ob_obj = ob.collision_object()
                                 req = fcl.CollisionRequest()
                                 res = fcl.CollisionResult()
-                                if fcl.collide(oa.obj, ob.obj, req, res) > 0:
+                                if fcl.collide(oa_obj, ob_obj, req, res) > 0:
                                     # Log tool collisions specifically
                                     if "tool" in lname.lower() or "tool" in elname.lower():
                                         self.logger.warning(f"TOOL COLLISION DETECTED: {lname} <-> {env_robot}/{elname}")

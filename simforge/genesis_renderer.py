@@ -42,7 +42,7 @@ class GenesisRenderer:
             viewer_options=self.gs.options.ViewerOptions(
                 camera_pos=(3.0, 0.0, 2.0),
                 camera_lookat=(0.0, 0.0, 0.5),
-                max_FPS=max_fps,
+                max_FPS=max_fps
             ),
             show_viewer=show_viewer,
         )

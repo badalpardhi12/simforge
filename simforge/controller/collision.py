@@ -22,6 +22,7 @@ def create_collision_checker(
     ctrl = config.control_for(robot_config.name)
 
     world_boxes: List[Tuple[str, Any, Tuple[float, float, float], Tuple[float, float, float]]] = []
+    world_meshes: List[Tuple[str, str, Tuple[float, float, float], Tuple[float, float, float]]] = []
     for obj in config.objects:
         if obj.collision_enabled is False:
             continue
@@ -58,6 +59,15 @@ def create_collision_checker(
                     tuple(obj.orientation_rpy or [0.0, 0.0, 0.0]),
                 )
             )
+        elif obj.type == "urdf" and getattr(obj, "urdf", None):
+            world_meshes.append(
+                (
+                    obj.name or "urdf",
+                    obj.urdf,
+                    tuple(obj.position or (0.0, 0.0, 0.0)),
+                    tuple(obj.orientation_rpy or (0.0, 0.0, 0.0)),
+                )
+            )
 
     world_allowed_pairs: List[Tuple[str, str]] = []
     if robot_config.control and robot_config.control.world_allowed_pairs:
@@ -88,6 +98,7 @@ def create_collision_checker(
             allowed_link_pairs=allowed_link_pairs,
             world_allowed_pairs=world_allowed_pairs,
             world_boxes=world_boxes,
+            world_meshes=world_meshes,
             ground_plane_z=ctrl.ground_plane_z,
             collision_mesh_shrink=getattr(ctrl, "collision_mesh_shrink", 1.0),
         )
