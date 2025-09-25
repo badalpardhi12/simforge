@@ -1,0 +1,53 @@
+version: 2
+metadata:
+  name: meca500_cell
+  description: Single MECA500 workstation with reference objects.
+scene:
+  dt: 0.01
+  backend: gpu
+  viewer:
+    enabled: true
+    max_fps: 120
+world:
+  objects:
+    - type: plane
+      name: shop_floor
+      size: [5.0, 5.0, 0.01]
+      pose_position: [0.0, 0.0, 0.0]
+    - type: box
+      name: table1
+      size: [1.2, 0.8, 0.76]
+      pose_position: [-1.5, 0.0, 0.38]
+      pose_orientation_rpy: [0.0, 0.0, 0.0]
+    - type: sphere
+      name: ref_sphere
+      radius: 0.05
+      pose_position: [0.4, 0.0, 0.3]
+      dynamic: false
+      collision_enabled: true
+robots:
+  - name: MECA500_1
+    urdf: ../../../assets/meca500/meca.urdf
+    end_effector_link: meca_axis_6_link
+    base_pose:
+      position: [0.8, -0.8, 0.0]
+      orientation_rpy: [0.0, 0.0, 0.0]
+    fixed_base: true
+    initial_joint_positions_deg: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    tool:
+      name: meca_simple_tool
+      urdf_override: ../../../assets/tools/simple_tool.urdf
+      attach_pose: [0.0, 0.0, 0.0, 0.0, 90.0, 0.0]
+    control:
+      mode: cartesian
+      limits:
+        cartesian_velocity: 0.1
+      planner_strategy: cartesian_preferred
+      ground_clearance_m: 0.04
+policies:
+  safety:
+    workspace_min: [-2.0, -2.0, 0.0]
+    workspace_max: [2.0, 2.0, 2.0]
+    minimum_clearance_m: 0.01
+  logging:
+    level: INFO
