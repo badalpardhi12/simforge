@@ -97,12 +97,12 @@ async def run_demo() -> None:
     # frame = "obj:face_object_0"
     # run on 8 face_object poses
     frames = ["obj:face_object_0", 
-              "obj:face_object_1", 
-              "obj:face_object_2", 
-              "obj:face_object_3",
-              "obj:face_object_4",
-              "obj:face_object_5",
-              "obj:face_object_6",
+            #   "obj:face_object_1", 
+            #   "obj:face_object_2", 
+            #   "obj:face_object_3",
+            #   "obj:face_object_4",
+            #   "obj:face_object_5",
+            #   "obj:face_object_6",
               "obj:face_object_7"]
     max_retries = 2
 

@@ -12,6 +12,12 @@ from .base import CollisionCheck, CollisionQuery, CollisionWorld
 from .simple import SimpleCollisionWorld
 from ...core.config_schema import SafetyPolicy, WorldObjectType
 from ...core.models import EnvironmentSpec, RobotProfile
+from ...infrastructure.pinocchio_cache import (
+    PinocchioModelBundle,
+    get_model_bundle as get_pinocchio_bundle,
+    import_error as pinocchio_import_error,
+    is_available as pinocchio_available,
+)
 
 try:  # Optional dependencies resolved lazily at runtime
     from simforge.collision_checker import CollisionChecker as FCLChecker
@@ -19,12 +25,7 @@ try:  # Optional dependencies resolved lazily at runtime
 except Exception:  # pragma: no cover - optional
     _FCL_AVAILABLE = False
 
-try:
-    import pinocchio as pin  # type: ignore
-    _PIN_AVAILABLE = True
-except Exception:  # pragma: no cover - optional
-    pin = None  # type: ignore
-    _PIN_AVAILABLE = False
+_PIN_AVAILABLE = pinocchio_available()
 
 
 def _normalize_quaternion(quat: Tuple[float, float, float, float]) -> np.ndarray:
@@ -54,7 +55,7 @@ def _quat_to_rpy(quat: Tuple[float, float, float, float]) -> Tuple[float, float,
 @dataclass(frozen=True)
 class _RobotKinematics:
     checker: Optional[FCLChecker]
-    model: Optional[object]
+    pin_bundle: Optional[PinocchioModelBundle]
     urdf: str
     base_position: Tuple[float, float, float]
     base_rpy: Tuple[float, float, float]
@@ -90,13 +91,19 @@ class FCLCollisionWorld(CollisionWorld):
         self._lock = threading.RLock()
         self._enable_env_robot_updates = False
         self._env_update_pairs_logged: set[Tuple[str, str]] = set()
+        self._disabled_env_pairs: set[Tuple[str, str]] = set()
         self._latest_states: Dict[str, Tuple[float, ...]] = {}
+        self._runtime_updates_received = False
+        pin_error = pinocchio_import_error()
         if not _FCL_AVAILABLE or not _PIN_AVAILABLE:
             missing = []
             if not _FCL_AVAILABLE:
                 missing.append("FCL/trimesh")
             if not _PIN_AVAILABLE:
-                missing.append("Pinocchio")
+                message = "Pinocchio"
+                if pin_error:
+                    message += f" ({pin_error})"
+                missing.append(message)
             self._logger.warning(
                 "Geometry collision checks unavailable (%s); using heuristic fallback.",
                 ", ".join(missing) or "unknown",
@@ -113,7 +120,10 @@ class FCLCollisionWorld(CollisionWorld):
                 self._latest_states[name] = initial_state
 
         self._enable_env_robot_updates = (
-            len(self._robots) > 1 and _FCL_AVAILABLE and _PIN_AVAILABLE
+            len(self._robots) > 1
+            and _FCL_AVAILABLE
+            and _PIN_AVAILABLE
+            and all(kin.pin_bundle is not None for kin in self._robots.values())
         )
         if self._enable_env_robot_updates:
             for name, kin in self._robots.items():
@@ -143,7 +153,6 @@ class FCLCollisionWorld(CollisionWorld):
                 self._fallback.update_environment(self._latest_states)
             except Exception:  # pragma: no cover - defensive
                 pass
-            self._apply_env_robot_states_locked()
 
     # ------------------------------------------------------------------
     # CollisionWorld API
@@ -158,11 +167,12 @@ class FCLCollisionWorld(CollisionWorld):
 
         kin = self._robots[query.robot.name]
         checker = kin.checker
-        model = kin.model
-        if checker is None or model is None or not checker.available:
+        bundle = kin.pin_bundle
+        if checker is None or bundle is None or not checker.available:
             return self._fallback.is_state_valid(query)
 
-        q = self._coerce_state(query.joints, model.nq)
+        model = bundle.model
+        q = self._coerce_state(query.joints, bundle.nq)
         try:
             in_collision = checker.in_collision_from_pin(model, model.createData(), q)
         except Exception as exc:  # pragma: no cover
@@ -189,8 +199,11 @@ class FCLCollisionWorld(CollisionWorld):
                 name: tuple(float(v) for v in values)
                 for name, values in (robot_states or {}).items()
             }
+            if self._latest_states:
+                self._runtime_updates_received = True
             self._fallback.update_environment(robot_states)
-            self._apply_env_robot_states_locked()
+            if self._runtime_updates_received:
+                self._apply_env_robot_states_locked()
 
     def allowed_pairs(self) -> Iterable[Tuple[str, str]]:
         return self._fallback.allowed_pairs()
@@ -198,9 +211,9 @@ class FCLCollisionWorld(CollisionWorld):
     def joint_limits(self, robot: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         with self._lock:
             kin = self._robots.get(robot)
-        if kin is None or kin.model is None:
+        if kin is None or kin.pin_bundle is None:
             return None
-        model = kin.model
+        model = kin.pin_bundle.model
         try:
             lower = np.asarray(model.lowerPositionLimit, dtype=np.float64)
             upper = np.asarray(model.upperPositionLimit, dtype=np.float64)
@@ -236,17 +249,19 @@ class FCLCollisionWorld(CollisionWorld):
             self._logger.warning("Collision checker init failed for %s: %s", profile.name, exc)
             checker = None
 
-        model = None
-        if checker is not None and checker.available and _PIN_AVAILABLE:
+        pin_bundle: Optional[PinocchioModelBundle] = None
+        if _PIN_AVAILABLE:
             try:
-                model = pin.buildModelFromUrdf(urdf_path)
+                pin_bundle = get_pinocchio_bundle(urdf_path)
+            except FileNotFoundError as exc:
+                raise
             except Exception as exc:  # pragma: no cover
                 self._logger.warning("Pinocchio model failed for %s: %s", profile.name, exc)
-                model = None
+                pin_bundle = None
 
         return _RobotKinematics(
             checker=checker,
-            model=model,
+            pin_bundle=pin_bundle,
             urdf=urdf_path,
             base_position=base_position,
             base_rpy=base_rpy,
@@ -266,8 +281,8 @@ class FCLCollisionWorld(CollisionWorld):
                 return None
             values = tuple(0.0 for _ in range(dof))
 
-        if kin and kin.model is not None:
-            nq = int(getattr(kin.model, "nq", len(values)))
+        if kin and kin.pin_bundle is not None:
+            nq = kin.pin_bundle.nq or len(values)
             if nq and len(values) != nq:
                 padded = [0.0] * nq
                 span = min(nq, len(values))
@@ -297,8 +312,10 @@ class FCLCollisionWorld(CollisionWorld):
             for other_name, state in self._latest_states.items():
                 if other_name == subject_name:
                     continue
+                if (subject_name, other_name) in self._disabled_env_pairs:
+                    continue
                 other = self._robots.get(other_name)
-                if other is None or other.model is None:
+                if other is None or other.pin_bundle is None:
                     continue
 
                 if (subject_name, other_name) not in self._env_update_pairs_logged:
@@ -307,29 +324,31 @@ class FCLCollisionWorld(CollisionWorld):
                         subject_name,
                         other_name,
                         len(state),
-                        other.model.nq if hasattr(other.model, "nq") else -1,
+                        other.pin_bundle.nq,
                     )
                     self._env_update_pairs_logged.add((subject_name, other_name))
 
-                q_other = self._coerce_state(state, other.model.nq)
+                nq = other.pin_bundle.nq or len(state)
+                if nq == 0:
+                    continue
+                q_other = self._coerce_state(state, nq)
                 try:
                     checker.update_env_robot_from_pin(
                         other_name,
-                        other.model,
-                        other.model.createData(),
+                        other.pin_bundle.model,
+                        other.pin_bundle.create_data(),
                         q_other,
                         base_position=other.base_position,
                         base_orientation_rpy=other.base_rpy,
                     )
                 except Exception as exc:  # pragma: no cover
                     self._logger.warning(
-                        "Failed to update %s inside %s checker; disabling env updates: %s",
+                        "Failed to update %s inside %s checker; disabling pair: %s",
                         other_name,
                         subject_name,
                         exc,
                     )
-                    self._enable_env_robot_updates = False
-                    return
+                    self._disabled_env_pairs.add((subject_name, other_name))
 
     def _build_world_geometry(self) -> Tuple[list, list]:
         boxes = []
