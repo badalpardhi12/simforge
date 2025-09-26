@@ -1,0 +1,38 @@
+# env_configs/all_robots.yaml
+scene:
+  show_viewer: true
+  dt: 0.005
+  max_fps: 60
+  backend: gpu
+
+objects:
+  - type: "plane"
+    position: [0, 0, 0]
+    size: [5, 5, 0.1]
+  - type: "box"
+    name: table1
+    position: [-1.0, 0.0, 0.38]
+    orientation_rpy: [0, 0, 0]
+    size: [1.2, 0.8, 0.76]
+
+# Defaults applied to every robot unless overridden below
+defaults:
+  control:
+    planner: RRTConnect
+    planner_timeout: 1.0
+    planner_resolution: 0.02
+    planner_max_retry: 10
+    cartesian_waypoints: 200
+robots:
+  - name: UR5e_1
+    urdf: "assets/ur5e/ur5e.urdf"
+    pose: {position: [0.5, 0.5, 0.0], rpy: [0, 0, 0]}
+    fixed_base: true
+    initial_joint_positions: [0, 0, 0, 0, 0, 0]  # degrees
+    end_effector_link: wrist_3_link
+    control:
+      cartesian_speed_limit: 0.1
+      default_tcp: [0, 0, 0, 1, 0, 0, 0]
+      collision_check: true
+      self_collision_check: true  # Re-enable with conservative adjacent pairs
+      ground_plane_z: 0.0
