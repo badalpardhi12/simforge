@@ -229,27 +229,32 @@
     <parent link="flange" />
     <child link="tool0" />
   </joint>
-<link name="ur20_simple_tool_tool_base_link">
+<link name="iphone::tool_base_link">
     <visual>
+      <origin xyz="0 0 0" rpy="0 0 3.14" />
       <geometry>
-        <cylinder length="0.1" radius="0.03" />
+  <mesh filename="../tools/iphone.stl" scale="0.04 0.04 0.04" />
       </geometry>
-      <origin rpy="0 0 0" xyz="0 0 0.05" />
-      <material name="red">
-        <color rgba="1 0 0 1" />
+      <material name="gray">
+        <color rgba="0.5 0.5 0.5 1" />
       </material>
     </visual>
     <collision>
+      <origin xyz="-0.065 0 .02" rpy="0 0 0" />
       <geometry>
-        <cylinder length="0.1" radius="0.03" />
+        <box size="0.3 0.13 0.055" />
       </geometry>
-      <origin rpy="0 0 0" xyz="0 0 0.05" />
     </collision>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <mass value="0.2" />
+      <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001" />
+    </inertial>
   </link>
-  <link name="ur20_simple_tool_tool_tip_link" />
-  <joint name="tool_base_to_tip" type="fixed">
-    <parent link="ur20_simple_tool_tool_base_link" />
-    <child link="ur20_simple_tool_tool_tip_link" />
-    <origin rpy="0 0 0" xyz="0 0 0.05" />
+  <link name="iphone::tool_tip_link" />
+  <joint name="iphone::tool_base_to_tip" type="fixed">
+    <parent link="iphone::tool_base_link" />
+    <child link="iphone::tool_tip_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
   </joint>
-<joint name="ur20_simple_tool_attach_joint" type="fixed"><parent link="wrist_3_link" /><child link="ur20_simple_tool_tool_base_link" /><origin xyz="0.0 0.0 0.0" rpy="0 0 0" /></joint></robot>
+<joint name="iphone_attachment" type="fixed"><origin xyz="-0.08 0.0 0.03" rpy="0.0 0.0 0.0" /><parent link="wrist_3_link" /><child link="iphone::tool_base_link" /></joint></robot>

@@ -2,7 +2,7 @@
 <robot name="iphone_tool">
   <link name="tool_base_link">
     <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <origin xyz="0 0 0" rpy="0 0 3.14"/>
       <geometry>
   <mesh filename="../tools/iphone.stl" scale="0.04 0.04 0.04"/>
       </geometry>
@@ -11,9 +11,9 @@
       </material>
     </visual>
     <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <origin xyz="-0.065 0 .02" rpy="0 0 0"/>
       <geometry>
-        <box size="0.30 0.13 0.055"/>
+        <box size="0.3 0.13 0.055"/>
       </geometry>
     </collision>
     <inertial>

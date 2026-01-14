@@ -5,6 +5,7 @@ import asyncio
 import logging
 import time
 from typing import Dict, Optional
+import threading
 
 import numpy as np
 
@@ -23,12 +24,14 @@ class PollingStateEstimator(StateEstimator):
         *,
         default_frequency_hz: float = 60.0,
         logger: Optional[logging.Logger] = None,
+        lock: Optional[threading.RLock] = None,
     ) -> None:
         self._entities = dict(entities)
         self._profiles = dict(profiles)
         self._default_frequency = float(default_frequency_hz)
         self._logger = logger or logging.getLogger("simforge.state.polling")
         self._references: Dict[str, np.ndarray] = {}
+        self._lock = lock or threading.RLock()
 
     async def states(self, subscription: StateSubscription):
         robot = subscription.robot.name
@@ -44,7 +47,8 @@ class PollingStateEstimator(StateEstimator):
 
         try:
             while True:
-                joints = get_joint_positions(entity, self._logger, prefer_struct=True)
+                with self._lock:
+                    joints = get_joint_positions(entity, self._logger, prefer_struct=True)
                 joints = self._resize(robot, joints, profile)
                 timestamp = time.time()
                 state = RobotState(

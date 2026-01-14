@@ -39,14 +39,78 @@ def _quat_to_euler_deg(quat: Tuple[float, float, float, float]) -> Tuple[float, 
 class SceneBuildResult:
     scene: object
     robot_entities: Dict[str, object]
+    viewer_active: bool = True
+
+
+def _check_opengl_available() -> bool:
+    """Check if OpenGL 3+ context can be initialized."""
+    import os
+    # Quick heuristic checks
+    # If DISPLAY is not set and not using EGL, viewer likely won't work
+    display = os.environ.get("DISPLAY")
+    egl_platform = os.environ.get("PYOPENGL_PLATFORM", "").lower()
+    
+    if not display and egl_platform != "egl":
+        return False
+    return True
 
 
 def build_scene(client: "GenesisClient", spec: EnvironmentSpec, logger: logging.Logger) -> SceneBuildResult:
+    """Build a Genesis scene with automatic fallback to headless mode if viewer fails."""
     scene_cfg = spec.scene
-    scene = client.create_scene(
+    viewer_requested = scene_cfg.viewer.enabled
+    
+    # Check if viewer is likely to work
+    if viewer_requested and not _check_opengl_available():
+        logger.warning(
+            "Display environment not detected. Starting in headless mode. "
+            "Set DISPLAY or PYOPENGL_PLATFORM=egl for viewer support."
+        )
+        viewer_requested = False
+    
+    # First attempt: build with requested viewer setting
+    scene, robot_entities, viewer_active, build_ok = _attempt_scene_build(
+        client, spec, logger, show_viewer=viewer_requested
+    )
+    
+    # If viewer was requested but failed, we need to restart Genesis and retry
+    if viewer_requested and not build_ok:
+        logger.info("Viewer initialization failed. Restarting Genesis in headless mode...")
+        try:
+            # Destroy current Genesis state
+            client.destroy()
+            # Re-initialize Genesis
+            client._initialise_backend()
+            # Rebuild scene without viewer
+            scene, robot_entities, viewer_active, build_ok = _attempt_scene_build(
+                client, spec, logger, show_viewer=False
+            )
+            if build_ok:
+                logger.info("Scene built successfully in headless mode")
+            else:
+                logger.error("Failed to build scene even in headless mode")
+        except Exception as exc:
+            logger.error("Failed to rebuild scene in headless mode: %s", exc)
+    
+    return SceneBuildResult(scene=scene, robot_entities=robot_entities, viewer_active=viewer_active)
+
+
+def _attempt_scene_build(
+    client: "GenesisClient",
+    spec: EnvironmentSpec,
+    logger: logging.Logger,
+    show_viewer: bool,
+) -> Tuple[object, Dict[str, object], bool, bool]:
+    """Attempt to build a scene with the specified viewer setting.
+    
+    Returns:
+        Tuple of (scene, robot_entities, viewer_active, build_succeeded)
+    """
+    scene_cfg = spec.scene
+    scene, _ = client.create_scene(
         dt=scene_cfg.dt,
         gravity=scene_cfg.gravity,
-        show_viewer=scene_cfg.viewer.enabled,
+        show_viewer=show_viewer,
         max_fps=scene_cfg.viewer.max_fps,
     )
 
@@ -57,24 +121,46 @@ def build_scene(client: "GenesisClient", spec: EnvironmentSpec, logger: logging.
         entity = _spawn_robot(scene, client, robot, logger)
         robot_entities[robot.name] = entity
 
+    viewer_active = show_viewer
+    build_succeeded = True
+    
     try:
         scene.build()
     except Exception as exc:  # pragma: no cover - genesis internals
-        logger.warning("Genesis scene build reported: %s", exc)
+        exc_msg = str(exc).lower()
+        if "opengl" in exc_msg or "viewer" in exc_msg or "unable to initialize" in exc_msg:
+            logger.warning(
+                "Genesis viewer initialization failed: %s. "
+                "To fix: ensure NVIDIA drivers are active "
+                "(try: sudo prime-select nvidia, or set PYOPENGL_PLATFORM=egl)",
+                exc
+            )
+            viewer_active = False
+            build_succeeded = False
+        else:
+            logger.warning("Genesis scene build reported: %s", exc)
 
     # Apply initial joint positions AFTER scene.build()
     for robot in spec.robots:
         entity = robot_entities[robot.name]
         _apply_initial_joints(robot, entity, logger)
 
-    for _ in range(2):
-        try:
-            scene.step()
-        except Exception as exc:  # pragma: no cover
-            logger.debug("Initial scene step failed: %s", exc)
-            break
+    # Try initial steps only if build succeeded
+    if build_succeeded:
+        for _ in range(2):
+            try:
+                scene.step()
+            except Exception as exc:  # pragma: no cover
+                exc_msg = str(exc).lower()
+                if "viewer closed" in exc_msg or "viewer" in exc_msg:
+                    logger.debug("Viewer not available during initial step: %s", exc)
+                    viewer_active = False
+                    build_succeeded = False
+                else:
+                    logger.debug("Initial scene step failed: %s", exc)
+                break
 
-    return SceneBuildResult(scene=scene, robot_entities=robot_entities)
+    return scene, robot_entities, viewer_active, build_succeeded
 
 
 def _build_world(scene, client: "GenesisClient", spec: EnvironmentSpec, logger: logging.Logger) -> None:
@@ -129,6 +215,7 @@ def _spawn_robot(scene, client: "GenesisClient", robot: RobotProfile, logger: lo
             pos=position,
             euler=euler,
             fixed=robot.fixed_base,
+            requires_jac_and_IK=True,
         )
     )
     logger.info("Spawned robot %s from %s", robot.name, robot.urdf)

@@ -37,7 +37,7 @@ from .event_bus import EventBus
 from .command_bus import CommandBus
 from .synchronized_trajectory import SynchronizedTrajectoryManager
 from ..infrastructure import get_joint_positions
-from simforge.transformations import quaternion_to_rotation_matrix, quaternion_multiply, rpy_to_quaternion
+from ..core.transformations import quaternion_to_rotation_matrix, quaternion_multiply, rpy_to_quaternion
 
 
 def _normalize_quaternion(values: np.ndarray | Tuple[float, float, float, float]) -> np.ndarray:
@@ -148,6 +148,7 @@ class RobotCoordinator:
         if metadata.get("interrupt_active") or metadata.get("interrupt"):
             return "interrupt"
         return "append"
+
 
     async def _await_active_motion_if_needed(self, next_command: Command) -> None:
         motion = self._active_motion
@@ -332,6 +333,47 @@ class RobotCoordinator:
             )
             return
 
+        planner_source = str(metadata.get("source", "")).lower()
+        if planner_source == "proto_sim_home":
+            validator = self._state_validator()
+            plan_req = PlanRequest(
+                robot=robot,
+                start=tuple(float(v) for v in start_rad),
+                goal=tuple(float(v) for v in target_rad),
+                strategy=PlannerStrategy.JOINT_ONLY,
+                timeout_s=float(command.duration or 3.0),
+                is_state_valid=validator,
+            )
+            self._start_active_motion(command)
+            try:
+                plan = await self._run_blocking(self.planner.plan, plan_req)
+            except Exception:
+                self._cancel_active_motion("plan_exception")
+                raise
+            if plan.outcome != PlanOutcome.SUCCESS or plan.trajectory is None:
+                self._cancel_active_motion(f"planner_{plan.outcome.value}" if plan.outcome else "planner_failure")
+                message = self._format_plan_failure(
+                    command,
+                    MotionTarget(joints=tuple(float(v) for v in target_rad), frame="home"),
+                    plan_req,
+                    plan,
+                )
+                raise CommandExecutionError(
+                    message,
+                    reason=f"planner_{plan.outcome.value}" if plan.outcome else "planning_failure",
+                )
+
+            self.logger.info(
+                "Starting synchronized trajectory for %s (Home): duration=%.3fs, waypoints=%d",
+                robot.name,
+                plan.trajectory.duration,
+                len(plan.trajectory.positions),
+            )
+            self.sync_trajectory_manager.start_trajectory(robot.name, plan.trajectory)
+            self._pending_pose_validation = None
+            self._last_validation_failure = None
+            return
+
         duration = max(float(command.duration or 0.5), 0.05)
         joint_names = tuple(f"j{idx}" for idx in range(target_rad.size))
         trajectory = JointTrajectory(
@@ -502,8 +544,12 @@ class RobotCoordinator:
         base_rot_T = base_rot.T
 
         local_pos = np.asarray([float(v) for v in command.position_m], dtype=np.float64)
-        roll, pitch, yaw = (math.radians(float(v)) for v in command.orientation_deg)
-        local_quat = _normalize_quaternion(rpy_to_quaternion(roll, pitch, yaw))
+        metadata = command.metadata or {}
+        if metadata.get("target_quat_wxyz"):
+            local_quat = _normalize_quaternion(metadata["target_quat_wxyz"])
+        else:
+            roll, pitch, yaw = (math.radians(float(v)) for v in command.orientation_deg)
+            local_quat = _normalize_quaternion(rpy_to_quaternion(roll, pitch, yaw))
 
         base_aliases = {"", "base", "robot", "robot_base"}
         resolved_frame = "base"
@@ -803,6 +849,7 @@ class RobotCoordinator:
             position_tolerance_m=self._ik_refine_pos_tol,
             orientation_tolerance_deg=self._ik_refine_rot_tol,
             timeout_s=1.0,
+            max_attempts=max(self._ik_refine_max_attempts, 5),
         )
         try:
             result = await self._run_blocking(self.ik_solver.solve, request)
@@ -999,9 +1046,10 @@ class RobotCoordinator:
             return float(default)
 
     async def _run_blocking(self, func: Callable[..., Any], *args, **kwargs) -> Any:
-        loop = asyncio.get_running_loop()
+        # Genesis primitives are not thread-safe; execute synchronously within the
+        # session loop thread to avoid Taichi context assertions.
         call = functools.partial(func, *args, **kwargs)
-        return await loop.run_in_executor(None, call)
+        return call()
 
 
 __all__ = ["RobotCoordinator", "RobotContext"]

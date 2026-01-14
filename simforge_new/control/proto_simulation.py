@@ -47,6 +47,7 @@ class ProtoPose:
     parameters: ParameterMap
     position_m: Tuple[float, float, float]
     orientation_deg: Tuple[float, float, float]
+    orientation_quat_wxyz: Tuple[float, float, float, float]
 
 
 @dataclass
@@ -201,20 +202,22 @@ def _xyzw_to_wxyz(quat: Tuple[float, float, float, float]) -> Tuple[float, float
     return (w, x, y, z)
 
 
-def _quat_to_euler_deg(quat_wxyz: Tuple[float, float, float, float]) -> Tuple[float, float, float]:
-    R = _quaternion_to_matrix_wxyz(quat_wxyz)
-    sy = -R[2][0]
-    if abs(sy) < 1.0 - 1e-9:
-        pitch = math.asin(sy)
-        roll = math.atan2(R[2][1], R[2][2])
-        yaw = math.atan2(R[1][0], R[0][0])
+def _quat_to_rpy_deg(quat_wxyz: Tuple[float, float, float, float]) -> Tuple[float, float, float]:
+    w, x, y, z = (float(v) for v in quat_wxyz)
+
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2.0 * (w * y - z * x)
+    if abs(sinp) >= 1.0:
+        pitch = math.copysign(math.pi / 2.0, sinp)
     else:
-        pitch = math.copysign(math.pi / 2.0, sy)
-        roll = 0.0
-        if sy > 0:
-            yaw = math.atan2(R[0][1], R[0][2])
-        else:
-            yaw = math.atan2(-R[0][1], -R[0][2])
+        pitch = math.asin(sinp)
+
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
 
     return (math.degrees(roll), math.degrees(pitch), math.degrees(yaw))
 
@@ -254,9 +257,9 @@ def _rot_vec(pitch_deg: float, yaw_deg: float, dist_mm: float) -> Tuple[float, f
     cy, sy = math.cos(yaw), math.sin(yaw)
     cp, sp = math.cos(pitch), math.sin(pitch)
     return (
-        sy * d,
+        sy * d * cp,
         cy * d * cp,
-        cy * d * sp,
+        d * sp,
     )
 
 
@@ -336,7 +339,7 @@ def generate_proto_poses(params: ProtoSimParameters) -> List[ProtoPose]:
                             )
                             quat_xyzw = _look_at(position, pivot, roll)
                             quat_wxyz = _normalize_quaternion_wxyz(_xyzw_to_wxyz(quat_xyzw))
-                            orientation = _quat_to_euler_deg(quat_wxyz)
+                            orientation = _quat_to_rpy_deg(quat_wxyz)
                             pose = ProtoPose(
                                 parameters={
                                     "horiz": float(horiz),
@@ -348,6 +351,12 @@ def generate_proto_poses(params: ProtoSimParameters) -> List[ProtoPose]:
                                 },
                                 position_m=(float(position[0]), float(position[1]), float(position[2])),
                                 orientation_deg=(float(orientation[0]), float(orientation[1]), float(orientation[2])),
+                                orientation_quat_wxyz=(
+                                    float(quat_wxyz[0]),
+                                    float(quat_wxyz[1]),
+                                    float(quat_wxyz[2]),
+                                    float(quat_wxyz[3]),
+                                ),
                             )
                             poses.append(pose)
     return poses
@@ -381,7 +390,7 @@ def _object_pose_in_base(
     relative_rot = _matrix_multiply(base_rot_T, frame_rot)
     quat_xyzw = _quat_from_matrix(relative_rot)
     quat_wxyz = _normalize_quaternion_wxyz(_xyzw_to_wxyz(quat_xyzw))
-    orientation_deg = _quat_to_euler_deg(quat_wxyz)
+    orientation_deg = _quat_to_rpy_deg(quat_wxyz)
 
     return (float(x), float(y), float(z)), orientation_deg
 
@@ -406,7 +415,117 @@ async def _execute_pose(
     *,
     idle_timeout: float,
     logger,
+    home_joints_deg: Optional[Sequence[float]] = None,
+    enable_home_recovery: bool = True,
 ) -> ProtoPoseExecution:
+    """Execute a single pose, with optional home recovery on failure.
+    
+    If a pose fails due to IK collision or planning failure and home_recovery is enabled,
+    the robot will first go to the home position and retry the pose from there.
+    The recorded trajectory will contain the full sequence: current→home→target.
+    """
+    execution = await _execute_pose_single_attempt(
+        session, robot_name, frame_key, pose,
+        idle_timeout=idle_timeout, logger=logger
+    )
+    
+    # If successful or home recovery disabled, return as-is
+    if execution.success or not enable_home_recovery or not home_joints_deg:
+        return execution
+    
+    # Check if failure is recoverable (IK collision or planning failure)
+    reason = execution.failure_reason or ""
+    recoverable_failures = (
+        "ik_goal_collision", "ik_failure", "ik_out_of_tol",
+        "planner_collision", "planning_invalid", "planner_invalid",
+        "planning_failure", "planner_failure"
+    )
+    if not any(r in reason.lower() for r in recoverable_failures):
+        logger.debug(
+            "[%s] Failure reason '%s' not recoverable via home; skipping retry",
+            robot_name, reason
+        )
+        return execution
+    
+    logger.info(
+        "[%s] Pose failed (%s); attempting home recovery for frame=%s",
+        robot_name, reason, frame_key
+    )
+    
+    # Step 1: Go to home position
+    home_trajectory = await _execute_home_move(
+        session, robot_name, home_joints_deg,
+        idle_timeout=idle_timeout, logger=logger
+    )
+    
+    if home_trajectory is None:
+        logger.warning(
+            "[%s] Home recovery failed - could not reach home position",
+            robot_name
+        )
+        return execution  # Return original failure
+    
+    # Step 2: Retry the pose from home
+    logger.info(
+        "[%s] Reached home; retrying pose for frame=%s",
+        robot_name, frame_key
+    )
+    retry_execution = await _execute_pose_single_attempt(
+        session, robot_name, frame_key, pose,
+        idle_timeout=idle_timeout, logger=logger
+    )
+    
+    if not retry_execution.success:
+        logger.info(
+            "[%s] Home recovery failed - pose still unreachable after going home (reason=%s)",
+            robot_name, retry_execution.failure_reason
+        )
+        # Return retry failure but note that home recovery was attempted
+        retry_execution.failure_reason = f"{retry_execution.failure_reason}_after_home_retry"
+        return retry_execution
+    
+    # Step 3: Combine trajectories (home trajectory + pose trajectory)
+    logger.info(
+        "[%s] Home recovery successful for frame=%s",
+        robot_name, frame_key
+    )
+    combined_trajectory = _combine_trajectories(home_trajectory, retry_execution.trajectory)
+    retry_execution.trajectory = combined_trajectory
+    
+    return retry_execution
+
+
+def _combine_trajectories(
+    first: Optional[Dict[str, Any]],
+    second: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Combine two trajectory dicts into one with all waypoints in sequence."""
+    if first is None:
+        return second
+    if second is None:
+        return first
+    
+    first_waypoints = first.get("waypoints", [])
+    second_waypoints = second.get("waypoints", [])
+    
+    combined_waypoints = list(first_waypoints) + list(second_waypoints)
+    
+    return {
+        "waypoints": combined_waypoints,
+        "home_recovery": True,  # Flag to indicate this trajectory involved home recovery
+    }
+
+
+async def _execute_pose_single_attempt(
+    session: SimulationSession,
+    robot_name: str,
+    frame_key: str,
+    pose: ProtoPose,
+    *,
+    idle_timeout: float,
+    logger,
+) -> ProtoPoseExecution:
+    """Execute a single pose attempt without recovery logic."""
     execution = ProtoPoseExecution(pose=pose, success=False)
     rejection_event = asyncio.Event()
     rejection_reason: Dict[str, str] = {}
@@ -432,7 +551,11 @@ async def _execute_pose(
             orientation_deg=list(pose.orientation_deg),
             duration=4.0,
             reference_frame=frame_key,
-            metadata={"source": "proto_sim", "object_frame": frame_key},
+            metadata={
+                "source": "proto_sim",
+                "object_frame": frame_key,
+                "target_quat_wxyz": list(pose.orientation_quat_wxyz),
+            },
         )
         await session.send_command(command)
         try:
@@ -542,8 +665,24 @@ async def execute_proto_sim(
     idle_timeout: float = 15.0,
     logger,
     progress: Optional[ProgressCallback] = None,
+    enable_home_recovery: bool = True,
 ) -> ProtoSimRunResult:
-    """Execute the sampled poses sequentially for each selected object."""
+    """Execute the sampled poses sequentially for each selected object.
+    
+    Args:
+        enable_home_recovery: If True, when a pose fails due to IK collision or planning
+            failure, the robot will first go to the home position and retry the pose.
+            The trajectory will contain the full sequence (current→home→target).
+    """
+
+    # Prepare home joints for recovery
+    home_joints_deg = list(robot.initial_joint_positions_deg or [])
+    if not home_joints_deg:
+        home_joints_deg = [0.0] * robot.joint_count
+    if len(home_joints_deg) < robot.joint_count:
+        home_joints_deg = home_joints_deg + [0.0] * (robot.joint_count - len(home_joints_deg))
+    elif len(home_joints_deg) > robot.joint_count:
+        home_joints_deg = home_joints_deg[: robot.joint_count]
 
     results: Dict[str, ObjectRunResult] = {}
     for object_name, frame_key in object_frames.items():
@@ -570,6 +709,8 @@ async def execute_proto_sim(
                 pose,
                 idle_timeout=idle_timeout,
                 logger=logger,
+                home_joints_deg=home_joints_deg,
+                enable_home_recovery=enable_home_recovery,
             )
             run_result.poses.append(execution)
             if progress is not None:
@@ -579,18 +720,11 @@ async def execute_proto_sim(
                     logger.debug("proto_sim progress callback failed", exc_info=True)
 
     home_trajectory: Optional[Dict[str, Any]] = None
-    joints_deg = list(robot.initial_joint_positions_deg or [])
-    if not joints_deg:
-        joints_deg = [0.0] * robot.joint_count
-    if len(joints_deg) < robot.joint_count:
-        joints_deg = joints_deg + [0.0] * (robot.joint_count - len(joints_deg))
-    elif len(joints_deg) > robot.joint_count:
-        joints_deg = joints_deg[: robot.joint_count]
     try:
         home_trajectory = await _execute_home_move(
             session,
             robot.name,
-            joints_deg,
+            home_joints_deg,
             idle_timeout=idle_timeout,
             logger=logger,
         )

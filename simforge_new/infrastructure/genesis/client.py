@@ -64,7 +64,21 @@ class GenesisClient:
         finally:
             self._destroyed = True
 
-    def create_scene(self, dt: float, gravity: tuple[float, float, float], show_viewer: bool, max_fps: int) -> Any:
+    def create_scene(
+        self,
+        dt: float,
+        gravity: tuple[float, float, float],
+        show_viewer: bool,
+        max_fps: int,
+    ) -> tuple[Any, bool]:
+        """Create a Genesis scene.
+        
+        Returns:
+            Tuple of (scene, viewer_active) where viewer_active indicates if
+            the viewer was successfully initialized.
+        """
+        viewer_active = show_viewer
+        
         scene = self._gs.Scene(
             sim_options=self._gs.options.SimOptions(dt=dt, gravity=gravity),
             viewer_options=self._gs.options.ViewerOptions(
@@ -80,7 +94,25 @@ class GenesisClient:
                 profiling.show_FPS = False
         except Exception:  # pragma: no cover
             pass
-        return scene
+        return scene, viewer_active
+    
+    def check_viewer_health(self, scene: Any) -> bool:
+        """Check if the viewer is still healthy and running.
+        
+        Returns True if viewer is active, False if closed or never started.
+        """
+        try:
+            viewer = getattr(scene, "viewer", None)
+            if viewer is None:
+                return False
+            # Check if viewer is running
+            is_running = getattr(viewer, "is_running", None)
+            if callable(is_running):
+                return is_running()
+            # Fallback: check for viewer attributes
+            return hasattr(viewer, "_app") and viewer._app is not None
+        except Exception:
+            return False
 
 
 __all__ = ["GenesisClient"]

@@ -210,6 +210,16 @@ class MountPose:
 
 
 @dataclass(frozen=True)
+class RealRobotParams:
+    """Parameters for connecting to and controlling a real robot."""
+    ip: str
+    default_velocity: float = 0.2  # rad/s
+    default_acceleration: float = 0.3  # rad/s²
+    blend_radius: float = 0.03  # rad (~1.7°) - blend for smooth motion
+    settling_time: float = 0.3  # seconds
+
+
+@dataclass(frozen=True)
 class RobotProfile:
     name: str
     urdf: str
@@ -220,6 +230,7 @@ class RobotProfile:
     initial_joint_positions_deg: Optional[Tuple[float, ...]] = None
     tool: Optional[ToolAttachment] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    real_robot: Optional[RealRobotParams] = None
 
     @property
     def joint_count(self) -> int:
@@ -274,6 +285,18 @@ def build_robot_profile(spec: RobotSpec, urdf_path: str, end_effector_link: str)
     metadata: Dict[str, Any] = dict(spec.metadata or {})
     if spec.profile:
         metadata.setdefault("profile", spec.profile)
+    
+    # Build real robot params if configured
+    real_robot_params: Optional[RealRobotParams] = None
+    if spec.real_robot is not None:
+        real_robot_params = RealRobotParams(
+            ip=spec.real_robot.ip,
+            default_velocity=spec.real_robot.default_velocity,
+            default_acceleration=spec.real_robot.default_acceleration,
+            blend_radius=spec.real_robot.blend_radius,
+            settling_time=spec.real_robot.settling_time,
+        )
+    
     return RobotProfile(
         name=spec.name,
         urdf=urdf_path,
@@ -284,4 +307,5 @@ def build_robot_profile(spec: RobotSpec, urdf_path: str, end_effector_link: str)
         initial_joint_positions_deg=joints,
         tool=spec.tool,
         metadata=metadata,
+        real_robot=real_robot_params,
     )

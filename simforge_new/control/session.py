@@ -7,6 +7,7 @@ import math
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple
+import threading
 
 import numpy as np
 
@@ -28,15 +29,15 @@ from ..services import (
     StateSubscription,
     PollingStateEstimator,
     CollisionWorld,
-    DrakeIKSolver,
-    OMPLMotionPlanner,
-    FCLCollisionWorld,
+    GenesisIKSolver,
+    GenesisMotionPlanner,
+    GenesisCollisionWorld,
 )
 from .event_bus import EventBus
 from .command_bus import CommandBus
 from .coordinator import RobotCoordinator, RobotContext
 from .synchronized_trajectory import SynchronizedTrajectoryManager
-from simforge.transformations import rpy_to_quaternion
+from ..core.transformations import rpy_to_quaternion
 
 
 @dataclass
@@ -48,82 +49,93 @@ class SimulationResources:
     command_bus: CommandBus
 
 
-@dataclass(frozen=True)
 class ServiceFactories:
-    """Factories for per-robot services used by the session."""
+    """Creates per-robot services backed by Genesis primitives."""
 
-    make_ik_solver: Callable[[RobotProfile], IKSolver]
-    make_motion_planner: Callable[[RobotProfile], MotionPlanner]
-    make_state_estimator: Callable[[Dict[str, "RobotContext"]], StateEstimator]
-    make_collision_world: Callable[[Dict[str, "RobotContext"]], CollisionWorld]
+    def __init__(self, *, spec: EnvironmentSpec, scene: object) -> None:
+        self._spec = spec
+        self._scene = scene
+        self._dt = spec.scene.dt
+        self._safety_policy = spec.config.policies.safety
+        self._default_freq = 1.0 / self._dt if self._dt and self._dt > 0 else 60.0
+        self._logger = logging.getLogger("simforge.services")
+
+        self._contexts: Dict[str, RobotContext] = {}
+        self._collision_world: Optional[CollisionWorld] = None
+        self._ik_cache: Dict[str, IKSolver] = {}
+        self._planner_cache: Dict[str, MotionPlanner] = {}
+        self._gs_lock = threading.RLock()
 
     @classmethod
-    def default(cls, *, spec: EnvironmentSpec) -> "ServiceFactories":
-        dt = spec.scene.dt
-        safety_policy = spec.config.policies.safety
-        default_freq = 1.0 / dt if dt > 0 else 60.0
-        service_logger = logging.getLogger("simforge.services")
-        collision_world_box: list[Optional[CollisionWorld]] = [None]
-        ik_cache: Dict[str, IKSolver] = {}
-        planner_cache: Dict[str, MotionPlanner] = {}
+    def default(cls, *, spec: EnvironmentSpec, scene: object) -> "ServiceFactories":
+        return cls(spec=spec, scene=scene)
 
-        def _ik(robot: RobotProfile) -> IKSolver:
-            if robot.name in ik_cache:
-                return ik_cache[robot.name]
-
-            try:
-                solver = DrakeIKSolver(robot, logger=service_logger.getChild(f"ik.{robot.name}"))
-            except Exception as exc:  # pragma: no cover - surface configuration issues
-                raise RuntimeError(f"Failed to initialise Drake IK for {robot.name}") from exc
-
-            ik_cache[robot.name] = solver
-            return solver
-
-        def _planner(robot: RobotProfile) -> MotionPlanner:
-            if robot.name in planner_cache:
-                return planner_cache[robot.name]
-
-            world_ref = collision_world_box[0]
-            if world_ref is None:
-                raise RuntimeError("Collision world must be initialised before creating planners")
-
-            try:
-                planner = OMPLMotionPlanner(
-                    robot,
-                    collision_world=world_ref,
-                    logger=service_logger.getChild(f"planner.{robot.name}"),
-                )
-            except Exception as exc:  # pragma: no cover - surface configuration issues
-                raise RuntimeError(f"Failed to initialise OMPL planner for {robot.name}") from exc
-
-            planner_cache[robot.name] = planner
-            return planner
-
-        def _state_estimator(contexts: Dict[str, "RobotContext"]) -> StateEstimator:
-            entities = {name: ctx.entity for name, ctx in contexts.items()}
-            profiles = {name: ctx.profile for name, ctx in contexts.items()}
-            return PollingStateEstimator(entities, profiles, default_frequency_hz=default_freq)
-
-        def _collision_world(contexts: Dict[str, "RobotContext"]) -> CollisionWorld:
-            profiles = {name: ctx.profile for name, ctx in contexts.items()}
-            try:
-                world = FCLCollisionWorld(
-                    profiles,
-                    spec=spec,
-                    safety=safety_policy,
-                    logger=service_logger.getChild("collision"),
-                )
-            except Exception as exc:  # pragma: no cover - surface configuration issues
-                raise RuntimeError("Failed to initialise FCL collision world") from exc
-            collision_world_box[0] = world
-            return world
-
-        return cls(
-            make_ik_solver=_ik,
-            make_motion_planner=_planner,
-            make_state_estimator=_state_estimator,
-            make_collision_world=_collision_world,
+    # ------------------------------------------------------------------
+    # Factory interfaces used by SimulationSession
+    # ------------------------------------------------------------------
+    def make_collision_world(self, contexts: Dict[str, "RobotContext"]) -> CollisionWorld:
+        self._contexts = dict(contexts)
+        world = GenesisCollisionWorld(
+            contexts,
+            safety=self._safety_policy,
+            logger=self._logger.getChild("collision"),
+            lock=self._gs_lock,
         )
+        self._collision_world = world
+        return world
+
+    def make_state_estimator(self, contexts: Dict[str, "RobotContext"]) -> StateEstimator:
+        entities = {name: ctx.entity for name, ctx in contexts.items()}
+        profiles = {name: ctx.profile for name, ctx in contexts.items()}
+        return PollingStateEstimator(
+            entities,
+            profiles,
+            default_frequency_hz=self._default_freq,
+            lock=self._gs_lock,
+            logger=self._logger.getChild("state"),
+        )
+
+    def make_ik_solver(self, robot: RobotProfile) -> IKSolver:
+        if robot.name in self._ik_cache:
+            return self._ik_cache[robot.name]
+
+        ctx = self._contexts.get(robot.name)
+        if ctx is None:
+            raise RuntimeError(f"Robot context for {robot.name} not registered; create collision world first")
+
+        solver = GenesisIKSolver(
+            profile=robot,
+            entity=ctx.entity,
+            logger=self._logger.getChild(f"ik.{robot.name}"),
+            lock=self._gs_lock,
+        )
+        self._ik_cache[robot.name] = solver
+        return solver
+
+    def make_motion_planner(self, robot: RobotProfile) -> MotionPlanner:
+        if robot.name in self._planner_cache:
+            return self._planner_cache[robot.name]
+
+        if self._collision_world is None:
+            raise RuntimeError("Collision world must be initialised before creating planners")
+
+        ctx = self._contexts.get(robot.name)
+        if ctx is None:
+            raise RuntimeError(f"Robot context for {robot.name} not registered; create collision world first")
+
+        planner = GenesisMotionPlanner(
+            profile=robot,
+            entity=ctx.entity,
+            collision_world=self._collision_world,
+            logger=self._logger.getChild(f"planner.{robot.name}"),
+            lock=self._gs_lock,
+        )
+        self._planner_cache[robot.name] = planner
+        return planner
+
+    @property
+    def gs_lock(self) -> threading.RLock:
+        return self._gs_lock
 
 
 class SimulationSession:
@@ -140,7 +152,10 @@ class SimulationSession:
         self.logger = logger
         self._sync_trajectory_manager = SynchronizedTrajectoryManager(logger)
         self._coordinators: Dict[str, RobotCoordinator] = {}
-        self._factories = service_factories or ServiceFactories.default(spec=self.resources.spec)
+        self._factories = service_factories or ServiceFactories.default(
+            spec=self.resources.spec,
+            scene=self.resources.scene_result.scene,
+        )
         self._closed = False
         self._lock = asyncio.Lock()
         self._state_estimator: Optional[StateEstimator] = None
@@ -149,6 +164,7 @@ class SimulationSession:
         self._latest_states: Dict[str, RobotState] = {}
         self._simulation_task: Optional[asyncio.Task] = None
         self._reference_frames: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        self._viewer_active: bool = getattr(self.resources.scene_result, 'viewer_active', True)
         self._initialise_robot_coordinators()
         self._start_simulation_loop()
 
@@ -251,6 +267,10 @@ class SimulationSession:
         return self.resources.scene_result.scene
 
     @property
+    def viewer_active(self) -> bool:
+        """Whether the Genesis viewer is active and rendering."""
+        return self._viewer_active
+
     @property
     def coordinators(self) -> Dict[str, RobotCoordinator]:
         return dict(self._coordinators)
@@ -552,20 +572,45 @@ class SimulationSession:
         dt = float(self.resources.spec.scene.dt)
         self.logger.info(f"Starting simulation loop with dt={dt}s")
         
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+        
         try:
             while True:
                 start_time = asyncio.get_event_loop().time()
                 current_time = time.time()  # Use time.time() like legacy system
                 
-                # Update trajectories for all robots (like legacy system)
-                self._update_robot_trajectories(current_time)
-                
-                # Step the Genesis scene
-                try:
-                    self.resources.scene_result.scene.step()
-                except Exception as exc:
-                    self.logger.error(f"Genesis scene step failed: {exc}")
-                    break
+                with self._factories.gs_lock:
+                    # Update trajectories for all robots (like legacy system)
+                    self._update_robot_trajectories(current_time)
+
+                    # Step the Genesis scene
+                    try:
+                        self.resources.scene_result.scene.step()
+                        consecutive_failures = 0  # Reset on success
+                    except Exception as exc:
+                        exc_msg = str(exc).lower()
+                        # Handle viewer-related failures gracefully
+                        if "viewer closed" in exc_msg or "viewer" in exc_msg:
+                            consecutive_failures += 1
+                            if consecutive_failures == 1:
+                                self.logger.warning(
+                                    "Genesis viewer closed unexpectedly. "
+                                    "Continuing simulation in headless mode."
+                                )
+                                self._viewer_active = False
+                            # Continue simulation without viewer
+                            if consecutive_failures < max_consecutive_failures:
+                                continue
+                            else:
+                                self.logger.error(
+                                    "Genesis scene step failed repeatedly after viewer closure: %s",
+                                    exc
+                                )
+                                break
+                        else:
+                            self.logger.error(f"Genesis scene step failed: {exc}")
+                            break
                 
                 # Maintain timing
                 elapsed = asyncio.get_event_loop().time() - start_time

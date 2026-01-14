@@ -1,0 +1,37 @@
+# env_configs/all_robots.yaml
+scene:
+  show_viewer: true
+  dt: 0.005
+  max_fps: 60
+  backend: gpu
+
+objects:
+  - type: "plane"
+    position: [0, 0, 0]
+  - type: "box"
+    name: table1
+    position: [-1.0, 0.0, 0.38]
+    orientation_rpy: [0, 0, 0]
+    size: [1.2, 0.8, 0.76]
+
+# Defaults applied to every robot unless overridden below
+defaults:
+  control:
+    world_allowed_pairs:
+      - ["link_6", "obj:table1"]                 # TX2_60_1 EE link (prefix stripped in code)
+    collision_mesh_shrink: 0.97
+
+robots:
+  # You can inline a robot OR include an existing robot yaml and override fields.
+  - name: TX2_60_1
+    urdf: "assets/tx2_60/tx2_60.urdf"
+    pose: {position: [0.0, 0.0, 0.0], rpy: [0, 0, 0]}
+    fixed_base: true
+    initial_joint_positions: [0, -60, 90, 0, 60, 0]  # degrees (safer elbow-up-ish)
+    end_effector_link: link_6
+    control:
+      cartesian_speed_limit: 0.1
+      default_tcp: [0, 0, 0, 1, 0, 0, 0]
+      collision_check: true
+      self_collision_check: true  # Re-enable with conservative adjacent pairs
+      ground_plane_z: 0.0

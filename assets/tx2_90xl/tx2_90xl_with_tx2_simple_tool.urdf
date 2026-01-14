@@ -194,9 +194,9 @@
     <child link="tool0" />
     <origin rpy="0 1.5707963267948966 0" xyz="0 0 0" />
   </joint>
-<link name="tx2_simple_tool_tool_base_link">
+<link name="iphone::tool_base_link">
     <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
+      <origin xyz="0 0 0" rpy="0 0 3.14" />
       <geometry>
   <mesh filename="../tools/iphone.stl" scale="0.04 0.04 0.04" />
       </geometry>
@@ -205,9 +205,9 @@
       </material>
     </visual>
     <collision>
-      <origin xyz="0 0 0" rpy="0 0 0" />
+      <origin xyz="-0.065 0 .02" rpy="0 0 0" />
       <geometry>
-        <box size="0.30 0.13 0.055" />
+        <box size="0.3 0.13 0.055" />
       </geometry>
     </collision>
     <inertial>
@@ -216,10 +216,10 @@
       <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001" />
     </inertial>
   </link>
-  <link name="tx2_simple_tool_tool_tip_link" />
-  <joint name="tool_base_to_tip" type="fixed">
-    <parent link="tx2_simple_tool_tool_base_link" />
-    <child link="tx2_simple_tool_tool_tip_link" />
+  <link name="iphone::tool_tip_link" />
+  <joint name="iphone::tool_base_to_tip" type="fixed">
+    <parent link="iphone::tool_base_link" />
+    <child link="iphone::tool_tip_link" />
     <origin xyz="0 0 0" rpy="0 0 0" />
   </joint>
-<joint name="tx2_simple_tool_attach_joint" type="fixed"><parent link="link_6" /><child link="tx2_simple_tool_tool_base_link" /><origin xyz="-0.08 0.0 0.03" rpy="0 0 0" /></joint></robot>
+<joint name="iphone_attachment" type="fixed"><origin xyz="-0.08 0.0 0.03" rpy="0.0 0.0 0.0" /><parent link="link_6" /><child link="iphone::tool_base_link" /></joint></robot>

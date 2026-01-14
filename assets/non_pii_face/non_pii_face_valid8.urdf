@@ -2,18 +2,18 @@
 <robot name="non_pii_face_valid8">
   <link name="face_link">
     <visual>
-      <origin xyz="0 -0.3 -0.08" rpy="0 0 -3.14"/>
+      <origin xyz="0 -0.09 0" rpy="0 0 -1.57"/>
       <geometry>
-        <mesh filename="Non-PII-Exp-HDF5.dae" scale="0.0012 0.0012 0.0012"/>
+        <mesh filename="UR5-to-SuperClamp-withFoamForm.dae" scale="0.0012 0.0012 0.0012"/>
       </geometry>
       <material name="face_brown">
         <color rgba="0.76 0.60 0.42 1"/>
       </material>
     </visual>
     <collision>
-      <origin xyz="0 -0.13 -0.05" rpy="0 0 0"/>
+      <origin xyz="0 -0.13 0" rpy="0 0 -1.57"/>
       <geometry>
-        <sphere radius="0.00018"/>
+        <mesh filename="UR5-to-SuperClamp-withFoamForm.dae" scale="0.0012 0.0012 0.0012"/>
       </geometry>
     </collision>
     <inertial>

@@ -22,10 +22,10 @@ world:
       collision_enabled: true
       dynamic: false
     - type: urdf
-      name: face_target
-      # urdf: ../../../assets/non_pii_face/non_pii_face_valid8.urdf
-      urdf: ../../../assets/non_pii_face/non_pii_face.urdf
-      pose_position: [0.1742, 0.0007, 1.58]
+      name: face_link
+      urdf: ../../../assets/non_pii_face/non_pii_face_valid8.urdf
+      # urdf: ../../../assets/non_pii_face/non_pii_face.urdf
+      pose_position: [0.1742, 0.0, 1.6]
       pose_orientation_rpy: [0.0, 0.0, 90.0]
       collision_enabled: true
       dynamic: false
@@ -34,22 +34,41 @@ robots:
     urdf: ../../../assets/ur5e/ur5e.urdf
     end_effector_link: wrist_3_link
     base_pose:
-      position: [-0.6758, 0.0, 1.0]
+      position: [-0.6758, 0.0, 1.03]
       orientation_rpy: [0.0, 0.0, -90.0]
     fixed_base: true
     initial_joint_positions_deg: [0.0, -90.0, 0.0, -90.0, 0.0, 0.0]
+    metadata:
+      genesis_ik_max_samples: "512"
+      genesis_ik_solver_iters: "100"
+      genesis_ik_max_step: "0.1"
+      genesis_ik_damping: "0.02"
+      genesis_plan_waypoint_spacing: "0.02"
+      genesis_plan_waypoints_max: "400"
     tool:
       name: iphone_tool
-      urdf_override: ../../../assets/tools/iphone.urdf
-      attach_pose: [-0.08, 0.0, 0.03, 0.0, 0.0, 0.0]
       # urdf_override: ../../../assets/tools/simple_tool.urdf
       # attach_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      urdf_override: ../../../assets/tools/iphone.urdf
+      attach_pose: [-0.08, 0.0, 0.0, 0.0, 0.0, 0.0]
     control:
       mode: cartesian
       limits:
         cartesian_velocity: 0.1
       planner_strategy: cartesian_preferred
       ground_clearance_m: 0.04
+    # Real robot connection parameters for deployment
+    real_robot:
+      ip: "192.168.1.9"
+      # Default velocity for maximum accuracy at final pose (rad/s)
+      # Low velocity with small blend ensures precise end position
+      default_velocity: 0.2
+      default_acceleration: 0.3
+      # Blend radius in meters - smaller = more accurate at waypoints
+      # 0.0 = stop at each waypoint (most accurate but slower)
+      blend_radius: 0.0
+      # Settling time after trajectory completion (seconds)
+      settling_time: 0.3
 policies:
   safety:
     workspace_min: [-2.0, -2.0, 0.0]

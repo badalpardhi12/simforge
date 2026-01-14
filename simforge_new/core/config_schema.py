@@ -104,6 +104,36 @@ class ToolAttachment(_FrozenModel):
     urdf_override: Optional[str] = None
 
 
+class RealRobotConfig(_FrozenModel):
+    """Configuration for connecting to a real physical robot."""
+    
+    ip: str = Field(description="IP address of the robot controller")
+    default_velocity: float = Field(
+        default=0.2,
+        ge=0.01,
+        le=3.14,
+        description="Default joint velocity in rad/s for maximum accuracy"
+    )
+    default_acceleration: float = Field(
+        default=0.3,
+        ge=0.01,
+        le=5.0,
+        description="Default joint acceleration in rad/s²"
+    )
+    blend_radius: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=0.1,
+        description="Blend radius in meters (0 = stop at each waypoint for max accuracy)"
+    )
+    settling_time: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=5.0,
+        description="Time to wait after trajectory completion in seconds"
+    )
+
+
 class RobotMount(_FrozenModel):
     position: Vec3 = (0.0, 0.0, 0.0)
     orientation_rpy: Vec3 = (0.0, 0.0, 0.0)
@@ -128,6 +158,10 @@ class RobotSpec(_FrozenModel):
     initial_joint_positions_deg: Optional[List[float]] = None
     tool: Optional[ToolAttachment] = None
     metadata: Dict[str, str] = Field(default_factory=dict)
+    real_robot: Optional[RealRobotConfig] = Field(
+        default=None,
+        description="Configuration for deploying to a real physical robot"
+    )
 
 
 class WorldObjectType(str, Enum):
