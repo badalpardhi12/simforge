@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>simforge_server</name>
+  <version>1.0.0</version>
+  <description>Simforge Server - ROS 2 nodes for robot control, perception, and VLA inference</description>
+  <maintainer email="badal@example.com">Badal</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- Core ROS 2 -->
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>tf2_ros</depend>
+
+  <!-- Custom messages -->
+  <depend>simforge_msgs</depend>
+
+  <!-- Robot control -->
+  <depend>control_msgs</depend>
+
+  <!-- Visualization -->
+  <depend>foxglove_bridge</depend>
+
+  <!-- Testing -->
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

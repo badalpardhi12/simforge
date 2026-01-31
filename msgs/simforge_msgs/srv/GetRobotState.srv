@@ -1,0 +1,22 @@
+# Get current robot state service
+
+# === REQUEST ===
+
+# Robot name to query
+string robot_name
+
+# Include force/torque data (may add latency)
+bool include_wrench
+
+---
+
+# === RESPONSE ===
+
+# Success flag
+bool success
+
+# Error message if failed
+string error_message
+
+# Full robot state
+simforge_msgs/RobotState robot_state

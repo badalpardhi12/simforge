@@ -1,0 +1,151 @@
+# Simforge Docker Compose Configuration
+#
+# This file orchestrates all services for the Simforge distributed system.
+#
+# Usage:
+#   Development (x86):  docker-compose --profile dev up
+#   Production (Thor):  docker-compose --profile prod up
+
+services:
+  # =============================================================================
+  # ROS 2 Server (AI Workstation - Development)
+  # =============================================================================
+  ros2_server_dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server.x86
+    image: simforge_server:dev-x86
+    container_name: simforge_server_dev
+    profiles:
+      - dev
+    # GPU support - uncomment when nvidia-container-toolkit is configured with Docker Desktop
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - DISPLAY=${DISPLAY}
+    volumes:
+      # Device access for cameras
+      - /dev:/dev
+    privileged: true
+    network_mode: host
+    stdin_open: true
+    tty: true
+    command: >
+      bash -c "
+        source /ros2_ws/install/setup.bash &&
+        ros2 launch simforge_server full_stack.launch.py
+      "
+    healthcheck:
+      test: ["CMD", "ros2", "topic", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # =============================================================================
+  # Foxglove Bridge (Development)
+  # =============================================================================
+  foxglove_bridge_dev:
+    image: simforge_server:dev-x86
+    container_name: simforge_foxglove_dev
+    profiles:
+      - dev
+    depends_on:
+      ros2_server_dev:
+        condition: service_started
+    environment:
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    network_mode: host
+    command: >
+      bash -c "
+        source /opt/ros/humble/setup.bash &&
+        ros2 launch foxglove_bridge foxglove_bridge_launch.xml
+          port:=9090
+          address:=0.0.0.0
+          send_buffer_limit:=100000000
+          use_compression:=true
+      "
+
+  # =============================================================================
+  # ROS 2 Server (Jetson Thor - Production)
+  # =============================================================================
+  ros2_server_prod:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server.l4t
+    image: simforge_server:prod-l4t
+    container_name: simforge_server_prod
+    profiles:
+      - prod
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    volumes:
+      - ./config:/ros2_ws/src/simforge_server/config:ro
+      - ./assets:/ros2_ws/src/simforge_server/assets:ro
+      - /dev:/dev
+    privileged: true
+    network_mode: host
+    stdin_open: true
+    tty: true
+    command: >
+      bash -c "
+        source /ros2_ws/install/setup.bash &&
+        ros2 launch simforge_server full_stack.launch.py
+      "
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # =============================================================================
+  # Foxglove Bridge (Production)
+  # =============================================================================
+  foxglove_bridge_prod:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server.l4t
+    image: simforge_server:prod-l4t
+    container_name: simforge_foxglove_prod
+    profiles:
+      - prod
+    environment:
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    network_mode: host
+    command: >
+      bash -c "
+        source /opt/ros/humble/setup.bash &&
+        ros2 launch foxglove_bridge foxglove_bridge_launch.xml
+          port:=9090
+          address:=0.0.0.0
+          send_buffer_limit:=100000000
+          use_compression:=true
+      "
+    depends_on:
+      - ros2_server_prod
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  simforge_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

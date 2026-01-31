@@ -1,0 +1,98 @@
+# FastDDS Configuration for ROS 2
+# Optimized for low-latency robot control
+
+<?xml version="1.0" encoding="UTF-8"?>
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <profiles>
+        <!-- Default participant profile -->
+        <participant profile_name="participant_profile" is_default_profile="true">
+            <rtps>
+                <name>simforge_participant</name>
+                
+                <!-- Discovery configuration -->
+                <builtin>
+                    <discovery_config>
+                        <discoveryProtocol>SIMPLE</discoveryProtocol>
+                        <leaseDuration>
+                            <sec>10</sec>
+                            <nanosec>0</nanosec>
+                        </leaseDuration>
+                        <leaseAnnouncement>
+                            <sec>3</sec>
+                            <nanosec>0</nanosec>
+                        </leaseAnnouncement>
+                    </discovery_config>
+                    
+                    <!-- Multicast for discovery -->
+                    <metatrafficMulticastLocatorList>
+                        <locator>
+                            <udpv4>
+                                <address>239.255.0.1</address>
+                                <port>7400</port>
+                            </udpv4>
+                        </locator>
+                    </metatrafficMulticastLocatorList>
+                </builtin>
+                
+                <!-- Flow controllers for QoS -->
+                <throughputController>
+                    <bytesPerPeriod>1048576</bytesPerPeriod>
+                    <periodMillisecs>100</periodMillisecs>
+                </throughputController>
+            </rtps>
+        </participant>
+        
+        <!-- High-reliability publisher profile (for safety messages) -->
+        <data_writer profile_name="reliable_publisher">
+            <qos>
+                <reliability>
+                    <kind>RELIABLE</kind>
+                    <max_blocking_time>
+                        <sec>0</sec>
+                        <nanosec>100000000</nanosec>
+                    </max_blocking_time>
+                </reliability>
+                <durability>
+                    <kind>TRANSIENT_LOCAL</kind>
+                </durability>
+                <history>
+                    <kind>KEEP_LAST</kind>
+                    <depth>10</depth>
+                </history>
+            </qos>
+            <historyMemoryPolicy>PREALLOCATED</historyMemoryPolicy>
+        </data_writer>
+        
+        <!-- Best-effort publisher profile (for high-frequency data) -->
+        <data_writer profile_name="best_effort_publisher">
+            <qos>
+                <reliability>
+                    <kind>BEST_EFFORT</kind>
+                </reliability>
+                <durability>
+                    <kind>VOLATILE</kind>
+                </durability>
+                <history>
+                    <kind>KEEP_LAST</kind>
+                    <depth>1</depth>
+                </history>
+            </qos>
+        </data_writer>
+        
+        <!-- High-reliability subscriber profile -->
+        <data_reader profile_name="reliable_subscriber">
+            <qos>
+                <reliability>
+                    <kind>RELIABLE</kind>
+                </reliability>
+                <durability>
+                    <kind>TRANSIENT_LOCAL</kind>
+                </durability>
+                <history>
+                    <kind>KEEP_LAST</kind>
+                    <depth>10</depth>
+                </history>
+            </qos>
+        </data_reader>
+    </profiles>
+</dds>

@@ -1,0 +1,81 @@
+# Simforge Server Docker Configuration for Jetson Thor (Production)
+#
+# Base image: Isaac ROS container with JetPack 7.0 / Isaac ROS 4.0
+# Includes: cuMotion, nvblox, TensorRT
+#
+# Note: ur_rtde must be built from source on ARM64
+
+FROM nvcr.io/nvidia/isaac/ros:humble-aarch64
+
+LABEL maintainer="badal@example.com"
+LABEL description="Simforge Server - Jetson Thor with Isaac ROS"
+LABEL version="1.0.0"
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install additional dependencies
+RUN apt-get update && apt-get install -y \
+    python3-pip \
+    python3-dev \
+    libboost-all-dev \
+    libeigen3-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build ur_rtde from source (no ARM64 package available)
+WORKDIR /tmp
+RUN git clone https://gitlab.com/sdurobotics/ur_rtde.git && \
+    cd ur_rtde && \
+    git checkout v1.5.8 && \
+    git submodule update --init --recursive && \
+    mkdir build && cd build && \
+    cmake -DCMAKE_BUILD_TYPE=Release \
+          -DPYTHON_BINDINGS=ON \
+          -DPYTHON_EXECUTABLE=$(which python3) \
+          .. && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd /tmp && rm -rf ur_rtde
+
+# Install Python dependencies
+RUN pip3 install --no-cache-dir \
+    websockets>=12.0 \
+    asyncio \
+    numpy>=1.24.0 \
+    scipy>=1.10.0 \
+    transforms3d>=0.4.1 \
+    pyyaml>=6.0 \
+    opencv-python>=4.8.0 \
+    foxglove-websocket>=0.1.0
+
+# Create workspace directory
+WORKDIR /ros2_ws
+
+# Copy package source
+COPY msgs /ros2_ws/src/msgs
+COPY simforge_server /ros2_ws/src/simforge_server
+COPY config /ros2_ws/src/simforge_server/config
+COPY assets /ros2_ws/src/simforge_server/assets
+
+# Build ROS 2 packages
+RUN /bin/bash -c "source /opt/ros/humble/setup.bash && \
+    cd /ros2_ws && \
+    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release"
+
+# Setup entrypoint
+COPY docker/ros_entrypoint.sh /ros_entrypoint.sh
+RUN chmod +x /ros_entrypoint.sh
+
+# Environment variables
+ENV ROS_DOMAIN_ID=42
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+# Expose ports
+EXPOSE 9090
+EXPOSE 8765
+EXPOSE 7400-7500/udp
+
+ENTRYPOINT ["/ros_entrypoint.sh"]
+CMD ["bash"]

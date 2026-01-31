@@ -1,0 +1,30 @@
+# Set safety mode service
+
+# === REQUEST ===
+
+# Safety mode to set
+# 0=NORMAL, 1=REDUCED_SPEED, 2=PROTECTIVE_STOP, 3=EMERGENCY_STOP
+uint8 SAFETY_MODE_NORMAL = 0
+uint8 SAFETY_MODE_REDUCED_SPEED = 1
+uint8 SAFETY_MODE_PROTECTIVE_STOP = 2
+uint8 SAFETY_MODE_EMERGENCY_STOP = 3
+uint8 safety_mode
+
+# Client ID making the request
+string client_id
+
+# Reason for mode change
+string reason
+
+---
+
+# === RESPONSE ===
+
+# Success flag
+bool success
+
+# Previous safety mode
+uint8 previous_mode
+
+# Error message if failed
+string error_message

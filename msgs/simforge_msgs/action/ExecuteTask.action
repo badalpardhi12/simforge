@@ -1,0 +1,72 @@
+# ExecuteTask Action
+# Execute a VLA-guided manipulation task
+
+# === GOAL ===
+
+# Natural language instruction
+string instruction
+
+# Robot to use
+string robot_name
+
+# Optional: camera topic to use
+string camera_topic
+
+# Optional: additional context
+string[] context_hints
+
+# Maximum execution time (seconds, 0 = no limit)
+float64 timeout
+
+# Safety parameters
+float64 max_velocity_scale
+bool require_confirmation_on_grasp
+
+---
+
+# === RESULT ===
+
+# Success flag
+bool success
+
+# Status message
+string message
+
+# Task execution summary
+string[] completed_steps
+string[] skipped_steps
+
+# Performance metrics
+float64 total_time_sec
+float64 vla_inference_time_sec
+float64 motion_time_sec
+uint32 waypoints_executed
+uint32 replans_performed
+
+# Final state
+float64[] final_joint_positions
+geometry_msgs/Pose final_pose
+
+---
+
+# === FEEDBACK ===
+
+# Overall progress (0.0 to 1.0)
+float32 overall_progress
+
+# Current step being executed
+string current_step
+uint32 current_step_index
+uint32 total_steps
+
+# Step progress (0.0 to 1.0)
+float32 step_progress
+
+# VLA confidence for current action
+float32 confidence
+
+# Current robot state
+geometry_msgs/Pose current_pose
+
+# Status description
+string status
