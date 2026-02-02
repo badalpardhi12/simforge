@@ -199,13 +199,18 @@ class SimforgeClient:
             
             logger.info(f"Connecting to {self.server_uri}...")
             
+            # For websockets 12.0+, pass parameters directly
+            connect_kwargs = {
+                "ping_interval": 20,
+                "ping_timeout": 10,
+            }
+            
+            # Only add ssl context if using wss
+            if self.config.use_ssl and ssl_context:
+                connect_kwargs["ssl"] = ssl_context
+            
             self._ws = await asyncio.wait_for(
-                connect(
-                    self.server_uri,
-                    ssl=ssl_context,
-                    ping_interval=20,
-                    ping_timeout=10,
-                ),
+                connect(self.server_uri, **connect_kwargs),
                 timeout=self.config.connection_timeout_sec
             )
             
