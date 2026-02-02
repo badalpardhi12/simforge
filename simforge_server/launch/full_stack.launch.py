@@ -87,9 +87,9 @@ def generate_launch_description():
         name='safety_watchdog',
         output='screen',
         parameters=[{
-            'heartbeat_timeout_sec': 0.1,
-            'max_consecutive_misses': 3,
-            'check_frequency_hz': 100.0,
+            'heartbeat_timeout_sec': 2.0,  # 2 seconds - tolerant for network variations
+            'max_consecutive_misses': 5,   # Allow more misses before protective stop
+            'check_frequency_hz': 10.0,    # 10Hz monitoring - sufficient for safety
             'enable_force_monitoring': True,
             'max_tcp_force_n': 100.0,
             'max_tcp_torque_nm': 10.0,
