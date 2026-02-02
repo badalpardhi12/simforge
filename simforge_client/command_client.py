@@ -95,7 +95,7 @@ class ClientConfig:
     """Client configuration."""
     server_ip: str = "localhost"
     command_port: int = 8765
-    heartbeat_rate_hz: float = 50.0
+    heartbeat_rate_hz: float = 2.0  # 2Hz - send heartbeat every 500ms
     reconnect_delay_sec: float = 1.0
     max_reconnect_attempts: int = 10
     client_id: str = "mac_client"

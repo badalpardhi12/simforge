@@ -51,11 +51,11 @@ class ClientInfo:
 @dataclass
 class SafetyConfig:
     """Safety watchdog configuration."""
-    heartbeat_timeout_sec: float = 0.1  # 100ms
-    max_consecutive_misses: int = 3
-    check_frequency_hz: float = 100.0  # 100Hz monitoring
-    warning_threshold_misses: int = 1
-    max_communication_latency_ms: float = 50.0
+    heartbeat_timeout_sec: float = 2.0  # 2 seconds - more tolerant for network variations
+    max_consecutive_misses: int = 5  # Allow more misses before protective stop
+    check_frequency_hz: float = 10.0  # 10Hz monitoring - sufficient for safety
+    warning_threshold_misses: int = 2  # Warn after 2 misses
+    max_communication_latency_ms: float = 200.0  # Allow higher latency over network
     enable_force_monitoring: bool = True
     max_tcp_force_n: float = 100.0  # Maximum force at TCP
     max_tcp_torque_nm: float = 10.0  # Maximum torque at TCP
@@ -76,10 +76,10 @@ class SafetyWatchdogNode(Node):
     def __init__(self):
         super().__init__('safety_watchdog')
         
-        # Declare parameters
-        self.declare_parameter('heartbeat_timeout_sec', 0.1)
-        self.declare_parameter('max_consecutive_misses', 3)
-        self.declare_parameter('check_frequency_hz', 100.0)
+        # Declare parameters - defaults match SafetyConfig
+        self.declare_parameter('heartbeat_timeout_sec', 2.0)
+        self.declare_parameter('max_consecutive_misses', 5)
+        self.declare_parameter('check_frequency_hz', 10.0)
         self.declare_parameter('enable_force_monitoring', True)
         self.declare_parameter('max_tcp_force_n', 100.0)
         self.declare_parameter('max_tcp_torque_nm', 10.0)
@@ -207,7 +207,11 @@ class SafetyWatchdogNode(Node):
             
             with self.lock:
                 if client_id not in self._connected_clients:
-                    self._connected_clients[client_id] = ClientInfo(client_id=client_id)
+                    # Initialize with current time to avoid immediate timeout detection
+                    self._connected_clients[client_id] = ClientInfo(
+                        client_id=client_id,
+                        last_heartbeat_time=current_time
+                    )
                     self.get_logger().info(f"New client connected: {client_id}")
                 
                 client = self._connected_clients[client_id]
