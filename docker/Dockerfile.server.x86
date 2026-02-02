@@ -58,6 +58,10 @@ RUN apt-get update && apt-get install -y \
     ros-humble-nav-msgs \
     ros-humble-foxglove-bridge \
     ros-humble-moveit \
+    ros-humble-robot-state-publisher \
+    ros-humble-joint-state-publisher \
+    ros-humble-xacro \
+    ros-humble-urdf \
     python3-colcon-common-extensions \
     ros-humble-moveit-planners \
     ros-humble-moveit-ros-planning-interface \
@@ -98,6 +102,9 @@ COPY msgs /ros2_ws/src/msgs
 COPY simforge_server /ros2_ws/src/simforge_server
 COPY config /ros2_ws/src/simforge_server/config
 COPY assets /ros2_ws/src/simforge_server/assets
+
+# Also copy assets to root level for easy access
+COPY assets /ros2_ws/assets
 
 # Build ROS 2 packages
 RUN /bin/bash -c "source /opt/ros/humble/setup.bash && \

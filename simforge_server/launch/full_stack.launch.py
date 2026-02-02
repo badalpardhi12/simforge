@@ -4,6 +4,7 @@ Full Stack Launch File
 Launches all Simforge server components:
 - Safety Watchdog (first)
 - Robot Control
+- Robot State Publisher (for TF and URDF visualization)
 - Command Gateway
 - Perception
 - VLA Inference
@@ -16,11 +17,13 @@ Usage:
     ros2 launch simforge_server full_stack.launch.py simulation_mode:=true
 """
 
+import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition, UnlessCondition
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import LaunchConfiguration, PythonExpression, Command
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -69,12 +72,19 @@ def generate_launch_description():
         description='Enable perception node'
     )
     
+    urdf_path_arg = DeclareLaunchArgument(
+        'urdf_path',
+        default_value='/ros2_ws/assets/ur5e/ur5e.urdf',
+        description='Path to robot URDF file'
+    )
+    
     # Get launch configurations
     robot_ip = LaunchConfiguration('robot_ip')
     robot_name = LaunchConfiguration('robot_name')
     simulation_mode = LaunchConfiguration('simulation_mode')
     websocket_port = LaunchConfiguration('websocket_port')
     foxglove_port = LaunchConfiguration('foxglove_port')
+    urdf_path = LaunchConfiguration('urdf_path')
     use_vla = LaunchConfiguration('use_vla')
     use_perception = LaunchConfiguration('use_perception')
     
@@ -107,6 +117,21 @@ def generate_launch_description():
             'robot_name': robot_name,
             'state_publish_rate': 50.0,
             'simulation_mode': simulation_mode,
+        }],
+    )
+    
+    # 2b. Robot State Publisher (publishes TF transforms from joint_states + URDF)
+    robot_state_publisher_node = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        output='screen',
+        parameters=[{
+            'robot_description': ParameterValue(
+                Command(['cat ', urdf_path]),
+                value_type=str
+            ),
+            'publish_frequency': 50.0,
         }],
     )
     
@@ -193,10 +218,12 @@ def generate_launch_description():
         foxglove_port_arg,
         use_vla_arg,
         use_perception_arg,
+        urdf_path_arg,
         
         # Nodes (in dependency order)
         safety_watchdog_node,
         robot_control_node,
+        robot_state_publisher_node,  # Publishes TF from joint_states
         command_gateway_node,
         perception_node,
         vla_inference_node,
