@@ -12,7 +12,7 @@ Launches all Simforge server components:
 
 Usage:
     ros2 launch simforge_server full_stack.launch.py
-    ros2 launch simforge_server full_stack.launch.py robot_ip:=192.168.1.10
+    ros2 launch simforge_server full_stack.launch.py robot_ip:=192.168.1.9
     ros2 launch simforge_server full_stack.launch.py simulation_mode:=true
 """
 
@@ -29,7 +29,7 @@ def generate_launch_description():
     # Declare launch arguments
     robot_ip_arg = DeclareLaunchArgument(
         'robot_ip',
-        default_value='192.168.1.10',
+        default_value='192.168.1.9',
         description='IP address of the UR robot'
     )
     

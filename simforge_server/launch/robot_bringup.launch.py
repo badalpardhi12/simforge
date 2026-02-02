@@ -9,7 +9,7 @@ Launches only robot control components (without VLA/Perception):
 
 Usage:
     ros2 launch simforge_server robot_bringup.launch.py
-    ros2 launch simforge_server robot_bringup.launch.py robot_ip:=192.168.1.10
+    ros2 launch simforge_server robot_bringup.launch.py robot_ip:=192.168.1.9
 """
 
 from launch import LaunchDescription
@@ -24,7 +24,7 @@ def generate_launch_description():
     # Declare launch arguments
     robot_ip_arg = DeclareLaunchArgument(
         'robot_ip',
-        default_value='192.168.1.10',
+        default_value='192.168.1.9',
         description='IP address of the UR robot'
     )
     

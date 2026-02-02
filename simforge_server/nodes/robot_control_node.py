@@ -51,7 +51,7 @@ class RobotMode(IntEnum):
 @dataclass
 class RobotConfig:
     """Robot configuration."""
-    robot_ip: str = "192.168.1.10"
+    robot_ip: str = "192.168.1.9"
     robot_name: str = "ur20"
     control_frequency: float = 500.0  # Hz
     state_publish_rate: float = 50.0  # Hz
@@ -70,7 +70,7 @@ class RobotControlNode(Node):
         super().__init__('robot_control')
         
         # Declare parameters
-        self.declare_parameter('robot_ip', '192.168.1.10')
+        self.declare_parameter('robot_ip', '192.168.1.9')
         self.declare_parameter('robot_name', 'ur20')
         self.declare_parameter('control_frequency', 500.0)
         self.declare_parameter('state_publish_rate', 50.0)

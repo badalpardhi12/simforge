@@ -47,7 +47,7 @@ safety:
 robots:
   ur20:
     # Connection
-    ip: "192.168.1.10"
+    ip: "192.168.1.9"
     name: "ur20"
     type: "ur20"
     

@@ -140,7 +140,7 @@ Edit `config/simforge_config.yaml`:
 ```yaml
 robots:
   ur20:
-    ip: "192.168.1.10"
+    ip: "192.168.1.9"
     name: "ur20"
     max_velocity_scale: 1.0
     default_velocity_scale: 0.5
@@ -178,10 +178,10 @@ asyncio.run(main())
 
 ```bash
 # Full stack (all components)
-ros2 launch simforge_server full_stack.launch.py robot_ip:=192.168.1.10
+ros2 launch simforge_server full_stack.launch.py robot_ip:=192.168.1.9
 
 # Robot only (no VLA/perception)
-ros2 launch simforge_server robot_bringup.launch.py robot_ip:=192.168.1.10
+ros2 launch simforge_server robot_bringup.launch.py robot_ip:=192.168.1.9
 
 # Simulation mode
 ros2 launch simforge_server full_stack.launch.py simulation_mode:=true

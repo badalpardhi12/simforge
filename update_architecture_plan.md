@@ -1196,7 +1196,7 @@ ros2 launch foxglove_bridge foxglove_bridge.launch.py
 **Phase 2 - Test Motion:**
 ```bash
 # Server - Start robot control stack
-ros2 launch simforge_server robot_bringup.launch.py robot_ip:=192.168.1.10
+ros2 launch simforge_server robot_bringup.launch.py robot_ip:=192.168.1.9
 
 # Mac - Send test command
 python3 simforge_client/test_move.py --server <SERVER_IP> --joints 0 -1.57 1.57 0 0 0
