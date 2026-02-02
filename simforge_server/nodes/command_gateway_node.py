@@ -140,8 +140,11 @@ class CommandGatewayNode(Node):
         
         self.get_logger().info("WebSocket server started")
 
-    async def handle_client(self, websocket: WebSocketServerProtocol, path: str):
-        """Handle a WebSocket client connection."""
+    async def handle_client(self, websocket: WebSocketServerProtocol, path: str = None):
+        """Handle a WebSocket client connection.
+        
+        Note: path parameter is optional for websockets 12.0+ compatibility.
+        """
         client_id = f"client_{id(websocket)}"
         
         # Check max clients

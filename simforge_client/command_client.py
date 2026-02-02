@@ -332,6 +332,7 @@ class SimforgeClient:
                 logger.error(f"Invalid JSON received: {e}")
             except Exception as e:
                 logger.error(f"Receive error: {e}")
+                await asyncio.sleep(0.5)  # Prevent tight error loops
 
     async def _handle_disconnect(self):
         """Handle unexpected disconnection with reconnection logic."""
