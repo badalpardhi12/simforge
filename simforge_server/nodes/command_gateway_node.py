@@ -64,7 +64,7 @@ class CommandGatewayNode(Node):
         super().__init__('command_gateway')
         
         # Declare parameters
-        self.declare_parameter('websocket_port', 8765)
+        self.declare_parameter('websocket_port', 8766)
         self.declare_parameter('websocket_host', '0.0.0.0')
         self.declare_parameter('max_clients', 5)
         
@@ -76,7 +76,7 @@ class CommandGatewayNode(Node):
         self.callback_group = ReentrantCallbackGroup()
         
         # Connected clients
-        self.clients: Dict[str, ConnectedClient] = {}
+        self._connected_clients: Dict[str, ConnectedClient] = {}
         
         # Action clients for robots (registered dynamically)
         self.move_action_clients: Dict[str, ActionClient] = {}
@@ -145,7 +145,7 @@ class CommandGatewayNode(Node):
         client_id = f"client_{id(websocket)}"
         
         # Check max clients
-        if len(self.clients) >= self.max_clients:
+        if len(self._connected_clients) >= self.max_clients:
             self.get_logger().warning(f"Max clients reached, rejecting {client_id}")
             await websocket.close(1013, "Max clients reached")
             return
@@ -157,7 +157,7 @@ class CommandGatewayNode(Node):
             connected_at=time.time(),
             last_activity=time.time(),
         )
-        self.clients[client_id] = client
+        self._connected_clients[client_id] = client
         
         self.get_logger().info(f"Client connected: {client_id} from {websocket.remote_address}")
         
@@ -171,7 +171,7 @@ class CommandGatewayNode(Node):
             self.get_logger().error(f"Client error: {client_id} - {e}")
         finally:
             # Unregister client
-            self.clients.pop(client_id, None)
+            self._connected_clients.pop(client_id, None)
             self.get_logger().info(f"Client removed: {client_id}")
 
     async def process_message(self, client: ConnectedClient, message: str):
@@ -386,7 +386,7 @@ class CommandGatewayNode(Node):
 
     async def broadcast(self, message: str):
         """Broadcast message to all connected clients."""
-        for client in self.clients.values():
+        for client in self._connected_clients.values():
             try:
                 await client.websocket.send(message)
             except Exception as e:

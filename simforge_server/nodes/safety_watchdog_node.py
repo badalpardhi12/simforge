@@ -95,7 +95,7 @@ class SafetyWatchdogNode(Node):
         )
         
         # State tracking
-        self.clients: Dict[str, ClientInfo] = {}
+        self._connected_clients: Dict[str, ClientInfo] = {}
         self.current_safety_state = SafetyState.NORMAL
         self.active_faults: List[str] = []
         self.last_fault_message = ""
@@ -206,11 +206,11 @@ class SafetyWatchdogNode(Node):
             current_time = time.time()
             
             with self.lock:
-                if client_id not in self.clients:
-                    self.clients[client_id] = ClientInfo(client_id=client_id)
+                if client_id not in self._connected_clients:
+                    self._connected_clients[client_id] = ClientInfo(client_id=client_id)
                     self.get_logger().info(f"New client connected: {client_id}")
                 
-                client = self.clients[client_id]
+                client = self._connected_clients[client_id]
                 
                 # Check for sequence gaps
                 if sequence > 0 and client.sequence_number > 0:
@@ -254,7 +254,7 @@ class SafetyWatchdogNode(Node):
                 return
             
             # Check all client heartbeats
-            for client_id, client in list(self.clients.items()):
+            for client_id, client in list(self._connected_clients.items()):
                 time_since_heartbeat = current_time - client.last_heartbeat_time
                 
                 if time_since_heartbeat > self.config.heartbeat_timeout_sec:
@@ -377,7 +377,7 @@ class SafetyWatchdogNode(Node):
             self.current_safety_state = SafetyState.NORMAL
             
             # Reset client miss counts
-            for client in self.clients.values():
+            for client in self._connected_clients.values():
                 client.consecutive_misses = 0
         
         self.get_logger().info("Safety state reset to NORMAL")
@@ -396,7 +396,7 @@ class SafetyWatchdogNode(Node):
         """Publish current safety status."""
         with self.lock:
             # Build status message (simplified - will use proper msg type)
-            client_ids = list(self.clients.keys())
+            client_ids = list(self._connected_clients.keys())
             faults = "; ".join(self.active_faults[-5:])  # Last 5 faults
             
             status = (

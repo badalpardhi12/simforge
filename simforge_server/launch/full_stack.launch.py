@@ -35,7 +35,7 @@ def generate_launch_description():
     
     robot_name_arg = DeclareLaunchArgument(
         'robot_name',
-        default_value='ur20',
+        default_value='ur5e',
         description='Name of the robot'
     )
     
@@ -47,7 +47,7 @@ def generate_launch_description():
     
     websocket_port_arg = DeclareLaunchArgument(
         'websocket_port',
-        default_value='8765',
+        default_value='8766',
         description='WebSocket port for Command Gateway'
     )
     
