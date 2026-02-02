@@ -120,6 +120,7 @@ def generate_launch_description():
             'websocket_port': websocket_port,
             'websocket_host': '0.0.0.0',
             'max_clients': 5,
+            'robot_name': robot_name,
         }],
     )
     
