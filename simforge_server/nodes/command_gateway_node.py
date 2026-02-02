@@ -67,10 +67,12 @@ class CommandGatewayNode(Node):
         self.declare_parameter('websocket_port', 8766)
         self.declare_parameter('websocket_host', '0.0.0.0')
         self.declare_parameter('max_clients', 5)
+        self.declare_parameter('robot_name', 'nakul_ur5e')
         
         self.ws_port = self.get_parameter('websocket_port').value
         self.ws_host = self.get_parameter('websocket_host').value
         self.max_clients = self.get_parameter('max_clients').value
+        self.default_robot = self.get_parameter('robot_name').value
         
         # Callback group for async operations
         self.callback_group = ReentrantCallbackGroup()
@@ -106,7 +108,7 @@ class CommandGatewayNode(Node):
         )
         
         # === Register default robot ===
-        self.register_robot('ur20')
+        self.register_robot(self.default_robot)
         
         # WebSocket server (started separately)
         self.ws_server = None
