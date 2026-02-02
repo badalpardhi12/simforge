@@ -22,7 +22,7 @@ from enum import IntEnum
 import ssl
 
 try:
-    from websockets.client import connect, WebSocketClientProtocol
+    from websockets.client import connect as ws_connect, WebSocketClientProtocol
     from websockets.exceptions import ConnectionClosed, WebSocketException
 except ImportError:
     raise ImportError("websockets package required. Install with: pip install websockets>=12.0")
@@ -210,13 +210,13 @@ class SimforgeClient:
             try:
                 # Try with ping parameters (websockets 10.x style)
                 self._ws = await asyncio.wait_for(
-                    connect(self.server_uri, ping_interval=20, ping_timeout=10, **connect_kwargs),
+                    ws_connect(self.server_uri, ping_interval=20, ping_timeout=10, **connect_kwargs),
                     timeout=self.config.connection_timeout_sec
                 )
             except TypeError:
                 # Fall back to basic connection (older or newer API)
                 self._ws = await asyncio.wait_for(
-                    connect(self.server_uri, **connect_kwargs),
+                    ws_connect(self.server_uri, **connect_kwargs),
                     timeout=self.config.connection_timeout_sec
                 )
             
