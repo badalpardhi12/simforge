@@ -35,7 +35,7 @@ def generate_launch_description():
     
     robot_name_arg = DeclareLaunchArgument(
         'robot_name',
-        default_value='ur5e',
+        default_value='nakul_ur5e',
         description='Name of the robot'
     )
     
@@ -96,16 +96,15 @@ def generate_launch_description():
         }],
     )
     
-    # 2. Robot Control
+    # 2. Robot Control (v2 - uses Dashboard + Secondary/Realtime interfaces)
     robot_control_node = Node(
         package='simforge_server',
-        executable='robot_control_node.py',
+        executable='robot_control_node_v2.py',
         name='robot_control',
         output='screen',
         parameters=[{
             'robot_ip': robot_ip,
             'robot_name': robot_name,
-            'control_frequency': 500.0,
             'state_publish_rate': 50.0,
             'simulation_mode': simulation_mode,
         }],

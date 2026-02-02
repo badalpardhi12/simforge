@@ -25,6 +25,8 @@ install(PROGRAMS
   nodes/safety_watchdog_node.py
   nodes/command_gateway_node.py
   nodes/robot_control_node.py
+  nodes/robot_control_node_v2.py
+  nodes/ur_communication.py
   nodes/perception_node.py
   nodes/vla_inference_node.py
   nodes/orchestrator_node.py

@@ -31,7 +31,7 @@ async def test_move_joints(client: SimforgeClient, joints: list):
     print(f"Target joints: {joints}")
     
     result = await client.move_robot(
-        robot_name="ur20",
+        robot_name="nakul_ur5e",
         target_joints=joints,
         velocity_scale=0.3,
         collision_check=True,
@@ -53,7 +53,7 @@ async def test_move_cartesian(client: SimforgeClient, pose: Pose):
     print(f"Target pose: ({pose.x:.3f}, {pose.y:.3f}, {pose.z:.3f})")
     
     result = await client.move_robot(
-        robot_name="ur20",
+        robot_name="nakul_ur5e",
         target_pose=pose,
         velocity_scale=0.2,
         collision_check=True,
