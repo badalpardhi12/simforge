@@ -199,20 +199,26 @@ class SimforgeClient:
             
             logger.info(f"Connecting to {self.server_uri}...")
             
-            # For websockets 12.0+, pass parameters directly
-            connect_kwargs = {
-                "ping_interval": 20,
-                "ping_timeout": 10,
-            }
+            # Build connection kwargs - be compatible with different websockets versions
+            connect_kwargs = {}
             
             # Only add ssl context if using wss
             if self.config.use_ssl and ssl_context:
                 connect_kwargs["ssl"] = ssl_context
             
-            self._ws = await asyncio.wait_for(
-                connect(self.server_uri, **connect_kwargs),
-                timeout=self.config.connection_timeout_sec
-            )
+            # Try connecting - websockets API varies between versions
+            try:
+                # Try with ping parameters (websockets 10.x style)
+                self._ws = await asyncio.wait_for(
+                    connect(self.server_uri, ping_interval=20, ping_timeout=10, **connect_kwargs),
+                    timeout=self.config.connection_timeout_sec
+                )
+            except TypeError:
+                # Fall back to basic connection (older or newer API)
+                self._ws = await asyncio.wait_for(
+                    connect(self.server_uri, **connect_kwargs),
+                    timeout=self.config.connection_timeout_sec
+                )
             
             self._state = ConnectionState.CONNECTED
             self._reconnect_attempts = 0
