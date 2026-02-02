@@ -249,7 +249,7 @@ class SafetyWatchdogNode(Node):
         self.trigger_emergency_stop(f"External E-Stop: {msg.data}")
 
     def check_safety(self):
-        """Main safety check loop - runs at 100Hz."""
+        """Main safety check loop - runs at configured frequency."""
         current_time = time.time()
         
         with self.lock:
@@ -261,13 +261,19 @@ class SafetyWatchdogNode(Node):
             for client_id, client in list(self._connected_clients.items()):
                 time_since_heartbeat = current_time - client.last_heartbeat_time
                 
-                if time_since_heartbeat > self.config.heartbeat_timeout_sec:
-                    client.consecutive_misses += 1
+                # Calculate how many heartbeat intervals have been missed
+                # Expected heartbeat interval is roughly timeout/max_misses
+                expected_interval = self.config.heartbeat_timeout_sec
+                missed_intervals = int(time_since_heartbeat / expected_interval)
+                
+                # Only update if we've missed more intervals than previously recorded
+                if missed_intervals > client.consecutive_misses:
+                    client.consecutive_misses = missed_intervals
                     
                     if client.consecutive_misses == self.config.warning_threshold_misses:
                         self.get_logger().warn(
                             f"Heartbeat warning: {client_id} - "
-                            f"{client.consecutive_misses} misses"
+                            f"{client.consecutive_misses} misses ({time_since_heartbeat:.1f}s)"
                         )
                         if self.current_safety_state == SafetyState.NORMAL:
                             self.current_safety_state = SafetyState.WARNING
@@ -276,7 +282,7 @@ class SafetyWatchdogNode(Node):
                     if client.consecutive_misses >= self.config.max_consecutive_misses:
                         self.get_logger().error(
                             f"SAFETY: Connection lost to {client_id} - "
-                            f"triggering protective stop"
+                            f"triggering protective stop (no heartbeat for {time_since_heartbeat:.1f}s)"
                         )
                         self.trigger_protective_stop(
                             f"Connection lost: {client_id}"
