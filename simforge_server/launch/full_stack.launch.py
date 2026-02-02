@@ -24,10 +24,14 @@ from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression, Command
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+from ament_index_python.packages import get_package_share_directory
 
 
 def generate_launch_description():
     """Generate launch description for full stack."""
+    
+    # Get package share directory for asset paths
+    pkg_share = get_package_share_directory('simforge_server')
     
     # Declare launch arguments
     robot_ip_arg = DeclareLaunchArgument(
@@ -72,9 +76,12 @@ def generate_launch_description():
         description='Enable perception node'
     )
     
+    # Default URDF path using package share directory
+    default_urdf = os.path.join(pkg_share, 'assets', 'ur5e', 'ur5e_package.urdf')
+    
     urdf_path_arg = DeclareLaunchArgument(
         'urdf_path',
-        default_value='/ros2_ws/assets/ur5e/ur5e_package.urdf',
+        default_value=default_urdf,
         description='Path to robot URDF file (with package:// mesh paths for Foxglove)'
     )
     
