@@ -74,8 +74,8 @@ def generate_launch_description():
     
     urdf_path_arg = DeclareLaunchArgument(
         'urdf_path',
-        default_value='/ros2_ws/assets/ur5e/ur5e_foxglove.urdf',
-        description='Path to robot URDF file (with absolute mesh paths for Foxglove)'
+        default_value='/ros2_ws/assets/ur5e/ur5e_package.urdf',
+        description='Path to robot URDF file (with package:// mesh paths for Foxglove)'
     )
     
     # Get launch configurations
@@ -206,6 +206,7 @@ def generate_launch_description():
             'address': '0.0.0.0',
             'send_buffer_limit': 100000000,  # 100MB for point clouds
             'use_compression': True,
+            'asset_uri_allowlist': ['package://.*'],  # Allow fetching package:// assets
         }],
     )
     
