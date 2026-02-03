@@ -174,8 +174,8 @@ class CommandGatewayNode(Node):
             self.handle_client,
             self.ws_host,
             self.ws_port,
-            ping_interval=20,
-            ping_timeout=10,
+            ping_interval=30,  # Send ping every 30s
+            ping_timeout=300,  # Allow 5 minutes for long-running proto-sim
         )
         
         self.get_logger().info("WebSocket server started")

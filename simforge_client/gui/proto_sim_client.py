@@ -596,6 +596,17 @@ class ProtoSimClientFrame(wx.Frame):
     ) -> None:
         """Execute the protocol simulation."""
         try:
+            # Calculate timeout based on number of poses
+            # Each pose takes ~3-5s (move + idle time), add buffer
+            total_poses = (
+                len(params.horiz) * len(params.vert) * len(params.distance) *
+                len(params.roll) * len(params.pitch) * len(params.yaw)
+            )
+            timeout_per_pose = params.idle_time + 3.0  # idle + movement time
+            timeout = max(120.0, total_poses * timeout_per_pose + 60.0)  # Min 2min, plus 1min buffer
+            
+            self._log(f"Timeout set to {timeout:.0f}s for {total_poses} poses")
+            
             response = await self._client.call_rpc("run_proto_sim", {
                 "robot_name": robot,
                 "target_object": target_object,
@@ -609,7 +620,7 @@ class ProtoSimClientFrame(wx.Frame):
                 "idle_time": params.idle_time,
                 "randomize": params.randomize,
                 "mode": mode,
-            })
+            }, timeout=timeout)
             
             if response.get("success"):
                 self._log(f"Protocol completed: {response.get('message', 'OK')}")
