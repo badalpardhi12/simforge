@@ -74,7 +74,7 @@ def main():
     
     # Import and run the GUI
     try:
-        from gui.proto_sim_client import run_proto_sim_client
+        from simforge_client.gui.proto_sim_client import run_proto_sim_client
         
         logger.info("Launching Proto-Sim Client GUI...")
         logger.info("")

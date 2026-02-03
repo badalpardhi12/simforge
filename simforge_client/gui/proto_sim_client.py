@@ -31,7 +31,7 @@ except ImportError:
     HAS_WX = False
     wx = None
 
-from ..command_client import SimforgeClient, MoveResult, MoveFeedback, Pose
+from simforge_client.command_client import SimforgeClient, MoveResult, MoveFeedback, Pose
 
 
 LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
