@@ -5,15 +5,24 @@ Simforge Client Entry Point
 Launch the Simforge client GUI on macOS for protocol simulation and robot control.
 
 Usage:
+    # After installing with pip install -e .
     python -m simforge_client --server 192.168.1.12 --port 8766
     
-Or run directly:
-    python simforge_client/run_client.py --server 192.168.1.12
+    # Or run directly from simforge directory:
+    cd simforge
+    PYTHONPATH=. python simforge_client/run_client.py --server 192.168.1.12
 """
 
 import argparse
 import logging
 import sys
+import os
+
+# Add parent directory to path if running as script
+if __name__ == "__main__" and __package__ is None:
+    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
 
 # Configure logging
 logging.basicConfig(
