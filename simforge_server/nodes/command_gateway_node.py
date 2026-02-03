@@ -544,6 +544,20 @@ class CommandGatewayNode(Node):
         # Execute poses
         completed = 0
         failed = 0
+        client_disconnected = False
+        
+        async def safe_send_feedback(feedback_data):
+            """Send feedback to client, return False if client disconnected."""
+            nonlocal client_disconnected
+            if client_disconnected:
+                return False
+            try:
+                await client.websocket.send(json.dumps(feedback_data))
+                return True
+            except Exception as e:
+                self.get_logger().warn(f"Client disconnected during proto-sim: {e}")
+                client_disconnected = True
+                return False
         
         try:
             self.get_logger().info(f"Starting pose execution loop with {total_poses} poses")
@@ -567,7 +581,7 @@ class CommandGatewayNode(Node):
                     failed += 1
                     continue
                 
-                # Send progress update - moving to pose
+                # Send progress update - moving to pose (ignore send failures)
                 feedback = {
                     'type': 'rpc_feedback',
                     'request_id': request_id,
@@ -577,7 +591,7 @@ class CommandGatewayNode(Node):
                     'progress_percent': (i / total_poses) * 100,
                     'status': 'moving',
                 }
-                await client.websocket.send(json.dumps(feedback))
+                await safe_send_feedback(feedback)
                 
                 # Execute simulated movement with joint state publishing
                 if mode in ('simulation', 'both'):
@@ -598,7 +612,7 @@ class CommandGatewayNode(Node):
                 
                 # Send progress update - at pose (idle)
                 feedback['status'] = 'idle'
-                await client.websocket.send(json.dumps(feedback))
+                await safe_send_feedback(feedback)
                 
                 # Wait at pose (idle time)
                 idle_steps = int(idle_time * 10)  # 10 Hz check for stop
@@ -621,14 +635,18 @@ class CommandGatewayNode(Node):
         result = {
             'type': 'rpc_result',
             'request_id': request_id,
-            'success': not self._proto_sim_stop_requested,
-            'message': f'Completed {completed}/{total_poses} poses',
+            'success': not self._proto_sim_stop_requested and not client_disconnected,
+            'message': f'Completed {completed}/{total_poses} poses' + (' (client disconnected)' if client_disconnected else ''),
             'completed': completed,
             'failed': failed,
             'total': total_poses,
             'stopped': self._proto_sim_stop_requested,
         }
-        await client.websocket.send(json.dumps(result))
+        
+        self.get_logger().info(f"Proto-sim finished: {result['message']}")
+        
+        # Try to send result, but don't fail if client disconnected
+        await safe_send_feedback(result)
         
         return result
     
