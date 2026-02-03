@@ -18,7 +18,9 @@ import asyncio
 import json
 import time
 import logging
-from typing import Dict, Optional, Any
+import math
+import numpy as np
+from typing import Dict, Optional, Any, List, Tuple
 from dataclasses import dataclass
 
 import rclpy
@@ -27,10 +29,11 @@ from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 
-from std_msgs.msg import String
+from std_msgs.msg import String, Header
 from std_srvs.srv import Trigger
 from geometry_msgs.msg import Pose, Point, Quaternion
 from trajectory_msgs.msg import JointTrajectory
+from sensor_msgs.msg import JointState
 
 try:
     import websockets
@@ -98,6 +101,28 @@ class CommandGatewayNode(Node):
             '/safety/emergency_stop',
             10
         )
+        
+        # Joint state publisher for simulation visualization
+        self.joint_state_pub = self.create_publisher(
+            JointState,
+            '/joint_states',
+            10
+        )
+        
+        # Current simulated joint positions (UR5e home position)
+        self.sim_joint_positions = [0.0, -math.pi/2, 0.0, -math.pi/2, 0.0, 0.0]
+        self.sim_joint_names = [
+            'shoulder_pan_joint',
+            'shoulder_lift_joint', 
+            'elbow_joint',
+            'wrist_1_joint',
+            'wrist_2_joint',
+            'wrist_3_joint'
+        ]
+        
+        # Proto-sim control flags
+        self._proto_sim_running = False
+        self._proto_sim_stop_requested = False
         
         # === Service Clients ===
         # Protective stop service
@@ -432,7 +457,21 @@ class CommandGatewayNode(Node):
         request_id: str,
         params: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Run protocol simulation."""
+        """
+        Run protocol simulation with actual robot movement visualization.
+        
+        Generates spherical coordinates around target object and moves
+        the robot to each pose while publishing joint states for visualization.
+        """
+        if self._proto_sim_running:
+            return {
+                'success': False,
+                'error': 'Protocol simulation already running',
+            }
+        
+        self._proto_sim_running = True
+        self._proto_sim_stop_requested = False
+        
         robot_name = params.get('robot_name', self.default_robot)
         target_object = params.get('target_object', 'face_link')
         distances = params.get('distances', [0.3, 0.4, 0.5])
@@ -441,12 +480,13 @@ class CommandGatewayNode(Node):
         idle_time = params.get('idle_time', 2.0)
         randomize = params.get('randomize', False)
         mode = params.get('mode', 'simulation')  # 'simulation', 'real', 'both'
+        move_speed = params.get('move_speed', 0.5)  # 0.0-1.0
         
         self.get_logger().info(
             f"Proto-sim: {robot_name} -> {target_object}, mode={mode}"
         )
         
-        # Generate pose list
+        # Generate pose list from spherical coordinates
         import itertools
         poses = list(itertools.product(distances, horizontal_angles, vertical_angles))
         total_poses = len(poses)
@@ -457,54 +497,207 @@ class CommandGatewayNode(Node):
         
         self.get_logger().info(f"Proto-sim: {total_poses} poses to execute")
         
+        # Target object position (face fixture location - adjust as needed)
+        # This should come from TF or config in production
+        target_position = np.array([0.5, 0.3, 0.8])  # x, y, z in meters
+        
+        # Generate joint configurations for each spherical pose
+        pose_joints = self._generate_proto_sim_joints(
+            target_position, distances, horizontal_angles, vertical_angles
+        )
+        
         # Execute poses
         completed = 0
         failed = 0
         
-        for i, (dist, h_angle, v_angle) in enumerate(poses):
-            pose_name = f"D{dist}_H{h_angle}_V{v_angle}"
-            
-            # Send progress update
-            feedback = {
-                'type': 'rpc_feedback',
-                'request_id': request_id,
-                'current_pose_index': i,
-                'total_poses': total_poses,
-                'current_pose_name': pose_name,
-                'progress_percent': (i / total_poses) * 100,
-                'status': 'executing',
-            }
-            await client.websocket.send(json.dumps(feedback))
-            
-            # TODO: In production:
-            # 1. Calculate target pose from object position + spherical coords
-            # 2. Plan collision-free path using motion_planner
-            # 3. Execute on simulation (always) and/or real robot (if mode allows)
-            # 4. Wait for idle_time at pose
-            
-            # Simulate execution time
-            await asyncio.sleep(0.3)  # Reduced for testing
-            
-            completed += 1
+        try:
+            for i, (dist, h_angle, v_angle) in enumerate(poses):
+                if self._proto_sim_stop_requested:
+                    self.get_logger().info("Proto-sim stopped by user request")
+                    break
+                
+                pose_name = f"D{dist}_H{h_angle}_V{v_angle}"
+                target_joints = pose_joints.get((dist, h_angle, v_angle))
+                
+                if target_joints is None:
+                    self.get_logger().warn(f"No valid joints for pose {pose_name}")
+                    failed += 1
+                    continue
+                
+                # Send progress update - moving to pose
+                feedback = {
+                    'type': 'rpc_feedback',
+                    'request_id': request_id,
+                    'current_pose_index': i,
+                    'total_poses': total_poses,
+                    'current_pose_name': pose_name,
+                    'progress_percent': (i / total_poses) * 100,
+                    'status': 'moving',
+                }
+                await client.websocket.send(json.dumps(feedback))
+                
+                # Execute simulated movement with joint state publishing
+                if mode in ('simulation', 'both'):
+                    await self._execute_sim_movement(
+                        target_joints, 
+                        move_speed=move_speed
+                    )
+                
+                # TODO: If mode is 'real' or 'both', also send to real robot
+                # if mode in ('real', 'both'):
+                #     await self._execute_real_movement(target_joints)
+                
+                # Send progress update - at pose (idle)
+                feedback['status'] = 'idle'
+                await client.websocket.send(json.dumps(feedback))
+                
+                # Wait at pose (idle time)
+                idle_steps = int(idle_time * 10)  # 10 Hz check for stop
+                for _ in range(idle_steps):
+                    if self._proto_sim_stop_requested:
+                        break
+                    await asyncio.sleep(0.1)
+                    # Keep publishing joint states while idle
+                    self._publish_joint_state()
+                
+                completed += 1
+                
+        finally:
+            self._proto_sim_running = False
         
         # Send final result
         result = {
             'type': 'rpc_result',
             'request_id': request_id,
-            'success': True,
+            'success': not self._proto_sim_stop_requested,
             'message': f'Completed {completed}/{total_poses} poses',
             'completed': completed,
             'failed': failed,
             'total': total_poses,
+            'stopped': self._proto_sim_stop_requested,
         }
         await client.websocket.send(json.dumps(result))
         
         return result
 
+    def _generate_proto_sim_joints(
+        self,
+        target_pos: np.ndarray,
+        distances: List[float],
+        horizontal_angles: List[float],
+        vertical_angles: List[float],
+    ) -> Dict[Tuple[float, int, int], List[float]]:
+        """
+        Generate joint configurations for proto-sim poses.
+        
+        For now, generates demonstration poses that sweep through
+        the robot's workspace. In production, this would use IK
+        to calculate actual poses pointing at the target.
+        """
+        pose_joints = {}
+        
+        # Home position
+        home = [0.0, -math.pi/2, 0.0, -math.pi/2, 0.0, 0.0]
+        
+        # Generate varied poses based on spherical coordinates
+        for dist in distances:
+            for h_angle in horizontal_angles:
+                for v_angle in vertical_angles:
+                    # Map spherical coords to joint angles for demonstration
+                    # This creates a sweeping motion that's visually interesting
+                    
+                    # Base rotation follows horizontal angle
+                    j0 = math.radians(h_angle) * 0.5  # Scale down
+                    
+                    # Shoulder adjusts with distance and vertical
+                    j1 = -math.pi/2 + math.radians(v_angle) * 0.02 + (dist - 0.4) * 0.5
+                    
+                    # Elbow adjusts with distance
+                    j2 = (0.5 - dist) * 2.0
+                    
+                    # Wrist angles for orientation
+                    j3 = -math.pi/2 - math.radians(v_angle) * 0.03
+                    j4 = math.radians(h_angle) * 0.3
+                    j5 = 0.0
+                    
+                    # Clamp to safe limits
+                    joints = [
+                        np.clip(j0, -math.pi, math.pi),
+                        np.clip(j1, -math.pi, 0),
+                        np.clip(j2, -math.pi, math.pi),
+                        np.clip(j3, -math.pi, 0),
+                        np.clip(j4, -math.pi, math.pi),
+                        np.clip(j5, -math.pi, math.pi),
+                    ]
+                    
+                    pose_joints[(dist, h_angle, v_angle)] = joints
+        
+        return pose_joints
+
+    async def _execute_sim_movement(
+        self, 
+        target_joints: List[float],
+        move_speed: float = 0.5,
+        publish_rate: float = 50.0,
+    ) -> None:
+        """
+        Execute simulated movement by interpolating joint positions
+        and publishing JointState messages.
+        """
+        start_joints = np.array(self.sim_joint_positions)
+        end_joints = np.array(target_joints)
+        
+        # Calculate movement duration based on max joint change and speed
+        max_delta = np.max(np.abs(end_joints - start_joints))
+        # Scale duration: slower speed = longer duration
+        base_duration = max_delta / (math.pi * 0.5)  # ~2 seconds for 90 deg at speed=1.0
+        duration = base_duration / max(0.1, move_speed)
+        duration = max(0.2, min(duration, 5.0))  # Clamp between 0.2s and 5s
+        
+        # Interpolate and publish
+        dt = 1.0 / publish_rate
+        num_steps = int(duration * publish_rate)
+        
+        for step in range(num_steps + 1):
+            if self._proto_sim_stop_requested:
+                break
+            
+            t = step / max(1, num_steps)  # 0 to 1
+            # Smooth interpolation (ease in/out)
+            t_smooth = (1 - math.cos(t * math.pi)) / 2
+            
+            # Interpolate joints
+            current_joints = start_joints + (end_joints - start_joints) * t_smooth
+            self.sim_joint_positions = current_joints.tolist()
+            
+            # Publish joint state
+            self._publish_joint_state()
+            
+            await asyncio.sleep(dt)
+        
+        # Ensure we end at target
+        self.sim_joint_positions = target_joints
+        self._publish_joint_state()
+
+    def _publish_joint_state(self) -> None:
+        """Publish current simulated joint state."""
+        msg = JointState()
+        msg.header = Header()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = ''
+        msg.name = self.sim_joint_names
+        msg.position = self.sim_joint_positions
+        msg.velocity = [0.0] * 6
+        msg.effort = [0.0] * 6
+        
+        self.joint_state_pub.publish(msg)
+
     async def rpc_stop_proto_sim(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Stop running protocol simulation."""
-        # TODO: Implement stop mechanism
-        return {'success': True, 'message': 'Stop requested'}
+        if self._proto_sim_running:
+            self._proto_sim_stop_requested = True
+            return {'success': True, 'message': 'Stop requested'}
+        return {'success': False, 'message': 'No protocol simulation running'}
 
     async def rpc_check_collision(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Check collision for given joint configuration."""
