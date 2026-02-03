@@ -125,6 +125,19 @@ class CommandGatewayNode(Node):
         self._proto_sim_stop_requested = False
         
         # === Service Clients ===
+        # Service to pause robot_control_node's joint state publishing during simulation
+        self.pause_joint_pub_client = self.create_client(
+            Trigger,
+            '/robot/pause_joint_publishing',
+            callback_group=self.callback_group
+        )
+        
+        self.resume_joint_pub_client = self.create_client(
+            Trigger,
+            '/robot/resume_joint_publishing',
+            callback_group=self.callback_group
+        )
+        
         # Protective stop service
         self.protective_stop_client = self.create_client(
             Trigger,
@@ -462,6 +475,14 @@ class CommandGatewayNode(Node):
         
         Generates spherical coordinates around target object and moves
         the robot to each pose while publishing joint states for visualization.
+        
+        Parameters match simforge_new/control/proto_simulation.py:
+        - horiz: horizontal shift from object center (mm)
+        - vert: vertical shift from object center (mm)
+        - distance: distance from object (mm)
+        - roll: roll angle (degrees)
+        - pitch: pitch angle (degrees) - look up/down
+        - yaw: yaw angle (degrees) - look left/right
         """
         if self._proto_sim_running:
             return {
@@ -474,9 +495,15 @@ class CommandGatewayNode(Node):
         
         robot_name = params.get('robot_name', self.default_robot)
         target_object = params.get('target_object', 'face_link')
-        distances = params.get('distances', [0.3, 0.4, 0.5])
-        horizontal_angles = params.get('horizontal_angles', [-30, 0, 30])
-        vertical_angles = params.get('vertical_angles', [-15, 0, 15])
+        
+        # Parameters matching simforge_new structure
+        horiz = params.get('horiz', [0])  # mm
+        vert = params.get('vert', [0])  # mm
+        distance = params.get('distance', [250, 350, 450, 550])  # mm
+        roll = params.get('roll', [-90])  # degrees
+        pitch = params.get('pitch', [-45, -30, 0, 15])  # degrees
+        yaw = params.get('yaw', [-30, 0, 30])  # degrees
+        
         idle_time = params.get('idle_time', 2.0)
         randomize = params.get('randomize', False)
         mode = params.get('mode', 'simulation')  # 'simulation', 'real', 'both'
@@ -485,10 +512,21 @@ class CommandGatewayNode(Node):
         self.get_logger().info(
             f"Proto-sim: {robot_name} -> {target_object}, mode={mode}"
         )
+        self.get_logger().info(
+            f"  horiz={horiz}, vert={vert}, distance={distance}"
+        )
+        self.get_logger().info(
+            f"  roll={roll}, pitch={pitch}, yaw={yaw}"
+        )
         
-        # Generate pose list from spherical coordinates
+        # Pause real robot's joint state publishing during simulation
+        if mode in ('simulation', 'both'):
+            await self._pause_real_robot_joint_publishing()
+        
+        # Generate pose list from all parameter combinations
+        # Matching simforge_new order: horiz -> vert -> distance -> roll -> pitch -> yaw
         import itertools
-        poses = list(itertools.product(distances, horizontal_angles, vertical_angles))
+        poses = list(itertools.product(horiz, vert, pitch, yaw, distance, roll))
         total_poses = len(poses)
         
         if randomize:
@@ -497,27 +535,23 @@ class CommandGatewayNode(Node):
         
         self.get_logger().info(f"Proto-sim: {total_poses} poses to execute")
         
-        # Target object position (face fixture location - adjust as needed)
-        # This should come from TF or config in production
-        target_position = np.array([0.5, 0.3, 0.8])  # x, y, z in meters
-        
-        # Generate joint configurations for each spherical pose
-        pose_joints = self._generate_proto_sim_joints(
-            target_position, distances, horizontal_angles, vertical_angles
-        )
-        
         # Execute poses
         completed = 0
         failed = 0
         
         try:
-            for i, (dist, h_angle, v_angle) in enumerate(poses):
+            for i, (h, v, p, y, d, r) in enumerate(poses):
                 if self._proto_sim_stop_requested:
                     self.get_logger().info("Proto-sim stopped by user request")
                     break
                 
-                pose_name = f"D{dist}_H{h_angle}_V{v_angle}"
-                target_joints = pose_joints.get((dist, h_angle, v_angle))
+                pose_name = f"H{h}_V{v}_D{d}_R{r}_P{p}_Y{y}"
+                
+                # Generate target joint configuration for this pose
+                target_joints = self._compute_proto_pose_joints(
+                    horiz_mm=h, vert_mm=v, dist_mm=d,
+                    roll_deg=r, pitch_deg=p, yaw_deg=y
+                )
                 
                 if target_joints is None:
                     self.get_logger().warn(f"No valid joints for pose {pose_name}")
@@ -538,6 +572,7 @@ class CommandGatewayNode(Node):
                 
                 # Execute simulated movement with joint state publishing
                 if mode in ('simulation', 'both'):
+                    self.get_logger().debug(f"Executing sim movement to {target_joints}")
                     await self._execute_sim_movement(
                         target_joints, 
                         move_speed=move_speed
@@ -564,6 +599,9 @@ class CommandGatewayNode(Node):
                 
         finally:
             self._proto_sim_running = False
+            # Resume real robot's joint state publishing
+            if mode in ('simulation', 'both'):
+                await self._resume_real_robot_joint_publishing()
         
         # Send final result
         result = {
@@ -579,6 +617,97 @@ class CommandGatewayNode(Node):
         await client.websocket.send(json.dumps(result))
         
         return result
+    
+    async def _pause_real_robot_joint_publishing(self) -> None:
+        """Pause real robot's joint state publishing for simulation mode."""
+        if not self.pause_joint_pub_client.service_is_ready():
+            self.get_logger().warn("Pause joint publishing service not available")
+            return
+        
+        try:
+            request = Trigger.Request()
+            future = self.pause_joint_pub_client.call_async(request)
+            # Don't wait too long
+            await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, lambda: future.result()),
+                timeout=2.0
+            )
+            self.get_logger().info("Paused real robot joint state publishing")
+        except Exception as e:
+            self.get_logger().warn(f"Failed to pause joint publishing: {e}")
+    
+    async def _resume_real_robot_joint_publishing(self) -> None:
+        """Resume real robot's joint state publishing after simulation."""
+        if not self.resume_joint_pub_client.service_is_ready():
+            self.get_logger().warn("Resume joint publishing service not available")
+            return
+        
+        try:
+            request = Trigger.Request()
+            future = self.resume_joint_pub_client.call_async(request)
+            await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, lambda: future.result()),
+                timeout=2.0
+            )
+            self.get_logger().info("Resumed real robot joint state publishing")
+        except Exception as e:
+            self.get_logger().warn(f"Failed to resume joint publishing: {e}")
+
+    def _compute_proto_pose_joints(
+        self,
+        horiz_mm: float,
+        vert_mm: float,
+        dist_mm: float,
+        roll_deg: float,
+        pitch_deg: float,
+        yaw_deg: float,
+    ) -> Optional[List[float]]:
+        """
+        Compute joint configuration for a proto-sim pose.
+        
+        This generates demonstration poses that create visible robot motion.
+        In production, this would use IK to compute actual poses pointing
+        at the target object from the specified spherical coordinates.
+        """
+        # Convert mm to meters for internal calculations
+        dist_m = dist_mm / 1000.0
+        horiz_m = horiz_mm / 1000.0
+        vert_m = vert_mm / 1000.0
+        
+        # Generate visually interesting joint configurations
+        # Base rotation influenced by yaw
+        j0 = math.radians(yaw_deg) * 0.02  # Scale down for safety
+        
+        # Shoulder influenced by pitch and distance
+        j1 = -math.pi/2 + math.radians(pitch_deg) * 0.01 + (dist_m - 0.35) * 0.8
+        
+        # Elbow influenced by distance
+        j2 = (0.4 - dist_m) * 2.5
+        
+        # Wrist 1 influenced by pitch
+        j3 = -math.pi/2 - math.radians(pitch_deg) * 0.02
+        
+        # Wrist 2 influenced by yaw and roll
+        j4 = math.radians(yaw_deg) * 0.02 + math.radians(roll_deg) * 0.01
+        
+        # Wrist 3 influenced by roll
+        j5 = math.radians(roll_deg) * 0.01
+        
+        # Add horizontal and vertical shifts as small offsets
+        j0 += horiz_m * 0.5
+        j1 += vert_m * 0.3
+        
+        # Clamp to safe UR5e joint limits
+        joints = [
+            float(np.clip(j0, -math.pi, math.pi)),
+            float(np.clip(j1, -math.pi, 0)),
+            float(np.clip(j2, -math.pi, math.pi)),
+            float(np.clip(j3, -math.pi, 0)),
+            float(np.clip(j4, -math.pi, math.pi)),
+            float(np.clip(j5, -math.pi, math.pi)),
+        ]
+        
+        return joints
 
     def _generate_proto_sim_joints(
         self,
@@ -654,6 +783,10 @@ class CommandGatewayNode(Node):
         duration = base_duration / max(0.1, move_speed)
         duration = max(0.2, min(duration, 5.0))  # Clamp between 0.2s and 5s
         
+        self.get_logger().info(
+            f"Sim movement: duration={duration:.2f}s, max_delta={max_delta:.3f}rad"
+        )
+        
         # Interpolate and publish
         dt = 1.0 / publish_rate
         num_steps = int(duration * publish_rate)
@@ -678,6 +811,8 @@ class CommandGatewayNode(Node):
         # Ensure we end at target
         self.sim_joint_positions = target_joints
         self._publish_joint_state()
+        
+        self.get_logger().info(f"Sim movement complete, final joints: {[f'{j:.3f}' for j in target_joints]}")
 
     def _publish_joint_state(self) -> None:
         """Publish current simulated joint state."""

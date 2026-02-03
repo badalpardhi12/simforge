@@ -166,6 +166,24 @@ class RobotControlNodeV2(Node):
             callback_group=self.callback_group
         )
         
+        # Service to pause joint state publishing (used during simulation mode)
+        self.pause_joint_pub_srv = self.create_service(
+            Trigger,
+            '/robot/pause_joint_publishing',
+            self.pause_joint_publishing_callback,
+            callback_group=self.callback_group
+        )
+        
+        self.resume_joint_pub_srv = self.create_service(
+            Trigger,
+            '/robot/resume_joint_publishing',
+            self.resume_joint_publishing_callback,
+            callback_group=self.callback_group
+        )
+        
+        # Flag to pause joint state publishing
+        self._joint_pub_paused = False
+        
         # === Timers ===
         state_period = 1.0 / self.config.state_publish_rate
         self.state_timer = self.create_timer(state_period, self.publish_state)
@@ -270,22 +288,24 @@ class RobotControlNodeV2(Node):
         """Publish robot state at configured rate."""
         self.update_robot_state()
         
-        # Publish JointState
-        # Note: Joint names must match the URDF exactly (no robot name prefix)
-        joint_state = JointState()
-        joint_state.header.stamp = self.get_clock().now().to_msg()
-        joint_state.name = [
-            'shoulder_pan_joint',
-            'shoulder_lift_joint',
-            'elbow_joint',
-            'wrist_1_joint',
-            'wrist_2_joint',
-            'wrist_3_joint',
-        ]
-        joint_state.position = self.current_joint_positions
-        joint_state.velocity = self.current_joint_velocities
-        joint_state.effort = self.current_joint_torques
-        self.joint_state_pub.publish(joint_state)
+        # Skip joint state publishing if paused (during simulation mode)
+        if not self._joint_pub_paused:
+            # Publish JointState
+            # Note: Joint names must match the URDF exactly (no robot name prefix)
+            joint_state = JointState()
+            joint_state.header.stamp = self.get_clock().now().to_msg()
+            joint_state.name = [
+                'shoulder_pan_joint',
+                'shoulder_lift_joint',
+                'elbow_joint',
+                'wrist_1_joint',
+                'wrist_2_joint',
+                'wrist_3_joint',
+            ]
+            joint_state.position = self.current_joint_positions
+            joint_state.velocity = self.current_joint_velocities
+            joint_state.effort = self.current_joint_torques
+            self.joint_state_pub.publish(joint_state)
         
         # Publish TCP wrench
         self.wrench_pub.publish(self.current_tcp_wrench)
@@ -299,6 +319,22 @@ class RobotControlNodeV2(Node):
             f"joints:{','.join(f'{j:.4f}' for j in self.current_joint_positions)}"
         )
         self.robot_state_pub.publish(state_msg)
+    
+    def pause_joint_publishing_callback(self, request, response):
+        """Pause joint state publishing (for simulation mode)."""
+        self._joint_pub_paused = True
+        self.get_logger().info("Joint state publishing PAUSED for simulation mode")
+        response.success = True
+        response.message = "Joint state publishing paused"
+        return response
+    
+    def resume_joint_publishing_callback(self, request, response):
+        """Resume joint state publishing."""
+        self._joint_pub_paused = False
+        self.get_logger().info("Joint state publishing RESUMED")
+        response.success = True
+        response.message = "Joint state publishing resumed"
+        return response
 
     def move_joints(
         self,

@@ -6,7 +6,7 @@ Similar to simforge_new/interfaces/gui/proto_sim.py but communicates via WebSock
 instead of directly controlling Genesis.
 
 Features:
-- Protocol parameter input (pose sampling)
+- Protocol parameter input (pose sampling) matching simforge_new exactly
 - Robot selection
 - Object/reference frame selection
 - Simulation vs Real Robot toggle
@@ -39,13 +39,23 @@ LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
 
 @dataclass
 class ProtoSimParameters:
-    """Parameters for protocol simulation pose generation."""
-    # Distance from face (meters)
-    distances: List[float]
-    # Horizontal angles (degrees) - azimuth
-    horizontal_angles: List[float]
-    # Vertical angles (degrees) - elevation
-    vertical_angles: List[float]
+    """
+    Parameters for protocol simulation pose generation.
+    
+    Matches simforge_new/control/proto_simulation.py ProtoSimParameters exactly.
+    """
+    # Horizontal shift from object center (mm)
+    horiz: List[float]
+    # Vertical shift from object center (mm)
+    vert: List[float]
+    # Distance from object (mm)
+    distance: List[float]
+    # Roll angle (degrees)
+    roll: List[float]
+    # Pitch angle (degrees) - vertical angle to look up/down
+    pitch: List[float]
+    # Yaw angle (degrees) - horizontal angle to look left/right
+    yaw: List[float]
     # Idle time at each pose (seconds)
     idle_time: float = 2.0
     # Randomize order
@@ -148,7 +158,18 @@ class ProtoSimClientFrame(wx.Frame):
     Main wxPython frame for protocol simulation client.
     
     This runs on macOS and communicates with the server via WebSocket.
+    Parameters match simforge_new/interfaces/gui/proto_sim.py exactly.
     """
+    
+    # Parameter definitions matching simforge_new
+    PARAMETERS = (
+        {"name": "horiz", "label": "Horiz Shift", "unit": "mm", "mode": "List", "default": "0"},
+        {"name": "vert", "label": "Vert Shift", "unit": "mm", "mode": "List", "default": "0"},
+        {"name": "distance", "label": "Distance", "unit": "mm", "mode": "List", "default": "250,350,450,550"},
+        {"name": "roll", "label": "Roll", "unit": "°", "mode": "List", "default": "-90"},
+        {"name": "pitch", "label": "Pitch", "unit": "°", "mode": "List", "default": "-45,-30,0,15"},
+        {"name": "yaw", "label": "Yaw", "unit": "°", "mode": "Range", "default": "-30,30,30"},
+    )
     
     def __init__(
         self,
@@ -162,7 +183,7 @@ class ProtoSimClientFrame(wx.Frame):
         if not HAS_WX:
             raise ImportError("wxPython is required for the GUI. Install with: pip install wxPython")
         
-        super().__init__(parent, title=title, size=(800, 700))
+        super().__init__(parent, title=title, size=(850, 850))
         
         self.logger = logger or logging.getLogger(__name__)
         self.server_ip = server_ip
@@ -181,6 +202,9 @@ class ProtoSimClientFrame(wx.Frame):
         # Available robots and objects (fetched from server)
         self._robots: List[str] = []
         self._objects: List[str] = []
+        
+        # Parameter controls
+        self.parameter_controls: Dict[str, ParameterInputControl] = {}
         
         self._build_ui()
         self._bind_events()
@@ -252,63 +276,31 @@ class ProtoSimClientFrame(wx.Frame):
         
         main_sizer.Add(object_sizer, 0, wx.EXPAND | wx.ALL, 10)
         
-        # === Protocol Parameters ===
-        params_box = wx.StaticBox(panel, label="Protocol Parameters")
+        # === Protocol Parameters (matching simforge_new) ===
+        params_box = wx.StaticBox(panel, label="Movement Parameters")
         params_sizer = wx.StaticBoxSizer(params_box, wx.VERTICAL)
         
         # Parameter grid
-        param_grid = wx.FlexGridSizer(4, 4, 5, 10)
-        param_grid.AddGrowableCol(2)
+        param_grid = wx.FlexGridSizer(rows=len(self.PARAMETERS), cols=3, hgap=10, vgap=8)
+        param_grid.AddGrowableCol(2, 1)
         
-        # Headers
-        param_grid.Add(wx.StaticText(panel, label="Parameter"), 0, wx.ALIGN_CENTER)
-        param_grid.Add(wx.StaticText(panel, label="Mode"), 0, wx.ALIGN_CENTER)
-        param_grid.Add(wx.StaticText(panel, label="Values"), 0, wx.ALIGN_CENTER)
-        param_grid.Add(wx.StaticText(panel, label="Unit"), 0, wx.ALIGN_CENTER)
+        for item in self.PARAMETERS:
+            label_text = f"{item['label']} ({item['unit']})"
+            label = wx.StaticText(panel, label=label_text)
+            control = ParameterInputControl(
+                panel,
+                name=item["name"],
+                label=item["label"],
+                unit=item["unit"],
+                default_mode=item["mode"],
+                default_text=item["default"],
+            )
+            self.parameter_controls[item["name"]] = control
+            param_grid.Add(label, 0, wx.ALIGN_CENTER_VERTICAL)
+            param_grid.Add(control.mode_choice, 0, wx.EXPAND)
+            param_grid.Add(control.text_ctrl, 1, wx.EXPAND)
         
-        # Distance
-        self.distance_input = ParameterInputControl(
-            panel,
-            name="distance",
-            label="Distance",
-            unit="m",
-            default_mode="List",
-            default_text="0.3, 0.4, 0.5",
-        )
-        param_grid.Add(wx.StaticText(panel, label="Distance:"), 0, wx.ALIGN_CENTER_VERTICAL)
-        param_grid.Add(self.distance_input.mode_choice, 0)
-        param_grid.Add(self.distance_input.text_ctrl, 1, wx.EXPAND)
-        param_grid.Add(wx.StaticText(panel, label="m"), 0, wx.ALIGN_CENTER_VERTICAL)
-        
-        # Horizontal angle
-        self.horizontal_input = ParameterInputControl(
-            panel,
-            name="horizontal",
-            label="Horizontal Angle",
-            unit="°",
-            default_mode="Range",
-            default_text="-30, 30, 15",
-        )
-        param_grid.Add(wx.StaticText(panel, label="Horizontal:"), 0, wx.ALIGN_CENTER_VERTICAL)
-        param_grid.Add(self.horizontal_input.mode_choice, 0)
-        param_grid.Add(self.horizontal_input.text_ctrl, 1, wx.EXPAND)
-        param_grid.Add(wx.StaticText(panel, label="°"), 0, wx.ALIGN_CENTER_VERTICAL)
-        
-        # Vertical angle
-        self.vertical_input = ParameterInputControl(
-            panel,
-            name="vertical",
-            label="Vertical Angle",
-            unit="°",
-            default_mode="Range",
-            default_text="-15, 15, 15",
-        )
-        param_grid.Add(wx.StaticText(panel, label="Vertical:"), 0, wx.ALIGN_CENTER_VERTICAL)
-        param_grid.Add(self.vertical_input.mode_choice, 0)
-        param_grid.Add(self.vertical_input.text_ctrl, 1, wx.EXPAND)
-        param_grid.Add(wx.StaticText(panel, label="°"), 0, wx.ALIGN_CENTER_VERTICAL)
-        
-        params_sizer.Add(param_grid, 0, wx.EXPAND | wx.ALL, 5)
+        params_sizer.Add(param_grid, 0, wx.EXPAND | wx.ALL, 8)
         
         # Additional options
         options_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -324,6 +316,11 @@ class ProtoSimClientFrame(wx.Frame):
         options_sizer.Add(self.randomize_check, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         
         params_sizer.Add(options_sizer, 0, wx.EXPAND | wx.ALL, 5)
+        
+        # Pose count preview
+        self.pose_count_label = wx.StaticText(panel, label="Total poses: --")
+        self.pose_count_label.SetFont(wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_ITALIC, wx.FONTWEIGHT_NORMAL))
+        params_sizer.Add(self.pose_count_label, 0, wx.ALL, 8)
         
         main_sizer.Add(params_sizer, 0, wx.EXPAND | wx.ALL, 10)
         
@@ -404,10 +401,44 @@ class ProtoSimClientFrame(wx.Frame):
         self.stop_btn.Bind(wx.EVT_BUTTON, lambda e: self._on_stop())
         self.estop_btn.Bind(wx.EVT_BUTTON, lambda e: self._on_estop())
         
+        # Bind parameter changes to update pose count
+        for control in self.parameter_controls.values():
+            control.text_ctrl.Bind(wx.EVT_TEXT, lambda e: self._update_pose_count())
+            control.mode_choice.Bind(wx.EVT_CHOICE, lambda e: self._update_pose_count())
+        
         self.Bind(wx.EVT_MENU, lambda e: self._on_save_log(), id=wx.ID_SAVE)
         self.Bind(wx.EVT_MENU, lambda e: self.Close(), id=wx.ID_EXIT)
         self.Bind(wx.EVT_MENU, lambda e: self._on_about(), id=wx.ID_ABOUT)
         self.Bind(wx.EVT_CLOSE, self._on_close)
+    
+    def _update_pose_count(self) -> None:
+        """Update the pose count label based on current parameters."""
+        try:
+            params = self._collect_parameters()
+            count = (
+                len(params.horiz) * 
+                len(params.vert) * 
+                len(params.distance) * 
+                len(params.roll) * 
+                len(params.pitch) * 
+                len(params.yaw)
+            )
+            self.pose_count_label.SetLabel(f"Total poses: {count}")
+        except ValueError:
+            self.pose_count_label.SetLabel("Total poses: (invalid parameters)")
+    
+    def _collect_parameters(self) -> ProtoSimParameters:
+        """Collect parameters from UI controls."""
+        return ProtoSimParameters(
+            horiz=self.parameter_controls["horiz"].get_values(),
+            vert=self.parameter_controls["vert"].get_values(),
+            distance=self.parameter_controls["distance"].get_values(),
+            roll=self.parameter_controls["roll"].get_values(),
+            pitch=self.parameter_controls["pitch"].get_values(),
+            yaw=self.parameter_controls["yaw"].get_values(),
+            idle_time=self.idle_time_ctrl.GetValue(),
+            randomize=self.randomize_check.GetValue(),
+        )
     
     def _log(self, message: str) -> None:
         """Add message to log control."""
@@ -515,13 +546,7 @@ class ProtoSimClientFrame(wx.Frame):
         
         # Gather parameters
         try:
-            params = ProtoSimParameters(
-                distances=self.distance_input.get_values(),
-                horizontal_angles=self.horizontal_input.get_values(),
-                vertical_angles=self.vertical_input.get_values(),
-                idle_time=self.idle_time_ctrl.GetValue(),
-                randomize=self.randomize_check.GetValue(),
-            )
+            params = self._collect_parameters()
         except ValueError as e:
             self._log(f"Parameter error: {e}")
             return
@@ -544,7 +569,14 @@ class ProtoSimClientFrame(wx.Frame):
         else:
             mode = "both"
         
-        total_poses = len(params.distances) * len(params.horizontal_angles) * len(params.vertical_angles)
+        total_poses = (
+            len(params.horiz) * 
+            len(params.vert) * 
+            len(params.distance) * 
+            len(params.roll) * 
+            len(params.pitch) * 
+            len(params.yaw)
+        )
         self._log(f"Starting protocol: {total_poses} poses, mode={mode}")
         
         # Update UI
@@ -567,9 +599,13 @@ class ProtoSimClientFrame(wx.Frame):
             response = await self._client.call_rpc("run_proto_sim", {
                 "robot_name": robot,
                 "target_object": target_object,
-                "distances": params.distances,
-                "horizontal_angles": params.horizontal_angles,
-                "vertical_angles": params.vertical_angles,
+                # Send parameters matching simforge_new structure
+                "horiz": params.horiz,
+                "vert": params.vert,
+                "distance": params.distance,
+                "roll": params.roll,
+                "pitch": params.pitch,
+                "yaw": params.yaw,
                 "idle_time": params.idle_time,
                 "randomize": params.randomize,
                 "mode": mode,
@@ -622,7 +658,8 @@ class ProtoSimClientFrame(wx.Frame):
             "Simforge Protocol Simulation Client\n\n"
             "A distributed robot control interface for\n"
             "protocol definition and execution.\n\n"
-            "Part of the Simforge distributed architecture.",
+            "Part of the Simforge distributed architecture.\n\n"
+            "Parameters match simforge_new/interfaces/gui/proto_sim.py",
             "About",
             wx.OK | wx.ICON_INFORMATION,
         )
