@@ -518,10 +518,16 @@ class CommandGatewayNode(Node):
         self.get_logger().info(
             f"  roll={roll}, pitch={pitch}, yaw={yaw}"
         )
+        self.get_logger().info(f"  idle_time={idle_time}, move_speed={move_speed}, randomize={randomize}")
         
         # Pause real robot's joint state publishing during simulation
         if mode in ('simulation', 'both'):
-            await self._pause_real_robot_joint_publishing()
+            self.get_logger().info("Attempting to pause real robot joint publishing...")
+            try:
+                await self._pause_real_robot_joint_publishing()
+                self.get_logger().info("Pause request completed")
+            except Exception as e:
+                self.get_logger().error(f"Failed to pause joint publishing: {e}")
         
         # Generate pose list from all parameter combinations
         # Matching simforge_new order: horiz -> vert -> distance -> roll -> pitch -> yaw
@@ -540,12 +546,15 @@ class CommandGatewayNode(Node):
         failed = 0
         
         try:
+            self.get_logger().info(f"Starting pose execution loop with {total_poses} poses")
             for i, (h, v, p, y, d, r) in enumerate(poses):
                 if self._proto_sim_stop_requested:
                     self.get_logger().info("Proto-sim stopped by user request")
                     break
                 
                 pose_name = f"H{h}_V{v}_D{d}_R{r}_P{p}_Y{y}"
+                if i == 0 or (i + 1) % 5 == 0:
+                    self.get_logger().info(f"Executing pose {i+1}/{total_poses}: {pose_name}")
                 
                 # Generate target joint configuration for this pose
                 target_joints = self._compute_proto_pose_joints(
@@ -572,11 +581,16 @@ class CommandGatewayNode(Node):
                 
                 # Execute simulated movement with joint state publishing
                 if mode in ('simulation', 'both'):
-                    self.get_logger().debug(f"Executing sim movement to {target_joints}")
-                    await self._execute_sim_movement(
-                        target_joints, 
-                        move_speed=move_speed
-                    )
+                    self.get_logger().info(f"Moving to joints: {[f'{j:.2f}' for j in target_joints]}")
+                    try:
+                        await self._execute_sim_movement(
+                            target_joints, 
+                            move_speed=move_speed
+                        )
+                    except Exception as e:
+                        self.get_logger().error(f"Movement error: {e}")
+                        import traceback
+                        self.get_logger().error(traceback.format_exc())
                 
                 # TODO: If mode is 'real' or 'both', also send to real robot
                 # if mode in ('real', 'both'):
@@ -620,36 +634,51 @@ class CommandGatewayNode(Node):
     
     async def _pause_real_robot_joint_publishing(self) -> None:
         """Pause real robot's joint state publishing for simulation mode."""
+        self.get_logger().info("Checking if pause service is ready...")
+        
+        # Wait a bit for service to become ready
+        for _ in range(10):
+            if self.pause_joint_pub_client.service_is_ready():
+                break
+            self.get_logger().info("Waiting for pause service...")
+            await asyncio.sleep(0.1)
+        
         if not self.pause_joint_pub_client.service_is_ready():
-            self.get_logger().warn("Pause joint publishing service not available")
+            self.get_logger().warn("Pause joint publishing service not available after waiting")
             return
         
         try:
+            self.get_logger().info("Calling pause service...")
             request = Trigger.Request()
             future = self.pause_joint_pub_client.call_async(request)
-            # Don't wait too long
-            await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, lambda: future.result()),
-                timeout=2.0
-            )
-            self.get_logger().info("Paused real robot joint state publishing")
+            # Simple approach - just call and continue, check result briefly
+            await asyncio.sleep(0.2)  # Give service time to process
+            if future.done():
+                result = future.result()
+                self.get_logger().info(f"Pause service response: success={result.success}, msg={result.message}")
+            else:
+                self.get_logger().info("Pause service called (async, not waiting for response)")
         except Exception as e:
-            self.get_logger().warn(f"Failed to pause joint publishing: {e}")
+            self.get_logger().warn(f"Error calling pause service: {e}")
     
     async def _resume_real_robot_joint_publishing(self) -> None:
         """Resume real robot's joint state publishing after simulation."""
+        self.get_logger().info("Checking if resume service is ready...")
+        
         if not self.resume_joint_pub_client.service_is_ready():
             self.get_logger().warn("Resume joint publishing service not available")
             return
         
         try:
+            self.get_logger().info("Calling resume service...")
             request = Trigger.Request()
             future = self.resume_joint_pub_client.call_async(request)
-            await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, lambda: future.result()),
-                timeout=2.0
-            )
-            self.get_logger().info("Resumed real robot joint state publishing")
+            await asyncio.sleep(0.2)  # Give service time to process
+            if future.done():
+                result = future.result()
+                self.get_logger().info(f"Resume service response: success={result.success}, msg={result.message}")
+            else:
+                self.get_logger().info("Resume service called (async, not waiting for response)")
         except Exception as e:
             self.get_logger().warn(f"Failed to resume joint publishing: {e}")
 
@@ -826,6 +855,12 @@ class CommandGatewayNode(Node):
         msg.effort = [0.0] * 6
         
         self.joint_state_pub.publish(msg)
+        # Log occasionally to avoid spam
+        if not hasattr(self, '_pub_count'):
+            self._pub_count = 0
+        self._pub_count += 1
+        if self._pub_count == 1 or self._pub_count % 50 == 0:
+            self.get_logger().info(f\"Publishing joint state #{self._pub_count}: {[f'{j:.2f}' for j in self.sim_joint_positions]}\")
 
     async def rpc_stop_proto_sim(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Stop running protocol simulation."""
