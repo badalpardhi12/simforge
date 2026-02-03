@@ -860,7 +860,8 @@ class CommandGatewayNode(Node):
             self._pub_count = 0
         self._pub_count += 1
         if self._pub_count == 1 or self._pub_count % 50 == 0:
-            self.get_logger().info(f\"Publishing joint state #{self._pub_count}: {[f'{j:.2f}' for j in self.sim_joint_positions]}\")
+            positions_str = ', '.join([f'{j:.2f}' for j in self.sim_joint_positions])
+            self.get_logger().info(f'Publishing joint state #{self._pub_count}: [{positions_str}]')
 
     async def rpc_stop_proto_sim(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Stop running protocol simulation."""
