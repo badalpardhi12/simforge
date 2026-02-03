@@ -703,28 +703,29 @@ class CommandGatewayNode(Node):
         horiz_m = horiz_mm / 1000.0
         vert_m = vert_mm / 1000.0
         
-        # Generate visually interesting joint configurations
-        # Base rotation influenced by yaw
-        j0 = math.radians(yaw_deg) * 0.02  # Scale down for safety
+        # Generate visually dramatic joint configurations
+        # These scaling factors produce ~30-45 degree movements for typical proto-sim params
         
-        # Shoulder influenced by pitch and distance
-        j1 = -math.pi/2 + math.radians(pitch_deg) * 0.01 + (dist_m - 0.35) * 0.8
+        # Base rotation (j0): yaw creates visible rotation around base
+        # Full yaw range maps to ±45 degrees base rotation
+        j0 = math.radians(yaw_deg) * 0.5 + horiz_m * 2.0
         
-        # Elbow influenced by distance
-        j2 = (0.4 - dist_m) * 2.5
+        # Shoulder (j1): pitch tilts the robot arm up/down  
+        # Pitch -30 to +30 creates ~30 degree shoulder movement
+        j1 = -math.pi/2 + math.radians(pitch_deg) * 0.5 + vert_m * 1.5
         
-        # Wrist 1 influenced by pitch
-        j3 = -math.pi/2 - math.radians(pitch_deg) * 0.02
+        # Elbow (j2): distance affects how extended the arm is
+        # 250-450mm range creates visible elbow bend
+        j2 = 0.5 + (0.35 - dist_m) * 3.0
         
-        # Wrist 2 influenced by yaw and roll
-        j4 = math.radians(yaw_deg) * 0.02 + math.radians(roll_deg) * 0.01
+        # Wrist 1 (j3): compensate for shoulder to keep tool oriented
+        j3 = -math.pi/2 - math.radians(pitch_deg) * 0.3
         
-        # Wrist 3 influenced by roll
-        j5 = math.radians(roll_deg) * 0.01
+        # Wrist 2 (j4): roll orientation of tool
+        j4 = math.radians(roll_deg + 90) * 0.5
         
-        # Add horizontal and vertical shifts as small offsets
-        j0 += horiz_m * 0.5
-        j1 += vert_m * 0.3
+        # Wrist 3 (j5): fine roll adjustment
+        j5 = math.radians(yaw_deg) * 0.3
         
         # Clamp to safe UR5e joint limits
         joints = [
