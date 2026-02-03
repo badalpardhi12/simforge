@@ -315,6 +315,10 @@ class SimforgeClient:
                     self._handle_feedback(msg)
                 elif msg_type == "result":
                     self._handle_result(msg)
+                elif msg_type == "rpc_result":
+                    self._handle_rpc_result(msg)
+                elif msg_type == "rpc_feedback":
+                    self._handle_rpc_feedback(msg)
                 elif msg_type == "robot_state":
                     self._handle_robot_state(msg)
                 elif msg_type == "error":
@@ -390,6 +394,11 @@ class SimforgeClient:
         """Handle robot state update."""
         # Can be extended to track robot state locally
         pass
+
+    def _handle_rpc_feedback(self, msg: Dict[str, Any]):
+        """Handle RPC feedback (progress updates during long operations)."""
+        # For now, just log - can be extended with callbacks
+        logger.debug(f"RPC feedback: {msg}")
 
     def _handle_error(self, msg: Dict[str, Any]):
         """Handle error message."""
@@ -666,6 +675,61 @@ class SimforgeClient:
         rtt = (time.time() - start) * 1000
         logger.debug(f"Ping: {rtt:.1f}ms")
         return rtt
+
+    async def call_rpc(
+        self,
+        method: str,
+        params: Dict[str, Any],
+        timeout: float = 60.0,
+    ) -> Dict[str, Any]:
+        """
+        Call a generic RPC method on the server.
+        
+        Args:
+            method: RPC method name (e.g., 'get_environment_info', 'run_proto_sim')
+            params: Parameters to pass to the method
+            timeout: Maximum time to wait for result
+            
+        Returns:
+            Dictionary with RPC result
+        """
+        if not self.is_connected:
+            raise RuntimeError("Not connected to server")
+        
+        # Generate request ID
+        self._request_id += 1
+        request_id = f"{self.config.client_id}_{self._request_id}"
+        
+        request = {
+            "type": "rpc",
+            "request_id": request_id,
+            "method": method,
+            "params": params,
+        }
+        
+        # Create future for result
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending_requests[request_id] = future
+        
+        try:
+            # Send request
+            await self._ws.send(json.dumps(request))
+            
+            # Wait for result with timeout
+            result = await asyncio.wait_for(future, timeout=timeout)
+            return result
+            
+        except asyncio.TimeoutError:
+            self._pending_requests.pop(request_id, None)
+            raise TimeoutError(f"RPC call '{method}' timed out after {timeout}s")
+
+    def _handle_rpc_result(self, msg: Dict[str, Any]):
+        """Handle RPC result message."""
+        request_id = msg.get("request_id")
+        if request_id and request_id in self._pending_requests:
+            future = self._pending_requests.pop(request_id)
+            if not future.done():
+                future.set_result(msg)
 
 
 # Convenience function for simple usage

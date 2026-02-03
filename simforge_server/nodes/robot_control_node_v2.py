@@ -271,15 +271,16 @@ class RobotControlNodeV2(Node):
         self.update_robot_state()
         
         # Publish JointState
+        # Note: Joint names must match the URDF exactly (no robot name prefix)
         joint_state = JointState()
         joint_state.header.stamp = self.get_clock().now().to_msg()
         joint_state.name = [
-            f'{self.config.robot_name}_shoulder_pan_joint',
-            f'{self.config.robot_name}_shoulder_lift_joint',
-            f'{self.config.robot_name}_elbow_joint',
-            f'{self.config.robot_name}_wrist_1_joint',
-            f'{self.config.robot_name}_wrist_2_joint',
-            f'{self.config.robot_name}_wrist_3_joint',
+            'shoulder_pan_joint',
+            'shoulder_lift_joint',
+            'elbow_joint',
+            'wrist_1_joint',
+            'wrist_2_joint',
+            'wrist_3_joint',
         ]
         joint_state.position = self.current_joint_positions
         joint_state.velocity = self.current_joint_velocities

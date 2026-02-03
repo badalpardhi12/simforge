@@ -33,9 +33,13 @@ foxglove = [
 keyboard = [
     "keyboard>=0.13.5",
 ]
+gui = [
+    "wxPython>=4.2.0",
+]
 full = [
     "foxglove-websocket>=0.1.0",
     "keyboard>=0.13.5",
+    "wxPython>=4.2.0",
 ]
 dev = [
     "pytest>=7.0.0",
@@ -46,6 +50,7 @@ dev = [
 
 [project.scripts]
 simforge-client = "simforge_client.cli:main"
+simforge-proto-sim = "simforge_client.run_client:main"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]

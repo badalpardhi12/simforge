@@ -201,6 +201,8 @@ class CommandGatewayNode(Node):
                 await self.handle_protective_stop(client, msg)
             elif msg_type == 'get_robot_state':
                 await self.handle_get_robot_state(client, msg)
+            elif msg_type == 'rpc':
+                await self.handle_rpc(client, msg)
             else:
                 await self.send_error(client, msg.get('request_id'), f"Unknown message type: {msg_type}")
                 
@@ -373,6 +375,169 @@ class CommandGatewayNode(Node):
             }
         }
         await client.websocket.send(json.dumps(result))
+
+    async def handle_rpc(self, client: ConnectedClient, msg: Dict[str, Any]):
+        """Handle generic RPC calls from client."""
+        request_id = msg.get('request_id')
+        method = msg.get('method', '')
+        params = msg.get('params', {})
+        
+        self.get_logger().info(f"RPC call from {client.client_id}: {method}")
+        
+        try:
+            if method == 'get_environment_info':
+                result = await self.rpc_get_environment_info(params)
+            elif method == 'run_proto_sim':
+                result = await self.rpc_run_proto_sim(client, request_id, params)
+                return  # run_proto_sim sends its own responses
+            elif method == 'stop_proto_sim':
+                result = await self.rpc_stop_proto_sim(params)
+            elif method == 'check_collision':
+                result = await self.rpc_check_collision(params)
+            elif method == 'plan_motion':
+                result = await self.rpc_plan_motion(params)
+            else:
+                result = {'success': False, 'error': f'Unknown RPC method: {method}'}
+            
+            response = {
+                'type': 'rpc_result',
+                'request_id': request_id,
+                **result,
+            }
+            await client.websocket.send(json.dumps(response))
+            
+        except Exception as e:
+            self.get_logger().error(f"RPC error: {e}")
+            await self.send_error(client, request_id, str(e))
+
+    async def rpc_get_environment_info(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Get available robots and objects in the environment."""
+        # TODO: Get actual environment info from URDF/config
+        # For now, return configured values
+        return {
+            'success': True,
+            'robots': [self.default_robot],
+            'objects': ['face_link', 'table_link', 'shop_floor'],
+            'reference_frames': {
+                'world': 'World Origin',
+                'base_link': 'Robot Base',
+                'tool0': 'Tool Center Point',
+                'face_link': 'Face Fixture',
+            },
+        }
+
+    async def rpc_run_proto_sim(
+        self,
+        client: ConnectedClient,
+        request_id: str,
+        params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Run protocol simulation."""
+        robot_name = params.get('robot_name', self.default_robot)
+        target_object = params.get('target_object', 'face_link')
+        distances = params.get('distances', [0.3, 0.4, 0.5])
+        horizontal_angles = params.get('horizontal_angles', [-30, 0, 30])
+        vertical_angles = params.get('vertical_angles', [-15, 0, 15])
+        idle_time = params.get('idle_time', 2.0)
+        randomize = params.get('randomize', False)
+        mode = params.get('mode', 'simulation')  # 'simulation', 'real', 'both'
+        
+        self.get_logger().info(
+            f"Proto-sim: {robot_name} -> {target_object}, mode={mode}"
+        )
+        
+        # Generate pose list
+        import itertools
+        poses = list(itertools.product(distances, horizontal_angles, vertical_angles))
+        total_poses = len(poses)
+        
+        if randomize:
+            import random
+            random.shuffle(poses)
+        
+        self.get_logger().info(f"Proto-sim: {total_poses} poses to execute")
+        
+        # Execute poses
+        completed = 0
+        failed = 0
+        
+        for i, (dist, h_angle, v_angle) in enumerate(poses):
+            pose_name = f"D{dist}_H{h_angle}_V{v_angle}"
+            
+            # Send progress update
+            feedback = {
+                'type': 'rpc_feedback',
+                'request_id': request_id,
+                'current_pose_index': i,
+                'total_poses': total_poses,
+                'current_pose_name': pose_name,
+                'progress_percent': (i / total_poses) * 100,
+                'status': 'executing',
+            }
+            await client.websocket.send(json.dumps(feedback))
+            
+            # TODO: In production:
+            # 1. Calculate target pose from object position + spherical coords
+            # 2. Plan collision-free path using motion_planner
+            # 3. Execute on simulation (always) and/or real robot (if mode allows)
+            # 4. Wait for idle_time at pose
+            
+            # Simulate execution time
+            await asyncio.sleep(0.3)  # Reduced for testing
+            
+            completed += 1
+        
+        # Send final result
+        result = {
+            'type': 'rpc_result',
+            'request_id': request_id,
+            'success': True,
+            'message': f'Completed {completed}/{total_poses} poses',
+            'completed': completed,
+            'failed': failed,
+            'total': total_poses,
+        }
+        await client.websocket.send(json.dumps(result))
+        
+        return result
+
+    async def rpc_stop_proto_sim(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Stop running protocol simulation."""
+        # TODO: Implement stop mechanism
+        return {'success': True, 'message': 'Stop requested'}
+
+    async def rpc_check_collision(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Check collision for given joint configuration."""
+        joint_positions = params.get('joint_positions', [0.0] * 6)
+        
+        # TODO: Use collision_checker.py to check collision
+        # For now, return no collision
+        return {
+            'success': True,
+            'in_collision': False,
+            'colliding_pairs': [],
+            'min_distance': 0.1,
+        }
+
+    async def rpc_plan_motion(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Plan motion from current to target configuration."""
+        start_joints = params.get('start_joints', [0.0] * 6)
+        target_joints = params.get('target_joints')
+        target_pose = params.get('target_pose')
+        motion_type = params.get('motion_type', 'joint')
+        velocity_scale = params.get('velocity_scale', 0.5)
+        
+        # TODO: Use motion_planner.py to generate trajectory
+        # For now, return success with empty trajectory
+        return {
+            'success': True,
+            'trajectory': {
+                'points': [],
+                'duration': 1.0,
+            },
+            'collision_free': True,
+            'planning_time': 0.05,
+        }
 
     async def send_error(
         self,

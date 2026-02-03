@@ -31,6 +31,7 @@ install(PROGRAMS
   nodes/perception_node.py
   nodes/vla_inference_node.py
   nodes/orchestrator_node.py
+  nodes/static_transform_republisher.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

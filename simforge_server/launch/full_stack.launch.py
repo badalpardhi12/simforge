@@ -76,13 +76,13 @@ def generate_launch_description():
         description='Enable perception node'
     )
     
-    # Default URDF path using package share directory
-    default_urdf = os.path.join(pkg_share, 'assets', 'ur5e', 'ur5e_package.urdf')
+    # Default URDF path - combined environment URDF with robot, table, and face
+    default_urdf = os.path.join(pkg_share, 'assets', 'valid8_environment.urdf')
     
     urdf_path_arg = DeclareLaunchArgument(
         'urdf_path',
         default_value=default_urdf,
-        description='Path to robot URDF file (with package:// mesh paths for Foxglove)'
+        description='Path to combined environment URDF file (robot + table + face)'
     )
     
     # Get launch configurations
@@ -127,7 +127,8 @@ def generate_launch_description():
         }],
     )
     
-    # 2b. Robot State Publisher (publishes TF transforms from joint_states + URDF)
+    # 2b. Robot State Publisher (publishes TF transforms from joint_states + combined URDF)
+    # This single publisher handles the robot, table, and face - all in one URDF
     robot_state_publisher_node = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
@@ -139,6 +140,18 @@ def generate_launch_description():
                 value_type=str
             ),
             'publish_frequency': 50.0,
+        }],
+    )
+    
+    # 2c. Static Transform Republisher (republishes /tf_static to /tf for Foxglove)
+    # Foxglove websocket bridge doesn't handle transient local QoS well
+    static_tf_republisher = Node(
+        package='simforge_server',
+        executable='static_transform_republisher.py',
+        name='static_tf_republisher',
+        output='screen',
+        parameters=[{
+            'publish_rate': 5.0,  # 5 Hz republish rate
         }],
     )
     
@@ -231,7 +244,8 @@ def generate_launch_description():
         # Nodes (in dependency order)
         safety_watchdog_node,
         robot_control_node,
-        robot_state_publisher_node,  # Publishes TF from joint_states
+        robot_state_publisher_node,  # Publishes TF from joint_states + combined URDF
+        static_tf_republisher,       # Republishes static TFs to /tf for Foxglove
         command_gateway_node,
         perception_node,
         vla_inference_node,
