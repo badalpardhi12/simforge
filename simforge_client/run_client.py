@@ -50,8 +50,8 @@ def main():
     parser.add_argument(
         "--foxglove-port",
         type=int,
-        default=8765,
-        help="Foxglove bridge WebSocket port (external port 8765 -> internal 9090)",
+        default=9090,
+        help="Foxglove bridge WebSocket port (use 9090 for dev)",
     )
     parser.add_argument(
         "--debug",
