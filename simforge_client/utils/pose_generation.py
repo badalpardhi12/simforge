@@ -205,12 +205,20 @@ def _look_at_quaternion(
     roll_deg: float = 0.0
 ) -> Tuple[float, float, float, float]:
     """
-    Compute quaternion that points Z-axis from position towards target with optional roll.
+    Compute quaternion that points Y-axis from position towards target with optional roll.
+    
+    For tool_tip_link/tool_base_link, the +Y axis is the "outward" direction that
+    should point at the target object. This matches the iPhone tool orientation.
+    
+    Coordinate frame convention:
+    - Y-axis: Points from position towards target (tool forward direction)
+    - Z-axis: "Up" direction (perpendicular to Y, preferring world Z)
+    - X-axis: Completes right-handed frame (perpendicular to Y and Z)
     
     Args:
-        position: Source position (x, y, z)
-        target: Target position to look at (x, y, z)
-        roll_deg: Roll angle around look-at axis in degrees
+        position: Source position (x, y, z) - where the tool is located
+        target: Target position to look at (x, y, z) - what the tool points at
+        roll_deg: Roll angle around the look-at (Y) axis in degrees
         
     Returns:
         Quaternion (x, y, z, w)
@@ -218,37 +226,37 @@ def _look_at_quaternion(
     src = np.asarray(position, dtype=np.float64)
     tgt = np.asarray(target, dtype=np.float64)
     
-    # Z-axis points from position to target
-    z_axis = tgt - src
-    norm = np.linalg.norm(z_axis)
+    # Y-axis points from position to target (tool forward direction)
+    y_axis = tgt - src
+    norm = np.linalg.norm(y_axis)
     if norm < 1e-9:
-        z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
     else:
-        z_axis = z_axis / norm
+        y_axis = y_axis / norm
     
-    # Choose up vector (prefer world Z, fall back to Y if looking straight up/down)
-    up_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    if abs(np.dot(up_axis, z_axis)) >= 0.95:
-        up_axis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    # Choose up vector for Z-axis (prefer world Z, fall back to world X if looking straight up/down)
+    up_hint = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    if abs(np.dot(up_hint, y_axis)) >= 0.95:
+        up_hint = np.array([1.0, 0.0, 0.0], dtype=np.float64)
     
-    # X-axis is perpendicular to Z and up
-    x_axis = np.cross(up_axis, z_axis)
+    # X-axis is perpendicular to Y and up_hint
+    x_axis = np.cross(y_axis, up_hint)
     x_norm = np.linalg.norm(x_axis)
     if x_norm < 1e-9:
         x_axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
     else:
         x_axis = x_axis / x_norm
     
-    # Y-axis completes the right-handed frame
-    y_axis = np.cross(z_axis, x_axis)
+    # Z-axis completes the right-handed frame
+    z_axis = np.cross(x_axis, y_axis)
     
     # Build rotation matrix [X|Y|Z] and convert to quaternion
     rot_matrix = np.column_stack((x_axis, y_axis, z_axis))
     quat_xyzw = _quat_from_matrix(rot_matrix.tolist())
     
-    # Apply roll around Z-axis
+    # Apply roll around Y-axis (the look-at axis)
     if abs(roll_deg) > 1e-6:
-        roll_quat = _rpy_to_quat_xyzw(0.0, 0.0, math.radians(roll_deg))
+        roll_quat = _rpy_to_quat_xyzw(0.0, math.radians(roll_deg), 0.0)
         quat_xyzw = _quat_multiply(quat_xyzw, roll_quat)
     
     return _normalize_quaternion(quat_xyzw)
