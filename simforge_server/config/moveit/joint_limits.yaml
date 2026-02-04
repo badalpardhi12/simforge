@@ -1,0 +1,49 @@
+# Joint limits configuration for UR5e
+# Overrides URDF-specified limits for motion planning safety
+
+joint_limits:
+  shoulder_pan_joint:
+    has_velocity_limits: true
+    max_velocity: 3.14159265  # rad/s (180 deg/s)
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+    has_jerk_limits: false
+    
+  shoulder_lift_joint:
+    has_velocity_limits: true
+    max_velocity: 3.14159265
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+    has_jerk_limits: false
+    
+  elbow_joint:
+    has_velocity_limits: true
+    max_velocity: 3.14159265
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+    has_jerk_limits: false
+    
+  wrist_1_joint:
+    has_velocity_limits: true
+    max_velocity: 3.14159265
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+    has_jerk_limits: false
+    
+  wrist_2_joint:
+    has_velocity_limits: true
+    max_velocity: 3.14159265
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+    has_jerk_limits: false
+    
+  wrist_3_joint:
+    has_velocity_limits: true
+    max_velocity: 3.14159265
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+    has_jerk_limits: false
+
+# Default velocity/acceleration scaling for planning
+default_velocity_scaling_factor: 0.1
+default_acceleration_scaling_factor: 0.1

@@ -32,6 +32,7 @@ install(PROGRAMS
   nodes/vla_inference_node.py
   nodes/orchestrator_node.py
   nodes/static_transform_republisher.py
+  nodes/motion_planner_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

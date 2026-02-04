@@ -1601,6 +1601,7 @@ class CommandGatewayNode(Node):
                         # Convert ROS duration to seconds
                         t = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
                         time_from_start.append(t)
+                    self.get_logger().info(f"MoveIt trajectory timing: {[f'{t:.3f}' for t in time_from_start]}")
                     return {
                         'waypoints': waypoints,
                         'time_from_start': time_from_start,
@@ -1629,20 +1630,40 @@ class CommandGatewayNode(Node):
         time_from_start = trajectory_data.get('time_from_start', [])
         
         if not waypoints:
+            self.get_logger().warn("No waypoints in trajectory data")
             return
         
-        # If no timing info, use simple linear interpolation
-        if not time_from_start or len(time_from_start) != len(waypoints):
-            total_duration = 2.0
-            time_from_start = [i * total_duration / max(1, len(waypoints) - 1) for i in range(len(waypoints))]
+        self.get_logger().info(f"Trajectory execution: {len(waypoints)} waypoints, timing: {time_from_start}")
         
-        # Total trajectory duration from MoveIt
+        # If no timing info or timing is near-zero, compute timing from joint velocities
+        # MoveIt's GetMotionPlan service doesn't always apply time parametrization
+        needs_timing = (
+            not time_from_start or 
+            len(time_from_start) != len(waypoints) or
+            (time_from_start[-1] < 0.1 and len(waypoints) > 1)  # Near-zero timing
+        )
+        
+        if needs_timing:
+            # Compute timing based on max joint velocity (conservative: 1.0 rad/s)
+            max_joint_velocity = 1.0  # rad/s - conservative for smooth motion
+            time_from_start = [0.0]
+            for i in range(1, len(waypoints)):
+                prev_wp = np.array(waypoints[i - 1])
+                curr_wp = np.array(waypoints[i])
+                max_joint_diff = np.max(np.abs(curr_wp - prev_wp))
+                segment_duration = max(0.02, max_joint_diff / max_joint_velocity)  # At least 20ms per segment
+                time_from_start.append(time_from_start[-1] + segment_duration)
+            self.get_logger().info(f"Computed timing: {[f'{t:.3f}' for t in time_from_start]}")
+        
+        # Total trajectory duration from MoveIt or computed
         total_duration = time_from_start[-1] if time_from_start else 2.0
         total_duration = max(0.5, total_duration)  # Minimum 0.5s duration
         
         # Publish at a fixed rate (e.g., 50Hz) for smooth visualization
         dt = 1.0 / publish_rate
         num_samples = max(1, int(total_duration * publish_rate))
+        
+        self.get_logger().info(f"Trajectory: duration={total_duration:.2f}s, samples={num_samples}, dt={dt:.4f}s")
         
         start_time = asyncio.get_event_loop().time()
         

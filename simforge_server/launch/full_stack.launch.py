@@ -215,7 +215,100 @@ def generate_launch_description():
         }],
     )
     
-    # 7. Foxglove Bridge
+    # 7. MoveIt 2 move_group for IK and Path Planning
+    # Load configs
+    import yaml
+    moveit_config_dir = os.path.join(pkg_share, 'config', 'moveit')
+    print(f"[MoveIt Config] Looking for configs in: {moveit_config_dir}")
+    print(f"[MoveIt Config] Directory exists: {os.path.exists(moveit_config_dir)}")
+    
+    # Load kinematics config
+    kinematics_yaml_path = os.path.join(moveit_config_dir, 'kinematics.yaml')
+    print(f"[MoveIt Config] kinematics.yaml exists: {os.path.exists(kinematics_yaml_path)}")
+    kinematics_config = {}
+    try:
+        if os.path.exists(kinematics_yaml_path):
+            with open(kinematics_yaml_path, 'r') as f:
+                kinematics_config = yaml.safe_load(f)
+    except Exception:
+        pass
+    
+    # Load OMPL planning config  
+    ompl_planning_yaml_path = os.path.join(moveit_config_dir, 'ompl_planning.yaml')
+    ompl_config = {}
+    try:
+        if os.path.exists(ompl_planning_yaml_path):
+            with open(ompl_planning_yaml_path, 'r') as f:
+                ompl_config = yaml.safe_load(f)
+    except Exception:
+        pass
+    
+    # Load joint limits config
+    joint_limits_yaml_path = os.path.join(moveit_config_dir, 'joint_limits.yaml')
+    joint_limits_config = {}
+    try:
+        if os.path.exists(joint_limits_yaml_path):
+            with open(joint_limits_yaml_path, 'r') as f:
+                joint_limits_config = yaml.safe_load(f)
+    except Exception:
+        pass
+    
+    # Try to read SRDF
+    srdf_path = os.path.join(moveit_config_dir, 'ur5e.srdf')
+    print(f"[MoveIt Config] SRDF path: {srdf_path}")
+    print(f"[MoveIt Config] SRDF exists: {os.path.exists(srdf_path)}")
+    robot_description_semantic = ''
+    try:
+        if os.path.exists(srdf_path):
+            with open(srdf_path, 'r') as f:
+                robot_description_semantic = f.read()
+            print(f"[MoveIt Config] SRDF loaded, length={len(robot_description_semantic)} chars")
+        else:
+            print(f"[MoveIt Config] ERROR: SRDF file not found at {srdf_path}")
+            # List available files in directory
+            if os.path.exists(moveit_config_dir):
+                print(f"[MoveIt Config] Files in {moveit_config_dir}: {os.listdir(moveit_config_dir)}")
+    except Exception as e:
+        print(f"[MoveIt Config] ERROR reading SRDF: {e}")
+    
+    # MoveIt configuration - split into separate dicts as MoveIt expects
+    robot_description_semantic_param = {'robot_description_semantic': robot_description_semantic}
+    
+    moveit_config = {
+        'robot_description_kinematics': kinematics_config,
+        'robot_description_planning': ompl_config,
+        'planning_scene_monitor_options': {
+            'joint_state_topic': '/joint_states',
+            'publish_planning_scene': True,
+            'publish_geometry_updates': True,
+            'publish_state_updates': True,
+            'publish_transforms_updates': True,
+        },
+        'move_group': {
+            'planning_plugin': 'ompl_interface/OMPLPlanner',
+            'default_planning_pipeline': 'ompl',
+            'start_state_max_bounds_error': 0.1,
+            'capabilities': '',
+            'disable_capabilities': '',
+            'publish_robot_description': True,
+            'publish_robot_description_semantic': True,
+        },
+    }
+    
+    move_group_node = Node(
+        package='moveit_ros_move_group',
+        executable='move_group',
+        name='move_group',
+        output='screen',
+        parameters=[
+            {'robot_description': ParameterValue(Command(['cat ', urdf_path]), value_type=str)},
+            robot_description_semantic_param,
+            moveit_config,
+            {'use_sim_time': False},
+        ],
+    )
+    
+    # 8. Foxglove Bridge
     foxglove_bridge_node = Node(
         package='foxglove_bridge',
         executable='foxglove_bridge',
@@ -250,5 +343,6 @@ def generate_launch_description():
         perception_node,
         vla_inference_node,
         orchestrator_node,
+        move_group_node,             # MoveIt 2 for IK and path planning
         foxglove_bridge_node,
     ])

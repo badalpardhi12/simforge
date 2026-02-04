@@ -25,6 +25,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetVLAAction.srv"
   "srv/GetRobotState.srv"
   "srv/SetSafetyMode.srv"
+  "srv/PlanCartesianMotion.srv"
   
   # Actions
   "action/MoveRobot.action"

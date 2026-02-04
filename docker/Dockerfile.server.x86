@@ -69,6 +69,15 @@ RUN apt-get update && apt-get install -y \
     ros-humble-ament-cmake-python \
     python3-colcon-common-extensions \
     python3-rosdep \
+    ros-humble-kdl-parser \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install trac_ik from source (not available as apt package for Humble)
+RUN apt-get update && apt-get install -y \
+    libnlopt-dev \
+    libnlopt-cxx-dev \
+    liborocos-kdl-dev \
+    python3-pykdl \
     && rm -rf /var/lib/apt/lists/*
 
 # Initialize rosdep

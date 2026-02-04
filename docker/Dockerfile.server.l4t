@@ -5,11 +5,11 @@
 #
 # Note: ur_rtde must be built from source on ARM64
 
-FROM nvcr.io/nvidia/isaac/ros:humble-aarch64
+FROM nvcr.io/nvidia/isaac/ros:aarch64-humble-3.2.0_b53c0a3-ros2_humble
 
 LABEL maintainer="badal@example.com"
-LABEL description="Simforge Server - Jetson Thor with Isaac ROS"
-LABEL version="1.0.0"
+LABEL description="Simforge Server - Jetson Thor with Isaac ROS cuMotion and nvblox"
+LABEL version="1.1.0"
 
 # Prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -21,6 +21,26 @@ RUN apt-get update && apt-get install -y \
     libboost-all-dev \
     libeigen3-dev \
     libssl-dev \
+    ros-humble-tf2-ros \
+    ros-humble-tf2-geometry-msgs \
+    ros-humble-moveit-core \
+    ros-humble-moveit-ros-planning-interface \
+    ros-humble-control-msgs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Isaac ROS packages (cuMotion + nvblox)
+# These provide GPU-accelerated motion planning and 3D reconstruction
+RUN apt-get update && apt-get install -y \
+    ros-humble-isaac-ros-cumotion \
+    ros-humble-isaac-ros-cumotion-moveit \
+    ros-humble-isaac-ros-nvblox \
+    ros-humble-isaac-ros-depth-image-proc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install trac_ik as IK fallback
+RUN apt-get update && apt-get install -y \
+    ros-humble-trac-ik-lib \
+    ros-humble-trac-ik-kinematics-plugin \
     && rm -rf /var/lib/apt/lists/*
 
 # Build ur_rtde from source (no ARM64 package available)
@@ -71,6 +91,9 @@ RUN chmod +x /ros_entrypoint.sh
 # Environment variables
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+# cuMotion uses cuRobo - set CUDA_HOME
+ENV CUDA_HOME=/usr/local/cuda
 
 # Expose ports
 EXPOSE 9090
