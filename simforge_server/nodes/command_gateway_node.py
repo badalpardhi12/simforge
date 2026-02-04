@@ -786,8 +786,8 @@ class CommandGatewayNode(Node):
                 self.get_logger().info(f"Pose {i+1}/{total_poses}: {pose_name}")
                 self.get_logger().info(f"  Position: ({position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f})")
                 
-                # Solve IK for this pose
-                target_joints = self._solve_ik_for_pose(position, orientation)
+                # Solve IK for this pose, using current joints as seed for continuity
+                target_joints = self._solve_ik_for_pose(position, orientation, seed_joints=self.sim_joint_positions)
                 
                 if target_joints is None:
                     self.get_logger().warn(f"IK failed for pose {pose_name}")
@@ -1117,6 +1117,7 @@ class CommandGatewayNode(Node):
         self,
         position: Tuple[float, float, float],
         orientation_quat_xyzw: Tuple[float, float, float, float],
+        seed_joints: Optional[List[float]] = None,
     ) -> Optional[List[float]]:
         """
         Solve inverse kinematics for a target Cartesian pose.
@@ -1127,6 +1128,7 @@ class CommandGatewayNode(Node):
         Args:
             position: Target (x, y, z) in base_link frame (meters)
             orientation_quat_xyzw: Target orientation quaternion (x, y, z, w)
+            seed_joints: Optional seed configuration for IK solver (use current joints for continuity)
             
         Returns:
             Joint angles [j0, j1, j2, j3, j4, j5] or None if IK failed
@@ -1135,7 +1137,7 @@ class CommandGatewayNode(Node):
         if self._has_moveit and self.compute_ik_client:
             try:
                 self.get_logger().info(f"Trying MoveIt IK for pos={position}")
-                result = self._solve_ik_moveit_sync(position, orientation_quat_xyzw)
+                result = self._solve_ik_moveit_sync(position, orientation_quat_xyzw, seed_joints=seed_joints)
                 if result is not None:
                     self.get_logger().info(f"MoveIt IK success: {[f'{j:.3f}' for j in result]}")
                     return result
@@ -1154,9 +1156,14 @@ class CommandGatewayNode(Node):
         self,
         position: Tuple[float, float, float],
         orientation_quat_xyzw: Tuple[float, float, float, float],
+        seed_joints: Optional[List[float]] = None,
     ) -> Optional[List[float]]:
         """
         Call MoveIt 2's compute_ik service synchronously.
+        
+        Uses seed_joints as the starting configuration for IK search.
+        This helps find solutions closer to the current configuration,
+        making motion planning more reliable.
         
         This is a blocking call that waits for the IK solution.
         """
@@ -1200,13 +1207,19 @@ class CommandGatewayNode(Node):
             target_pose.pose.orientation.w = orientation_quat_xyzw[3]
             request.ik_request.pose_stamped = target_pose
             
-            # Use a safe seed state (home position) instead of current sim state
-            # This avoids issues with invalid current states
+            # Use current joint configuration as seed for IK solver
+            # This produces solutions closer to current pose, making motion planning easier
             robot_state = RobotState()
             robot_state.joint_state.name = self.sim_joint_names
-            # Use home position as seed - this is always valid
-            home_position = [0.0, -math.pi/2, 0.0, -math.pi/2, 0.0, 0.0]
-            robot_state.joint_state.position = home_position
+            # Use provided seed_joints, fall back to current sim state, then home position
+            if seed_joints is not None:
+                robot_state.joint_state.position = list(seed_joints)
+            elif hasattr(self, 'sim_joint_positions') and self.sim_joint_positions:
+                robot_state.joint_state.position = list(self.sim_joint_positions)
+            else:
+                # Fallback to home position if nothing else available
+                home_position = [0.0, -math.pi/2, 0.0, -math.pi/2, 0.0, 0.0]
+                robot_state.joint_state.position = home_position
             request.ik_request.robot_state = robot_state
             
             # Call the service
@@ -1633,20 +1646,25 @@ class CommandGatewayNode(Node):
         
         start_time = asyncio.get_event_loop().time()
         
-        for sample_idx in range(num_samples):
+        for sample_idx in range(num_samples + 1):  # +1 to include final position
             if self._proto_sim_stop_requested:
                 break
             
             # Current time in trajectory
-            t = sample_idx * dt
+            t = min(sample_idx * dt, total_duration)
             
-            # Find which segment we're in
+            # Find which segment we're in using binary search approach
+            # We want segment_idx such that time_from_start[segment_idx] <= t < time_from_start[segment_idx + 1]
             segment_idx = 0
             for i in range(len(time_from_start) - 1):
-                if t >= time_from_start[i]:
-                    segment_idx = i
+                if time_from_start[i + 1] <= t:
+                    segment_idx = i + 1
                 else:
                     break
+            
+            # Ensure segment_idx is within valid range for interpolation
+            segment_idx = min(segment_idx, len(waypoints) - 2)
+            segment_idx = max(segment_idx, 0)
             
             # Interpolate within segment
             if segment_idx < len(waypoints) - 1:
