@@ -35,6 +35,86 @@ from geometry_msgs.msg import Pose, Point, Quaternion
 from trajectory_msgs.msg import JointTrajectory
 from sensor_msgs.msg import JointState
 
+import tf2_ros
+from tf2_ros import Buffer, TransformListener
+
+# Local imports for pose generation - try multiple import strategies
+try:
+    # Try installed package import first
+    from simforge_server.utils.pose_generation import (
+        ProtoSimParameters,
+        ProtoPose,
+        generate_proto_poses,
+        transform_pose_to_world,
+        count_poses,
+        rpy_deg_to_quat_xyzw,
+    )
+except ImportError:
+    try:
+        # Try relative path import (for development)
+        import sys
+        import os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        from utils.pose_generation import (
+            ProtoSimParameters,
+            ProtoPose,
+            generate_proto_poses,
+            transform_pose_to_world,
+            count_poses,
+            rpy_deg_to_quat_xyzw,
+        )
+    except ImportError:
+        # Fallback: define minimal stubs if pose_generation not available
+        import logging
+        logging.getLogger(__name__).warning("pose_generation module not found, using fallback")
+        from dataclasses import dataclass
+        from typing import Sequence, Dict, Tuple, List
+        
+        @dataclass(frozen=True)
+        class ProtoSimParameters:
+            horiz: Sequence[float]
+            vert: Sequence[float]
+            distance: Sequence[float]
+            roll: Sequence[float]
+            pitch: Sequence[float]
+            yaw: Sequence[float]
+        
+        @dataclass(frozen=True)
+        class ProtoPose:
+            parameters: Dict[str, float]
+            position_m: Tuple[float, float, float]
+            orientation_deg: Tuple[float, float, float]
+            orientation_quat_xyzw: Tuple[float, float, float, float]
+            def get_name(self) -> str:
+                p = self.parameters
+                return f"H{p['horiz']:.0f}_V{p['vert']:.0f}_D{p['distance']:.0f}_R{p['roll']:.0f}_P{p['pitch']:.0f}_Y{p['yaw']:.0f}"
+        
+        def generate_proto_poses(params: ProtoSimParameters) -> List[ProtoPose]:
+            # Fallback: generate simple poses
+            poses = []
+            for h in params.horiz:
+                for v in params.vert:
+                    for p in params.pitch:
+                        for y in params.yaw:
+                            for d in params.distance:
+                                for r in params.roll:
+                                    poses.append(ProtoPose(
+                                        parameters={'horiz': h, 'vert': v, 'distance': d, 'roll': r, 'pitch': p, 'yaw': y},
+                                        position_m=(0.0, d/1000.0, 0.0),
+                                        orientation_deg=(r, p, y),
+                                        orientation_quat_xyzw=(0.0, 0.0, 0.0, 1.0),
+                                    ))
+            return poses
+        
+        def transform_pose_to_world(pose, target_pos, target_quat):
+            return pose.position_m, pose.orientation_quat_xyzw
+        
+        def count_poses(params):
+            return len(params.horiz) * len(params.vert) * len(params.distance) * len(params.roll) * len(params.pitch) * len(params.yaw)
+        
+        def rpy_deg_to_quat_xyzw(r, p, y):
+            return (0.0, 0.0, 0.0, 1.0)
+
 try:
     import websockets
     from websockets.server import serve, WebSocketServerProtocol
@@ -123,6 +203,59 @@ class CommandGatewayNode(Node):
         # Proto-sim control flags
         self._proto_sim_running = False
         self._proto_sim_stop_requested = False
+        
+        # TF2 for frame lookups (target object position)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        
+        # IK solver (lazy initialized)
+        self._ik_solver = None
+        
+        # === MoveIt 2 Service Clients for IK and Planning ===
+        # Import MoveIt message types
+        try:
+            from moveit_msgs.srv import GetPositionIK, GetMotionPlan, GetPlanningScene
+            from moveit_msgs.msg import RobotState, Constraints, JointConstraint, PositionIKRequest, MoveItErrorCodes
+            self._has_moveit = True
+            
+            # IK service client
+            self.compute_ik_client = self.create_client(
+                GetPositionIK,
+                '/compute_ik',
+                callback_group=self.callback_group
+            )
+            
+            # Motion planning service client
+            self.plan_motion_client = self.create_client(
+                GetMotionPlan,
+                '/plan_kinematic_path',
+                callback_group=self.callback_group
+            )
+            
+            # Planning scene client
+            self.planning_scene_client = self.create_client(
+                GetPlanningScene,
+                '/get_planning_scene',
+                callback_group=self.callback_group
+            )
+            
+            # Planning scene publisher for adding collision objects
+            from moveit_msgs.msg import PlanningScene, CollisionObject
+            from shape_msgs.msg import SolidPrimitive
+            self.planning_scene_pub = self.create_publisher(
+                PlanningScene,
+                '/planning_scene',
+                10
+            )
+            self._collision_objects_added = False
+            
+            self.get_logger().info("MoveIt 2 service clients initialized")
+        except ImportError as e:
+            self._has_moveit = False
+            self.compute_ik_client = None
+            self.plan_motion_client = None
+            self.planning_scene_client = None
+            self.get_logger().warn(f"MoveIt 2 not available: {e}. Using fallback IK.")
         
         # === Service Clients ===
         # Service to pause robot_control_node's joint state publishing during simulation
@@ -449,19 +582,45 @@ class CommandGatewayNode(Node):
             await self.send_error(client, request_id, str(e))
 
     async def rpc_get_environment_info(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Get available robots and objects in the environment."""
-        # TODO: Get actual environment info from URDF/config
-        # For now, return configured values
+        """Get available robots and objects with TF data in base_link frame.
+        
+        Returns transforms for all known objects so the client can compute
+        poses locally in the robot's coordinate frame.
+        """
+        objects = ['face_link', 'table_link', 'shop_floor']
+        object_transforms = {}
+        
+        for obj_name in objects:
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    'base_link',
+                    obj_name,
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=1.0)
+                )
+                object_transforms[obj_name] = {
+                    'position': [
+                        transform.transform.translation.x,
+                        transform.transform.translation.y,
+                        transform.transform.translation.z,
+                    ],
+                    'orientation': [
+                        transform.transform.rotation.x,
+                        transform.transform.rotation.y,
+                        transform.transform.rotation.z,
+                        transform.transform.rotation.w,
+                    ],
+                }
+            except Exception as e:
+                self.get_logger().warn(f"Could not get transform for {obj_name}: {e}")
+                object_transforms[obj_name] = None
+        
         return {
             'success': True,
             'robots': [self.default_robot],
-            'objects': ['face_link', 'table_link', 'shop_floor'],
-            'reference_frames': {
-                'world': 'World Origin',
-                'base_link': 'Robot Base',
-                'tool0': 'Tool Center Point',
-                'face_link': 'Face Fixture',
-            },
+            'objects': objects,
+            'object_transforms': object_transforms,
+            'reference_frame': 'base_link',
         }
 
     async def rpc_run_proto_sim(
@@ -471,18 +630,27 @@ class CommandGatewayNode(Node):
         params: Dict[str, Any],
     ) -> Dict[str, Any]:
         """
-        Run protocol simulation with actual robot movement visualization.
+        Run protocol simulation with collision-checked robot movement.
         
-        Generates spherical coordinates around target object and moves
-        the robot to each pose while publishing joint states for visualization.
+        The server receives pre-computed poses from the client in base_link frame.
+        Each pose is validated via MoveIt IK and collision checking.
+        Poses that would cause collision are REJECTED (not executed).
         
-        Parameters match simforge_new/control/proto_simulation.py:
-        - horiz: horizontal shift from object center (mm)
-        - vert: vertical shift from object center (mm)
-        - distance: distance from object (mm)
-        - roll: roll angle (degrees)
-        - pitch: pitch angle (degrees) - look up/down
-        - yaw: yaw angle (degrees) - look left/right
+        Parameters (new architecture - poses from client):
+        - poses: List of poses in base_link frame, each with:
+            - name: Pose name (e.g., "H0_V0_D250_R-90_P0_Y0")
+            - position: [x, y, z] in meters
+            - orientation: [qx, qy, qz, qw] quaternion
+            - parameters: Original sampling parameters
+        
+        Parameters (legacy - server generates poses):
+        - horiz, vert, distance, roll, pitch, yaw: Sampling parameters
+        - target_object: Target frame name for pose transformation
+        
+        Common parameters:
+        - idle_time: Time to wait at each pose (seconds)
+        - mode: 'simulation', 'real', or 'both'
+        - move_speed: Movement speed scale (0.0-1.0)
         """
         if self._proto_sim_running:
             return {
@@ -494,95 +662,146 @@ class CommandGatewayNode(Node):
         self._proto_sim_stop_requested = False
         
         robot_name = params.get('robot_name', self.default_robot)
-        target_object = params.get('target_object', 'face_link')
-        
-        # Parameters matching simforge_new structure
-        horiz = params.get('horiz', [0])  # mm
-        vert = params.get('vert', [0])  # mm
-        distance = params.get('distance', [250, 350, 450, 550])  # mm
-        roll = params.get('roll', [-90])  # degrees
-        pitch = params.get('pitch', [-45, -30, 0, 15])  # degrees
-        yaw = params.get('yaw', [-30, 0, 30])  # degrees
-        
         idle_time = params.get('idle_time', 2.0)
-        randomize = params.get('randomize', False)
-        mode = params.get('mode', 'simulation')  # 'simulation', 'real', 'both'
-        move_speed = params.get('move_speed', 0.5)  # 0.0-1.0
+        mode = params.get('mode', 'simulation')
+        move_speed = params.get('move_speed', 0.5)
         
-        self.get_logger().info(
-            f"Proto-sim: {robot_name} -> {target_object}, mode={mode}"
-        )
-        self.get_logger().info(
-            f"  horiz={horiz}, vert={vert}, distance={distance}"
-        )
-        self.get_logger().info(
-            f"  roll={roll}, pitch={pitch}, yaw={yaw}"
-        )
-        self.get_logger().info(f"  idle_time={idle_time}, move_speed={move_speed}, randomize={randomize}")
+        # Check if client provided pre-computed poses (new architecture)
+        client_poses = params.get('poses', None)
+        
+        if client_poses:
+            # NEW: Client-side pose generation - poses are already in base_link frame
+            self.get_logger().info(f"Proto-sim: {robot_name}, mode={mode}, client-computed poses")
+            self.get_logger().info(f"  Received {len(client_poses)} pre-computed poses in base_link frame")
+            world_poses = client_poses
+            total_poses = len(world_poses)
+        else:
+            # LEGACY: Server-side pose generation (for backwards compatibility)
+            self.get_logger().warn("Using legacy server-side pose generation - consider updating client")
+            target_object = params.get('target_object', 'face_link')
+            horiz = params.get('horiz', [0])
+            vert = params.get('vert', [0])
+            distance = params.get('distance', [250, 350, 450, 550])
+            roll = params.get('roll', [-90])
+            pitch = params.get('pitch', [-45, -30, 0, 15])
+            yaw = params.get('yaw', [-30, 0, 30])
+            randomize = params.get('randomize', False)
+            
+            self.get_logger().info(f"Proto-sim: {robot_name} -> {target_object}, mode={mode}")
+            self.get_logger().info(f"  horiz={horiz}, vert={vert}, distance={distance}")
+            self.get_logger().info(f"  roll={roll}, pitch={pitch}, yaw={yaw}")
+            
+            # Get target object transform
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    'base_link', target_object, rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=2.0)
+                )
+                target_position = (
+                    transform.transform.translation.x,
+                    transform.transform.translation.y,
+                    transform.transform.translation.z,
+                )
+                target_orientation = (
+                    transform.transform.rotation.x,
+                    transform.transform.rotation.y,
+                    transform.transform.rotation.z,
+                    transform.transform.rotation.w,
+                )
+            except Exception as e:
+                self._proto_sim_running = False
+                return {
+                    'success': False,
+                    'error': f"Cannot find target object transform: {e}",
+                }
+            
+            # Generate and transform poses
+            proto_params = ProtoSimParameters(
+                horiz=horiz, vert=vert, distance=distance,
+                roll=roll, pitch=pitch, yaw=yaw,
+            )
+            local_poses = generate_proto_poses(proto_params)
+            if randomize:
+                import random
+                random.shuffle(local_poses)
+            
+            # Convert to world poses format
+            world_poses = []
+            for pose in local_poses:
+                world_pos, world_quat = transform_pose_to_world(
+                    pose, target_position, target_orientation
+                )
+                world_poses.append({
+                    'name': pose.get_name(),
+                    'position': list(world_pos),
+                    'orientation': list(world_quat),
+                    'parameters': pose.parameters,
+                })
+            total_poses = len(world_poses)
+            self.get_logger().info(f"  Generated {total_poses} poses")
+        
+        self.get_logger().info(f"  idle_time={idle_time}, move_speed={move_speed}")
+        
+        # Add collision objects to planning scene
+        self._add_collision_objects_to_planning_scene()
         
         # Pause real robot's joint state publishing during simulation
         if mode in ('simulation', 'both'):
-            self.get_logger().info("Attempting to pause real robot joint publishing...")
             try:
                 await self._pause_real_robot_joint_publishing()
-                self.get_logger().info("Pause request completed")
             except Exception as e:
                 self.get_logger().error(f"Failed to pause joint publishing: {e}")
-        
-        # Generate pose list from all parameter combinations
-        # Matching simforge_new order: horiz -> vert -> distance -> roll -> pitch -> yaw
-        import itertools
-        poses = list(itertools.product(horiz, vert, pitch, yaw, distance, roll))
-        total_poses = len(poses)
-        
-        if randomize:
-            import random
-            random.shuffle(poses)
-        
-        self.get_logger().info(f"Proto-sim: {total_poses} poses to execute")
         
         # Execute poses
         completed = 0
         failed = 0
+        collision_rejected = 0
         client_disconnected = False
         
         async def safe_send_feedback(feedback_data):
-            """Send feedback to client, return False if client disconnected."""
             nonlocal client_disconnected
             if client_disconnected:
                 return False
             try:
                 await client.websocket.send(json.dumps(feedback_data))
                 return True
-            except Exception as e:
-                self.get_logger().warn(f"Client disconnected during proto-sim: {e}")
+            except Exception:
                 client_disconnected = True
                 return False
         
         try:
-            self.get_logger().info(f"Starting pose execution loop with {total_poses} poses")
-            for i, (h, v, p, y, d, r) in enumerate(poses):
+            self.get_logger().info(f"Starting pose execution: {total_poses} poses, collision-checked")
+            
+            for i, pose_data in enumerate(world_poses):
                 if self._proto_sim_stop_requested:
                     self.get_logger().info("Proto-sim stopped by user request")
                     break
                 
-                pose_name = f"H{h}_V{v}_D{d}_R{r}_P{p}_Y{y}"
-                if i == 0 or (i + 1) % 5 == 0:
-                    self.get_logger().info(f"Executing pose {i+1}/{total_poses}: {pose_name}")
+                pose_name = pose_data.get('name', f'pose_{i}')
+                position = tuple(pose_data['position'])
+                orientation = tuple(pose_data['orientation'])
                 
-                # Generate target joint configuration for this pose
-                target_joints = self._compute_proto_pose_joints(
-                    horiz_mm=h, vert_mm=v, dist_mm=d,
-                    roll_deg=r, pitch_deg=p, yaw_deg=y
-                )
+                self.get_logger().info(f"Pose {i+1}/{total_poses}: {pose_name}")
+                self.get_logger().info(f"  Position: ({position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f})")
+                
+                # Solve IK for this pose
+                target_joints = self._solve_ik_for_pose(position, orientation)
                 
                 if target_joints is None:
-                    self.get_logger().warn(f"No valid joints for pose {pose_name}")
+                    self.get_logger().warn(f"IK failed for pose {pose_name}")
                     failed += 1
+                    await safe_send_feedback({
+                        'type': 'rpc_feedback',
+                        'request_id': request_id,
+                        'current_pose_index': i,
+                        'total_poses': total_poses,
+                        'current_pose_name': pose_name,
+                        'status': 'ik_failed',
+                    })
                     continue
                 
-                # Send progress update - moving to pose (ignore send failures)
-                feedback = {
+                # Send progress update - moving
+                await safe_send_feedback({
                     'type': 'rpc_feedback',
                     'request_id': request_id,
                     'current_pose_index': i,
@@ -590,62 +809,68 @@ class CommandGatewayNode(Node):
                     'current_pose_name': pose_name,
                     'progress_percent': (i / total_poses) * 100,
                     'status': 'moving',
-                }
-                await safe_send_feedback(feedback)
+                })
                 
-                # Execute simulated movement with joint state publishing
+                # Execute movement with COLLISION CHECKING - movement is REJECTED if collision detected
                 if mode in ('simulation', 'both'):
                     self.get_logger().info(f"Moving to joints: {[f'{j:.2f}' for j in target_joints]}")
-                    try:
-                        await self._execute_sim_movement(
-                            target_joints, 
-                            move_speed=move_speed
-                        )
-                    except Exception as e:
-                        self.get_logger().error(f"Movement error: {e}")
-                        import traceback
-                        self.get_logger().error(traceback.format_exc())
+                    movement_success = await self._execute_sim_movement(
+                        target_joints, 
+                        move_speed=move_speed,
+                        require_collision_check=True,  # IMPORTANT: Reject if collision
+                    )
+                    
+                    if not movement_success:
+                        self.get_logger().warn(f"Pose {pose_name} REJECTED due to collision")
+                        collision_rejected += 1
+                        await safe_send_feedback({
+                            'type': 'rpc_feedback',
+                            'request_id': request_id,
+                            'current_pose_index': i,
+                            'total_poses': total_poses,
+                            'current_pose_name': pose_name,
+                            'status': 'collision_rejected',
+                        })
+                        continue
                 
-                # TODO: If mode is 'real' or 'both', also send to real robot
-                # if mode in ('real', 'both'):
-                #     await self._execute_real_movement(target_joints)
+                # Send progress update - at pose
+                await safe_send_feedback({
+                    'type': 'rpc_feedback',
+                    'request_id': request_id,
+                    'current_pose_index': i,
+                    'total_poses': total_poses,
+                    'current_pose_name': pose_name,
+                    'status': 'idle',
+                })
                 
-                # Send progress update - at pose (idle)
-                feedback['status'] = 'idle'
-                await safe_send_feedback(feedback)
-                
-                # Wait at pose (idle time)
-                idle_steps = int(idle_time * 10)  # 10 Hz check for stop
-                for _ in range(idle_steps):
+                # Wait at pose
+                for _ in range(int(idle_time * 10)):
                     if self._proto_sim_stop_requested:
                         break
                     await asyncio.sleep(0.1)
-                    # Keep publishing joint states while idle
                     self._publish_joint_state()
                 
                 completed += 1
                 
         finally:
             self._proto_sim_running = False
-            # Resume real robot's joint state publishing
             if mode in ('simulation', 'both'):
                 await self._resume_real_robot_joint_publishing()
         
-        # Send final result
+        # Final result
         result = {
             'type': 'rpc_result',
             'request_id': request_id,
-            'success': not self._proto_sim_stop_requested and not client_disconnected,
-            'message': f'Completed {completed}/{total_poses} poses' + (' (client disconnected)' if client_disconnected else ''),
+            'success': completed > 0 and not self._proto_sim_stop_requested,
+            'message': f'Completed {completed}/{total_poses} poses ({collision_rejected} rejected for collision, {failed} IK failed)',
             'completed': completed,
-            'failed': failed,
+            'collision_rejected': collision_rejected,
+            'ik_failed': failed,
             'total': total_poses,
             'stopped': self._proto_sim_stop_requested,
         }
         
         self.get_logger().info(f"Proto-sim finished: {result['message']}")
-        
-        # Try to send result, but don't fail if client disconnected
         await safe_send_feedback(result)
         
         return result
@@ -700,7 +925,133 @@ class CommandGatewayNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Failed to resume joint publishing: {e}")
 
-    def _compute_proto_pose_joints(
+    def _add_collision_objects_to_planning_scene(self) -> None:
+        """Add environment collision objects (table, face) to MoveIt planning scene.
+        
+        From valid8_environment.urdf:
+        - Table link at world [0, 0, 1.0], with collision box at offset [0, 0, -0.5]
+        - Table collision box size: [2.1, 1.1, 1.04] (extends from world z=-0.02 to z=1.02)
+        - Face at world [0.1742, 0, 1.6] with 90° yaw
+        - Robot base at world [-0.6758, 0, 1.03] with -90° yaw
+        
+        So in base_link frame:
+        - Table center (of collision box) is approximately at [0.6758, 0, -0.53]
+        - Face is at approximately [0, 0.85, 0.57]
+        """
+        if not self._has_moveit or self._collision_objects_added:
+            return
+        
+        try:
+            from moveit_msgs.msg import PlanningScene, CollisionObject
+            from shape_msgs.msg import SolidPrimitive
+            from geometry_msgs.msg import Pose as GeometryPose
+            
+            planning_scene = PlanningScene()
+            planning_scene.is_diff = True
+            
+            # Get transforms for table and face to verify positions
+            try:
+                table_tf = self.tf_buffer.lookup_transform(
+                    'base_link', 'table_link', rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=2.0)
+                )
+                face_tf = self.tf_buffer.lookup_transform(
+                    'base_link', 'face_link', rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=2.0)
+                )
+                
+                self.get_logger().info(f"Table in base_link: ({table_tf.transform.translation.x:.3f}, "
+                                       f"{table_tf.transform.translation.y:.3f}, {table_tf.transform.translation.z:.3f})")
+                self.get_logger().info(f"Face in base_link: ({face_tf.transform.translation.x:.3f}, "
+                                       f"{face_tf.transform.translation.y:.3f}, {face_tf.transform.translation.z:.3f})")
+            except Exception as e:
+                self.get_logger().warn(f"Could not get transforms for collision objects: {e}")
+                self.get_logger().warn("Proceeding with hardcoded positions based on URDF")
+                # Use fallback positions based on URDF calculations
+                table_tf = None
+                face_tf = None
+            
+            # Add table as collision object
+            # The table collision box in URDF is size [2.1, 1.1, 1.04] centered at [0, 0, -0.5] relative to table_link
+            # table_link is at world [0, 0, 1.0], so collision box center is at world [0, 0, 0.5]
+            # Robot base is at world [-0.6758, 0, 1.03]
+            table_obj = CollisionObject()
+            table_obj.header.frame_id = 'base_link'
+            table_obj.header.stamp = self.get_clock().now().to_msg()
+            table_obj.id = 'optical_table'
+            table_obj.operation = CollisionObject.ADD
+            
+            # Table collision box (matching URDF exactly)
+            table_primitive = SolidPrimitive()
+            table_primitive.type = SolidPrimitive.BOX
+            table_primitive.dimensions = [2.1, 1.1, 1.04]  # From URDF
+            
+            table_pose = GeometryPose()
+            if table_tf is not None:
+                # Use TF-derived position, but offset by -0.5m in Z (collision box offset from table_link)
+                # Also need to rotate the offset by the table orientation
+                table_pose.position.x = table_tf.transform.translation.x
+                table_pose.position.y = table_tf.transform.translation.y
+                table_pose.position.z = table_tf.transform.translation.z - 0.5  # Offset for collision box center
+                table_pose.orientation = table_tf.transform.rotation
+            else:
+                # Hardcoded fallback: table collision center in base_link frame
+                # World: table_link at [0,0,1], collision at [0,0,0.5]
+                # Base at world [-0.6758, 0, 1.03] with -90° yaw
+                # In base_link: [0 - (-0.6758), 0 - 0, 0.5 - 1.03] = [0.6758, 0, -0.53]
+                # But base has -90° yaw, so X,Y swap: [0, 0.6758, -0.53]
+                table_pose.position.x = 0.0
+                table_pose.position.y = 0.6758
+                table_pose.position.z = -0.53
+                table_pose.orientation.w = 1.0
+            
+            table_obj.primitives.append(table_primitive)
+            table_obj.primitive_poses.append(table_pose)
+            planning_scene.world.collision_objects.append(table_obj)
+            
+            # Add face as collision object (sphere approximation for head)
+            face_obj = CollisionObject()
+            face_obj.header.frame_id = 'base_link'
+            face_obj.header.stamp = self.get_clock().now().to_msg()
+            face_obj.id = 'face_fixture'
+            face_obj.operation = CollisionObject.ADD
+            
+            face_primitive = SolidPrimitive()
+            face_primitive.type = SolidPrimitive.SPHERE
+            face_primitive.dimensions = [0.15]  # Head radius ~15cm (slightly larger for safety)
+            
+            face_pose = GeometryPose()
+            if face_tf is not None:
+                face_pose.position.x = face_tf.transform.translation.x
+                face_pose.position.y = face_tf.transform.translation.y
+                face_pose.position.z = face_tf.transform.translation.z
+                face_pose.orientation = face_tf.transform.rotation
+            else:
+                # Hardcoded fallback
+                face_pose.position.x = 0.0
+                face_pose.position.y = 0.85
+                face_pose.position.z = 0.57
+                face_pose.orientation.w = 1.0
+            
+            face_obj.primitives.append(face_primitive)
+            face_obj.primitive_poses.append(face_pose)
+            planning_scene.world.collision_objects.append(face_obj)
+            
+            # Publish the planning scene
+            self.planning_scene_pub.publish(planning_scene)
+            self._collision_objects_added = True
+            self.get_logger().info(f"Added collision objects to planning scene:")
+            self.get_logger().info(f"  - optical_table: box {table_primitive.dimensions} at "
+                                   f"({table_pose.position.x:.3f}, {table_pose.position.y:.3f}, {table_pose.position.z:.3f})")
+            self.get_logger().info(f"  - face_fixture: sphere r={face_primitive.dimensions[0]:.2f} at "
+                                   f"({face_pose.position.x:.3f}, {face_pose.position.y:.3f}, {face_pose.position.z:.3f})")
+            
+        except Exception as e:
+            self.get_logger().error(f"Failed to add collision objects: {e}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+
+    def _compute_demo_pose_joints(
         self,
         horiz_mm: float,
         vert_mm: float,
@@ -710,11 +1061,14 @@ class CommandGatewayNode(Node):
         yaw_deg: float,
     ) -> Optional[List[float]]:
         """
-        Compute joint configuration for a proto-sim pose.
+        Compute joint configuration for demonstration mode.
         
-        This generates demonstration poses that create visible robot motion.
-        In production, this would use IK to compute actual poses pointing
-        at the target object from the specified spherical coordinates.
+        This generates visually dramatic joint configurations that show
+        the robot moving through different orientations. This is used when
+        IK solving is disabled (default) for visualization purposes.
+        
+        For real pose accuracy, enable use_ik=True to use actual inverse
+        kinematics solving via motion_planner_node.
         """
         # Convert mm to meters for internal calculations
         dist_m = dist_mm / 1000.0
@@ -756,6 +1110,286 @@ class CommandGatewayNode(Node):
         ]
         
         return joints
+    
+    def _solve_ik_for_pose(
+        self,
+        position: Tuple[float, float, float],
+        orientation_quat_xyzw: Tuple[float, float, float, float],
+    ) -> Optional[List[float]]:
+        """
+        Solve inverse kinematics for a target Cartesian pose.
+        
+        This method attempts to use MoveIt 2's compute_ik service.
+        Falls back to analytical IK if MoveIt service is unavailable.
+        
+        Args:
+            position: Target (x, y, z) in base_link frame (meters)
+            orientation_quat_xyzw: Target orientation quaternion (x, y, z, w)
+            
+        Returns:
+            Joint angles [j0, j1, j2, j3, j4, j5] or None if IK failed
+        """
+        # Try MoveIt 2 IK first
+        if self._has_moveit and self.compute_ik_client:
+            try:
+                self.get_logger().info(f"Trying MoveIt IK for pos={position}")
+                result = self._solve_ik_moveit_sync(position, orientation_quat_xyzw)
+                if result is not None:
+                    self.get_logger().info(f"MoveIt IK success: {[f'{j:.3f}' for j in result]}")
+                    return result
+                else:
+                    self.get_logger().info("MoveIt IK failed, trying analytical fallback")
+            except Exception as e:
+                self.get_logger().warn(f"MoveIt IK error: {e}, using analytical fallback")
+        else:
+            self.get_logger().info(f"MoveIt not available (has_moveit={self._has_moveit}), using analytical")
+        
+        # Fallback: use simple analytical IK approximation
+        self.get_logger().info("Using analytical IK fallback")
+        return self._solve_ik_analytical(position, orientation_quat_xyzw)
+    
+    def _solve_ik_moveit_sync(
+        self,
+        position: Tuple[float, float, float],
+        orientation_quat_xyzw: Tuple[float, float, float, float],
+    ) -> Optional[List[float]]:
+        """
+        Call MoveIt 2's compute_ik service synchronously.
+        
+        This is a blocking call that waits for the IK solution.
+        """
+        if not self.compute_ik_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn("MoveIt compute_ik service not available")
+            return None
+        
+        try:
+            from moveit_msgs.srv import GetPositionIK
+            from moveit_msgs.msg import PositionIKRequest, RobotState, MoveItErrorCodes
+            from geometry_msgs.msg import PoseStamped
+            from sensor_msgs.msg import JointState
+            
+            # Error code names for better debugging
+            error_names = {
+                1: "SUCCESS",
+                -1: "FAILURE",
+                -2: "PLANNING_FAILED",
+                -10: "START_STATE_IN_COLLISION",
+                -11: "START_STATE_VIOLATES_PATH_CONSTRAINTS",
+                -12: "GOAL_IN_COLLISION",
+                -26: "START_STATE_INVALID",
+                -31: "NO_IK_SOLUTION",
+            }
+            
+            # Build IK request
+            request = GetPositionIK.Request()
+            request.ik_request.group_name = "ur_manipulator"
+            request.ik_request.avoid_collisions = True  # Enable collision checking in IK
+            
+            # Set the target pose
+            target_pose = PoseStamped()
+            target_pose.header.frame_id = "base_link"
+            target_pose.header.stamp = self.get_clock().now().to_msg()
+            target_pose.pose.position.x = position[0]
+            target_pose.pose.position.y = position[1]
+            target_pose.pose.position.z = position[2]
+            target_pose.pose.orientation.x = orientation_quat_xyzw[0]
+            target_pose.pose.orientation.y = orientation_quat_xyzw[1]
+            target_pose.pose.orientation.z = orientation_quat_xyzw[2]
+            target_pose.pose.orientation.w = orientation_quat_xyzw[3]
+            request.ik_request.pose_stamped = target_pose
+            
+            # Use a safe seed state (home position) instead of current sim state
+            # This avoids issues with invalid current states
+            robot_state = RobotState()
+            robot_state.joint_state.name = self.sim_joint_names
+            # Use home position as seed - this is always valid
+            home_position = [0.0, -math.pi/2, 0.0, -math.pi/2, 0.0, 0.0]
+            robot_state.joint_state.position = home_position
+            request.ik_request.robot_state = robot_state
+            
+            # Call the service
+            future = self.compute_ik_client.call_async(request)
+            
+            # Wait for result with timeout
+            rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+            
+            if future.done():
+                response = future.result()
+                if response.error_code.val == MoveItErrorCodes.SUCCESS:
+                    # Extract joint positions from solution
+                    solution = response.solution.joint_state
+                    joint_positions = list(solution.position)
+                    if len(joint_positions) >= 6:
+                        self.get_logger().debug(f"MoveIt IK success: {[f'{j:.3f}' for j in joint_positions[:6]]}")
+                        return joint_positions[:6]
+                else:
+                    error_name = error_names.get(response.error_code.val, f"UNKNOWN({response.error_code.val})")
+                    self.get_logger().debug(f"MoveIt IK failed: {error_name} for pos={position}")
+            
+            return None
+            
+        except Exception as e:
+            self.get_logger().warn(f"MoveIt IK call failed: {e}")
+            return None
+    
+    def _solve_ik_analytical(
+        self,
+        position: Tuple[float, float, float],
+        orientation_quat_xyzw: Tuple[float, float, float, float],
+    ) -> Optional[List[float]]:
+        """
+        Solve IK using analytical approach for UR5e.
+        
+        This is a simplified 6-DOF IK solver as a fallback when MoveIt is unavailable.
+        For production, MoveIt 2 should always be used.
+        
+        The UR5e URDF has these frame conventions:
+        - base_link: Robot mounting frame
+        - base_link_inertia: Rotated 180° (π rad) from base_link around Z
+        - shoulder_pan_joint rotates around base_link_inertia's Z axis
+        
+        When computing j0 (shoulder pan), we need to account for this 180° offset.
+        A target at (0, +Y, Z) in base_link frame requires j0 = -π/2 in shoulder_pan_joint
+        because the joint frame is rotated 180° from base_link.
+        """
+        try:
+            x, y, z = position
+            qx, qy, qz, qw = orientation_quat_xyzw
+            
+            # UR5e DH parameters (from URDF)
+            d1 = 0.1625   # base to shoulder offset
+            a2 = -0.425   # upper arm length
+            a3 = -0.3922  # forearm length
+            d4 = 0.1333   # wrist 1 offset
+            d5 = 0.0997   # wrist 2 offset
+            d6 = 0.0996   # wrist 3 to flange
+            
+            # Tool offset from flange (iphone tool)
+            tool_offset = 0.08  # 80mm in -X direction of tool0
+            
+            # Compute wrist center position (back off from TCP along tool Z-axis)
+            # The tool Z-axis direction comes from the quaternion
+            # For quaternion (x,y,z,w), the Z-axis of the rotated frame is:
+            # z_axis = [2*(xz+wy), 2*(yz-wx), 1-2*(xx+yy)]
+            tool_z_x = 2*(qx*qz + qw*qy)
+            tool_z_y = 2*(qy*qz - qw*qx)
+            tool_z_z = 1 - 2*(qx*qx + qy*qy)
+            
+            # Wrist center is TCP position minus tool length along tool Z
+            wc_x = x - (d6 + tool_offset) * tool_z_x
+            wc_y = y - (d6 + tool_offset) * tool_z_y
+            wc_z = z - (d6 + tool_offset) * tool_z_z
+            
+            # J0 (shoulder pan): angle to point arm towards wrist center
+            # The shoulder_pan_joint frame (base_link_inertia) is rotated 180° from base_link
+            # So we compute the angle in base_link frame and add π
+            j0_base = math.atan2(wc_y, wc_x)
+            j0 = j0_base + math.pi
+            # Normalize to [-π, π]
+            while j0 > math.pi:
+                j0 -= 2 * math.pi
+            while j0 < -math.pi:
+                j0 += 2 * math.pi
+            
+            # Distance from base to wrist center in XY plane
+            r_wc = math.sqrt(wc_x**2 + wc_y**2)
+            
+            # Account for wrist offset (d4) perpendicular to arm plane
+            # For elbow-down configuration
+            r_arm = r_wc  # Simplified - full IK needs proper handling
+            
+            # Height of wrist center relative to shoulder
+            z_arm = wc_z - d1
+            
+            # Arm lengths for 2-link planar IK
+            L1 = abs(a2)  # Upper arm
+            L2 = abs(a3)  # Forearm (simplified, ignoring d4 for now)
+            
+            # Distance from shoulder to wrist center in arm plane
+            d_arm = math.sqrt(r_arm**2 + z_arm**2)
+            
+            # Check reachability
+            if d_arm > L1 + L2:
+                self.get_logger().debug(f"Target out of reach: d={d_arm:.3f} > max={L1+L2:.3f}")
+                return None
+            if d_arm < abs(L1 - L2) + 0.01:  # Small margin
+                self.get_logger().debug(f"Target too close: d={d_arm:.3f} < min={abs(L1-L2):.3f}")
+                return None
+            
+            # J2 (elbow): cosine rule for elbow angle
+            cos_j2 = (d_arm**2 - L1**2 - L2**2) / (2 * L1 * L2)
+            cos_j2 = np.clip(cos_j2, -1.0, 1.0)
+            j2 = -math.acos(cos_j2)  # Elbow-down configuration (negative)
+            
+            # J1 (shoulder lift): angle to reach wrist center
+            # Two angles: angle to target + angle from elbow geometry
+            alpha = math.atan2(z_arm, r_arm)  # Angle to wrist center
+            # Angle from triangle formed by L1, L2, d_arm
+            cos_beta = (d_arm**2 + L1**2 - L2**2) / (2 * d_arm * L1)
+            cos_beta = np.clip(cos_beta, -1.0, 1.0)
+            beta = math.acos(cos_beta)
+            # J1 in UR convention (0 is horizontal forward, negative is up)
+            j1 = -(alpha + beta)  # Shoulder lift
+            
+            # Wrist joints (j3, j4, j5) from end-effector orientation
+            # This is simplified - proper decomposition requires full FK
+            
+            # Extract RPY from quaternion for approximate wrist angles
+            # Roll (X), Pitch (Y), Yaw (Z) in intrinsic XYZ order
+            sinr_cosp = 2 * (qw * qx + qy * qz)
+            cosr_cosp = 1 - 2 * (qx * qx + qy * qy)
+            roll = math.atan2(sinr_cosp, cosr_cosp)
+            
+            sinp = 2 * (qw * qy - qz * qx)
+            sinp = np.clip(sinp, -1.0, 1.0)
+            pitch = math.asin(sinp)
+            
+            siny_cosp = 2 * (qw * qz + qx * qy)
+            cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
+            yaw = math.atan2(siny_cosp, cosy_cosp)
+            
+            # Approximate wrist decomposition
+            # J3 compensates for arm pose to achieve desired pitch
+            j3 = pitch - j1 - j2
+            
+            # J4 sets roll around wrist 2 axis
+            j4 = roll - math.pi/2
+            
+            # J5 sets final orientation around wrist 3 axis
+            j5 = yaw - j0_base
+            
+            # Normalize and clamp to UR5e joint limits
+            def normalize_angle(a):
+                while a > math.pi:
+                    a -= 2 * math.pi
+                while a < -math.pi:
+                    a += 2 * math.pi
+                return a
+            
+            j3 = normalize_angle(j3)
+            j4 = normalize_angle(j4)
+            j5 = normalize_angle(j5)
+            
+            # UR5e joint limits (from URDF)
+            # All joints: [-2π, 2π] except some have tighter practical limits
+            joints = [
+                float(np.clip(j0, -2*math.pi, 2*math.pi)),
+                float(np.clip(j1, -math.pi, 0)),           # Shoulder lift: [-π, 0]
+                float(np.clip(j2, -math.pi, math.pi)),     # Elbow
+                float(np.clip(j3, -2*math.pi, 2*math.pi)), # Wrist 1
+                float(np.clip(j4, -2*math.pi, 2*math.pi)), # Wrist 2
+                float(np.clip(j5, -2*math.pi, 2*math.pi)), # Wrist 3
+            ]
+            
+            self.get_logger().debug(f"Analytical IK: pos=({x:.3f},{y:.3f},{z:.3f}) -> joints={[f'{j:.2f}' for j in joints]}")
+            
+            return joints
+            
+        except Exception as e:
+            self.get_logger().warn(f"Analytical IK failed: {e}")
+            import traceback
+            self.get_logger().debug(traceback.format_exc())
+            return None
 
     def _generate_proto_sim_joints(
         self,
@@ -816,51 +1450,164 @@ class CommandGatewayNode(Node):
         target_joints: List[float],
         move_speed: float = 0.5,
         publish_rate: float = 50.0,
-    ) -> None:
+        require_collision_check: bool = True,
+    ) -> bool:
         """
         Execute simulated movement by interpolating joint positions
         and publishing JointState messages.
+        
+        If require_collision_check=True and MoveIt planning fails (collision detected),
+        the movement is REJECTED and False is returned. This ensures collision safety.
+        
+        Args:
+            target_joints: Target joint positions [j0, j1, j2, j3, j4, j5]
+            move_speed: Movement speed scale (0.1 to 1.0)
+            publish_rate: Rate to publish joint states (Hz)
+            require_collision_check: If True, REJECT movement if collision-free path cannot be found
+            
+        Returns:
+            True if movement was executed successfully, False if rejected due to collision
         """
         start_joints = np.array(self.sim_joint_positions)
         end_joints = np.array(target_joints)
         
-        # Calculate movement duration based on max joint change and speed
-        max_delta = np.max(np.abs(end_joints - start_joints))
-        # Scale duration: slower speed = longer duration
-        base_duration = max_delta / (math.pi * 0.5)  # ~2 seconds for 90 deg at speed=1.0
-        duration = base_duration / max(0.1, move_speed)
-        duration = max(0.2, min(duration, 5.0))  # Clamp between 0.2s and 5s
+        # Plan with collision checking via MoveIt 2
+        trajectory = None
+        planning_failed = False
+        if self._has_moveit and self.plan_motion_client:
+            try:
+                trajectory = self._plan_motion_moveit_sync(start_joints.tolist(), target_joints)
+                if trajectory:
+                    self.get_logger().info(f"MoveIt planned trajectory with {len(trajectory)} waypoints")
+                else:
+                    planning_failed = True
+                    self.get_logger().warn(f"MoveIt planning failed - no collision-free path found")
+            except Exception as e:
+                planning_failed = True
+                self.get_logger().warn(f"MoveIt planning failed: {e}")
+        else:
+            # MoveIt not available
+            if require_collision_check:
+                self.get_logger().error("Collision checking required but MoveIt is not available")
+                return False
         
-        self.get_logger().info(
-            f"Sim movement: duration={duration:.2f}s, max_delta={max_delta:.3f}rad"
-        )
+        # If collision checking is required and planning failed, REJECT the movement
+        if require_collision_check and planning_failed:
+            self.get_logger().warn("Movement REJECTED due to collision - no fallback to unchecked movement")
+            return False
         
-        # Interpolate and publish
-        dt = 1.0 / publish_rate
-        num_steps = int(duration * publish_rate)
-        
-        for step in range(num_steps + 1):
-            if self._proto_sim_stop_requested:
-                break
-            
-            t = step / max(1, num_steps)  # 0 to 1
-            # Smooth interpolation (ease in/out)
-            t_smooth = (1 - math.cos(t * math.pi)) / 2
-            
-            # Interpolate joints
-            current_joints = start_joints + (end_joints - start_joints) * t_smooth
-            self.sim_joint_positions = current_joints.tolist()
-            
-            # Publish joint state
-            self._publish_joint_state()
-            
-            await asyncio.sleep(dt)
+        if trajectory and len(trajectory) > 1:
+            # Execute planned trajectory (collision-free path)
+            await self._execute_trajectory(trajectory, publish_rate)
         
         # Ensure we end at target
         self.sim_joint_positions = target_joints
         self._publish_joint_state()
         
         self.get_logger().info(f"Sim movement complete, final joints: {[f'{j:.3f}' for j in target_joints]}")
+        return True
+
+    def _plan_motion_moveit_sync(
+        self,
+        start_joints: List[float],
+        target_joints: List[float],
+    ) -> Optional[List[List[float]]]:
+        """
+        Plan motion using MoveIt 2's planning service.
+        
+        Returns a list of joint waypoints if planning succeeds.
+        """
+        if not self.plan_motion_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn("MoveIt motion planning service not available")
+            return None
+        
+        try:
+            from moveit_msgs.srv import GetMotionPlan
+            from moveit_msgs.msg import RobotState, Constraints, JointConstraint, MoveItErrorCodes, MotionPlanRequest
+            from sensor_msgs.msg import JointState as JointStateMsg
+            
+            # Build motion plan request
+            request = GetMotionPlan.Request()
+            request.motion_plan_request.group_name = "ur_manipulator"
+            request.motion_plan_request.num_planning_attempts = 10
+            request.motion_plan_request.allowed_planning_time = 5.0
+            request.motion_plan_request.max_velocity_scaling_factor = 0.5
+            request.motion_plan_request.max_acceleration_scaling_factor = 0.5
+            
+            # Set start state from current joint positions
+            start_state = RobotState()
+            start_state.joint_state.header.stamp = self.get_clock().now().to_msg()
+            start_state.joint_state.name = self.sim_joint_names
+            start_state.joint_state.position = start_joints
+            start_state.is_diff = False  # Full state, not a diff
+            request.motion_plan_request.start_state = start_state
+            
+            # Set workspace bounds to help OMPL
+            from moveit_msgs.msg import WorkspaceParameters
+            request.motion_plan_request.workspace_parameters.header.frame_id = "base_link"
+            request.motion_plan_request.workspace_parameters.min_corner.x = -2.0
+            request.motion_plan_request.workspace_parameters.min_corner.y = -2.0
+            request.motion_plan_request.workspace_parameters.min_corner.z = -0.5
+            request.motion_plan_request.workspace_parameters.max_corner.x = 2.0
+            request.motion_plan_request.workspace_parameters.max_corner.y = 2.0
+            request.motion_plan_request.workspace_parameters.max_corner.z = 3.0
+            
+            # Set goal constraints
+            goal_constraints = Constraints()
+            for i, (name, pos) in enumerate(zip(self.sim_joint_names, target_joints)):
+                jc = JointConstraint()
+                jc.joint_name = name
+                jc.position = pos
+                jc.tolerance_above = 0.01
+                jc.tolerance_below = 0.01
+                jc.weight = 1.0
+                goal_constraints.joint_constraints.append(jc)
+            request.motion_plan_request.goal_constraints.append(goal_constraints)
+            
+            # Call the service
+            future = self.plan_motion_client.call_async(request)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
+            
+            if future.done():
+                response = future.result()
+                if response.motion_plan_response.error_code.val == MoveItErrorCodes.SUCCESS:
+                    # Extract waypoints from trajectory
+                    trajectory = response.motion_plan_response.trajectory.joint_trajectory
+                    waypoints = []
+                    for point in trajectory.points:
+                        waypoints.append(list(point.positions))
+                    return waypoints
+                else:
+                    self.get_logger().debug(f"MoveIt planning error: {response.motion_plan_response.error_code.val}")
+            
+            return None
+            
+        except Exception as e:
+            self.get_logger().warn(f"MoveIt planning call failed: {e}")
+            return None
+
+    async def _execute_trajectory(
+        self,
+        waypoints: List[List[float]],
+        publish_rate: float = 50.0,
+    ) -> None:
+        """
+        Execute a trajectory by publishing waypoints at the given rate.
+        """
+        if not waypoints:
+            return
+        
+        # Calculate time per waypoint (simple linear timing)
+        total_duration = 2.0  # Total trajectory time
+        dt = total_duration / len(waypoints)
+        
+        for waypoint in waypoints:
+            if self._proto_sim_stop_requested:
+                break
+            
+            self.sim_joint_positions = waypoint
+            self._publish_joint_state()
+            await asyncio.sleep(dt)
 
     def _publish_joint_state(self) -> None:
         """Publish current simulated joint state."""

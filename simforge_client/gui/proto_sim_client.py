@@ -2,8 +2,14 @@
 Proto-Sim Client UI
 
 wxPython interface for protocol simulation that works with the distributed architecture.
-Similar to simforge_new/interfaces/gui/proto_sim.py but communicates via WebSocket
-instead of directly controlling Genesis.
+Generates poses locally on macOS and sends them to the server in base_link frame.
+
+Architecture:
+- Client fetches environment geometry (TF data) from server
+- Client generates poses locally using spherical coordinate sampling
+- Client transforms poses to robot's base_link frame
+- Client sends pre-computed poses to server
+- Server executes poses with collision checking (rejects unsafe poses)
 
 Features:
 - Protocol parameter input (pose sampling) matching simforge_new exactly
@@ -21,7 +27,7 @@ import logging
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional, Callable, Tuple
 from dataclasses import dataclass
 
 try:
@@ -32,6 +38,11 @@ except ImportError:
     wx = None
 
 from simforge_client.command_client import SimforgeClient, MoveResult, MoveFeedback, Pose
+from simforge_client.utils.pose_generation import (
+    ProtoSimParameters as PoseGenParams,
+    generate_world_poses,
+    count_poses,
+)
 
 
 LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
@@ -202,6 +213,8 @@ class ProtoSimClientFrame(wx.Frame):
         # Available robots and objects (fetched from server)
         self._robots: List[str] = []
         self._objects: List[str] = []
+        # Object transforms in base_link frame (for local pose generation)
+        self._object_transforms: Dict[str, Optional[Dict]] = {}
         
         # Parameter controls
         self.parameter_controls: Dict[str, ParameterInputControl] = {}
@@ -500,7 +513,7 @@ class ProtoSimClientFrame(wx.Frame):
         self._log("Disconnected")
     
     async def _fetch_environment_info(self) -> None:
-        """Fetch available robots and objects from server."""
+        """Fetch available robots, objects, and their transforms from server."""
         if not self._client:
             return
         
@@ -511,11 +524,19 @@ class ProtoSimClientFrame(wx.Frame):
             if response.get("success"):
                 self._robots = response.get("robots", [])
                 self._objects = response.get("objects", [])
+                # Store object transforms for local pose generation
+                self._object_transforms = response.get("object_transforms", {})
                 
                 wx.CallAfter(self._update_robot_choices)
                 wx.CallAfter(self._update_object_choices)
                 
                 self._log(f"Found {len(self._robots)} robots, {len(self._objects)} objects")
+                
+                # Log available transforms
+                for obj, tf in self._object_transforms.items():
+                    if tf:
+                        pos = tf.get('position', [0, 0, 0])
+                        self._log(f"  {obj}: pos=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
             else:
                 self._log(f"Failed to get environment info: {response.get('error', 'Unknown error')}")
                 
@@ -594,41 +615,77 @@ class ProtoSimClientFrame(wx.Frame):
         params: ProtoSimParameters,
         mode: str,
     ) -> None:
-        """Execute the protocol simulation."""
+        """Execute the protocol simulation with client-side pose generation."""
         try:
-            # Calculate timeout based on number of poses
-            # Each pose takes ~3-5s (move + idle time), add buffer
-            total_poses = (
-                len(params.horiz) * len(params.vert) * len(params.distance) *
-                len(params.roll) * len(params.pitch) * len(params.yaw)
+            # Get target object transform for local pose generation
+            target_tf = self._object_transforms.get(target_object)
+            if not target_tf:
+                self._log(f"Error: No transform available for {target_object}")
+                self._log("Refreshing environment info...")
+                await self._fetch_environment_info()
+                target_tf = self._object_transforms.get(target_object)
+                if not target_tf:
+                    self._log(f"Error: Still no transform for {target_object}. Aborting.")
+                    return
+            
+            target_position = tuple(target_tf['position'])
+            target_orientation = tuple(target_tf['orientation'])
+            
+            self._log(f"Target {target_object} at: ({target_position[0]:.3f}, {target_position[1]:.3f}, {target_position[2]:.3f})")
+            
+            # Generate poses locally using pose_generation module
+            pose_params = PoseGenParams(
+                horiz=params.horiz,
+                vert=params.vert,
+                distance=params.distance,
+                roll=params.roll,
+                pitch=params.pitch,
+                yaw=params.yaw,
             )
-            timeout_per_pose = params.idle_time + 3.0  # idle + movement time
-            timeout = max(120.0, total_poses * timeout_per_pose + 60.0)  # Min 2min, plus 1min buffer
             
-            self._log(f"Timeout set to {timeout:.0f}s for {total_poses} poses")
+            world_poses = generate_world_poses(
+                pose_params,
+                target_position,
+                target_orientation,
+                randomize=params.randomize,
+            )
             
+            total_poses = len(world_poses)
+            self._log(f"Generated {total_poses} poses locally in base_link frame")
+            
+            # Convert WorldPose objects to dicts for JSON serialization
+            poses_data = [pose.to_dict() for pose in world_poses]
+            
+            # Calculate timeout
+            timeout_per_pose = params.idle_time + 3.0
+            timeout = max(120.0, total_poses * timeout_per_pose + 60.0)
+            
+            self._log(f"Sending poses to server (timeout: {timeout:.0f}s)")
+            
+            # Send pre-computed poses to server
             response = await self._client.call_rpc("run_proto_sim", {
                 "robot_name": robot,
-                "target_object": target_object,
-                # Send parameters matching simforge_new structure
-                "horiz": params.horiz,
-                "vert": params.vert,
-                "distance": params.distance,
-                "roll": params.roll,
-                "pitch": params.pitch,
-                "yaw": params.yaw,
+                "poses": poses_data,  # NEW: Pre-computed poses in base_link frame
                 "idle_time": params.idle_time,
-                "randomize": params.randomize,
                 "mode": mode,
             }, timeout=timeout)
             
             if response.get("success"):
-                self._log(f"Protocol completed: {response.get('message', 'OK')}")
+                completed = response.get('completed', 0)
+                collision_rejected = response.get('collision_rejected', 0)
+                ik_failed = response.get('ik_failed', 0)
+                self._log(f"Protocol completed: {completed}/{total_poses} poses")
+                if collision_rejected > 0:
+                    self._log(f"  Collision rejected: {collision_rejected}")
+                if ik_failed > 0:
+                    self._log(f"  IK failed: {ik_failed}")
             else:
                 self._log(f"Protocol failed: {response.get('error', 'Unknown error')}")
                 
         except Exception as e:
             self._log(f"Protocol error: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
         finally:
             self._running_simulation = False
             wx.CallAfter(self.start_btn.Enable, True)
