@@ -854,15 +854,15 @@ class CommandGatewayNode(Node):
                 
                 completed += 1
         
-        # After all poses, smoothly return to home position
-        if mode in ('simulation', 'both') and not self._proto_sim_stop_requested:
-            self.get_logger().info("Returning to home position...")
-            home_position = [0.0, -math.pi/2, 0.0, -math.pi/2, 0.0, 0.0]
-            await self._execute_sim_movement(
-                home_position,
-                move_speed=move_speed,
-                require_collision_check=True,
-            )
+            # After all poses, smoothly return to home position
+            if mode in ('simulation', 'both') and not self._proto_sim_stop_requested:
+                self.get_logger().info("Returning to home position...")
+                home_position = [0.0, -math.pi/2, 0.0, -math.pi/2, 0.0, 0.0]
+                await self._execute_sim_movement(
+                    home_position,
+                    move_speed=move_speed,
+                    require_collision_check=True,
+                )
                 
         finally:
             self._proto_sim_running = False
