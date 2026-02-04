@@ -152,6 +152,10 @@ class SimforgeClient:
         self._state = ConnectionState.DISCONNECTED
         self._reconnect_attempts: int = 0
         
+        # Lock to prevent concurrent recv() calls
+        self._recv_lock = asyncio.Lock()
+        self._is_reconnecting = False
+        
         # Callbacks
         self._feedback_callbacks: Dict[str, Callable[[MoveFeedback], None]] = {}
         self._state_callbacks: List[Callable[[ConnectionState], None]] = []
@@ -209,8 +213,9 @@ class SimforgeClient:
             # Try connecting - websockets API varies between versions
             try:
                 # Try with ping parameters (websockets 10.x style)
+                # Use long ping_timeout to handle slow MoveIt planning operations
                 self._ws = await asyncio.wait_for(
-                    ws_connect(self.server_uri, ping_interval=20, ping_timeout=10, **connect_kwargs),
+                    ws_connect(self.server_uri, ping_interval=30, ping_timeout=300, **connect_kwargs),
                     timeout=self.config.connection_timeout_sec
                 )
             except TypeError:
@@ -224,9 +229,11 @@ class SimforgeClient:
             self._reconnect_attempts = 0
             self._notify_state_change()
             
-            # Start background tasks
-            self._heartbeat_task = asyncio.create_task(self._send_heartbeat())
-            self._receiver_task = asyncio.create_task(self._receive_messages())
+            # Start background tasks only if not already running
+            if not self._heartbeat_task or self._heartbeat_task.done():
+                self._heartbeat_task = asyncio.create_task(self._send_heartbeat())
+            if not self._receiver_task or self._receiver_task.done():
+                self._receiver_task = asyncio.create_task(self._receive_messages())
             
             logger.info(f"Connected to {self.server_uri}")
             return True
@@ -302,11 +309,16 @@ class SimforgeClient:
         """Receive and dispatch messages from server."""
         while True:
             try:
-                if not self._ws:
+                if not self._ws or self._is_reconnecting:
                     await asyncio.sleep(0.1)
                     continue
                 
-                message = await self._ws.recv()
+                # Use lock to prevent concurrent recv() calls
+                async with self._recv_lock:
+                    if not self._ws:  # Check again after acquiring lock
+                        continue
+                    message = await self._ws.recv()
+                
                 msg = json.loads(message)
                 
                 msg_type = msg.get("type", "")
@@ -343,9 +355,40 @@ class SimforgeClient:
         if self._state == ConnectionState.DISCONNECTED:
             return
         
+        # Prevent multiple concurrent reconnection attempts
+        if self._is_reconnecting:
+            return
+        self._is_reconnecting = True
+        
         self._state = ConnectionState.RECONNECTING
         self._notify_state_change()
         
+        # Cancel existing tasks before reconnecting
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
+        
+        if self._receiver_task and not self._receiver_task.done():
+            self._receiver_task.cancel()
+            try:
+                await self._receiver_task
+            except asyncio.CancelledError:
+                pass
+            self._receiver_task = None
+        
+        # Close old websocket
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        
+        # Attempt reconnection
         while self._reconnect_attempts < self.config.max_reconnect_attempts:
             self._reconnect_attempts += 1
             logger.info(
@@ -355,11 +398,15 @@ class SimforgeClient:
             
             await asyncio.sleep(self.config.reconnect_delay_sec)
             
+            # Reset reconnecting flag before connect() so it can start tasks
+            self._is_reconnecting = False
             if await self.connect():
                 return
+            self._is_reconnecting = True  # Set again if connect failed
         
         logger.error("Max reconnection attempts reached")
         self._state = ConnectionState.DISCONNECTED
+        self._is_reconnecting = False
         self._notify_state_change()
 
     def _handle_feedback(self, msg: Dict[str, Any]):

@@ -559,7 +559,9 @@ class CommandGatewayNode(Node):
             if method == 'get_environment_info':
                 result = await self.rpc_get_environment_info(params)
             elif method == 'run_proto_sim':
-                result = await self.rpc_run_proto_sim(client, request_id, params)
+                # Run long-running proto_sim in a separate task to not block message processing
+                # This allows heartbeats to continue being processed
+                asyncio.create_task(self.rpc_run_proto_sim(client, request_id, params))
                 return  # run_proto_sim sends its own responses
             elif method == 'stop_proto_sim':
                 result = await self.rpc_stop_proto_sim(params)
