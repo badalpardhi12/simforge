@@ -1474,13 +1474,14 @@ class CommandGatewayNode(Node):
         end_joints = np.array(target_joints)
         
         # Plan with collision checking via MoveIt 2
-        trajectory = None
+        trajectory_data = None
         planning_failed = False
         if self._has_moveit and self.plan_motion_client:
             try:
-                trajectory = self._plan_motion_moveit_sync(start_joints.tolist(), target_joints)
-                if trajectory:
-                    self.get_logger().info(f"MoveIt planned trajectory with {len(trajectory)} waypoints")
+                trajectory_data = self._plan_motion_moveit_sync(start_joints.tolist(), target_joints)
+                if trajectory_data:
+                    waypoints = trajectory_data.get('waypoints', [])
+                    self.get_logger().info(f"MoveIt planned trajectory with {len(waypoints)} waypoints")
                 else:
                     planning_failed = True
                     self.get_logger().warn(f"MoveIt planning failed - no collision-free path found")
@@ -1498,9 +1499,9 @@ class CommandGatewayNode(Node):
             self.get_logger().warn("Movement REJECTED due to collision - no fallback to unchecked movement")
             return False
         
-        if trajectory and len(trajectory) > 1:
-            # Execute planned trajectory (collision-free path)
-            await self._execute_trajectory(trajectory, publish_rate)
+        if trajectory_data and len(trajectory_data.get('waypoints', [])) > 1:
+            # Execute planned trajectory (collision-free path) with smooth interpolation
+            await self._execute_trajectory(trajectory_data, publish_rate)
         
         # Ensure we end at target
         self.sim_joint_positions = target_joints
@@ -1513,11 +1514,15 @@ class CommandGatewayNode(Node):
         self,
         start_joints: List[float],
         target_joints: List[float],
-    ) -> Optional[List[List[float]]]:
+    ) -> Optional[Dict[str, Any]]:
         """
         Plan motion using MoveIt 2's planning service.
         
-        Returns a list of joint waypoints if planning succeeds.
+        Returns a dict with:
+        - 'waypoints': List of joint position waypoints
+        - 'time_from_start': List of time_from_start for each waypoint (seconds)
+        
+        Uses multiple planning attempts for reliability with RRTConnect.
         """
         if not self.plan_motion_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn("MoveIt motion planning service not available")
@@ -1531,8 +1536,9 @@ class CommandGatewayNode(Node):
             # Build motion plan request
             request = GetMotionPlan.Request()
             request.motion_plan_request.group_name = "ur_manipulator"
-            request.motion_plan_request.num_planning_attempts = 10
-            request.motion_plan_request.allowed_planning_time = 5.0
+            # Increased planning attempts and time for better reliability
+            request.motion_plan_request.num_planning_attempts = 20
+            request.motion_plan_request.allowed_planning_time = 10.0
             request.motion_plan_request.max_velocity_scaling_factor = 0.5
             request.motion_plan_request.max_acceleration_scaling_factor = 0.5
             
@@ -1566,19 +1572,26 @@ class CommandGatewayNode(Node):
                 goal_constraints.joint_constraints.append(jc)
             request.motion_plan_request.goal_constraints.append(goal_constraints)
             
-            # Call the service
+            # Call the service - increase timeout for more planning attempts
             future = self.plan_motion_client.call_async(request)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=15.0)
             
             if future.done():
                 response = future.result()
                 if response.motion_plan_response.error_code.val == MoveItErrorCodes.SUCCESS:
-                    # Extract waypoints from trajectory
+                    # Extract waypoints and timing from trajectory
                     trajectory = response.motion_plan_response.trajectory.joint_trajectory
                     waypoints = []
+                    time_from_start = []
                     for point in trajectory.points:
                         waypoints.append(list(point.positions))
-                    return waypoints
+                        # Convert ROS duration to seconds
+                        t = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
+                        time_from_start.append(t)
+                    return {
+                        'waypoints': waypoints,
+                        'time_from_start': time_from_start,
+                    }
                 else:
                     self.get_logger().debug(f"MoveIt planning error: {response.motion_plan_response.error_code.val}")
             
@@ -1590,26 +1603,76 @@ class CommandGatewayNode(Node):
 
     async def _execute_trajectory(
         self,
-        waypoints: List[List[float]],
+        trajectory_data: Dict[str, Any],
         publish_rate: float = 50.0,
     ) -> None:
         """
-        Execute a trajectory by publishing waypoints at the given rate.
+        Execute a trajectory by publishing joint states at the specified rate.
+        
+        Uses MoveIt's computed trajectory timing for smooth, consistent motion.
+        Interpolates between waypoints for high-frequency publishing to Foxglove.
         """
+        waypoints = trajectory_data.get('waypoints', [])
+        time_from_start = trajectory_data.get('time_from_start', [])
+        
         if not waypoints:
             return
         
-        # Calculate time per waypoint (simple linear timing)
-        total_duration = 2.0  # Total trajectory time
-        dt = total_duration / len(waypoints)
+        # If no timing info, use simple linear interpolation
+        if not time_from_start or len(time_from_start) != len(waypoints):
+            total_duration = 2.0
+            time_from_start = [i * total_duration / max(1, len(waypoints) - 1) for i in range(len(waypoints))]
         
-        for waypoint in waypoints:
+        # Total trajectory duration from MoveIt
+        total_duration = time_from_start[-1] if time_from_start else 2.0
+        total_duration = max(0.5, total_duration)  # Minimum 0.5s duration
+        
+        # Publish at a fixed rate (e.g., 50Hz) for smooth visualization
+        dt = 1.0 / publish_rate
+        num_samples = max(1, int(total_duration * publish_rate))
+        
+        start_time = asyncio.get_event_loop().time()
+        
+        for sample_idx in range(num_samples):
             if self._proto_sim_stop_requested:
                 break
             
-            self.sim_joint_positions = waypoint
+            # Current time in trajectory
+            t = sample_idx * dt
+            
+            # Find which segment we're in
+            segment_idx = 0
+            for i in range(len(time_from_start) - 1):
+                if t >= time_from_start[i]:
+                    segment_idx = i
+                else:
+                    break
+            
+            # Interpolate within segment
+            if segment_idx < len(waypoints) - 1:
+                t0 = time_from_start[segment_idx]
+                t1 = time_from_start[segment_idx + 1]
+                segment_duration = t1 - t0
+                if segment_duration > 0:
+                    alpha = min(1.0, max(0.0, (t - t0) / segment_duration))
+                else:
+                    alpha = 1.0
+                
+                wp0 = np.array(waypoints[segment_idx])
+                wp1 = np.array(waypoints[segment_idx + 1])
+                interpolated = wp0 + alpha * (wp1 - wp0)
+                self.sim_joint_positions = interpolated.tolist()
+            else:
+                self.sim_joint_positions = waypoints[-1]
+            
             self._publish_joint_state()
-            await asyncio.sleep(dt)
+            
+            # Wait to maintain publish rate
+            elapsed = asyncio.get_event_loop().time() - start_time
+            target_time = (sample_idx + 1) * dt
+            sleep_time = target_time - elapsed
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
 
     def _publish_joint_state(self) -> None:
         """Publish current simulated joint state."""
