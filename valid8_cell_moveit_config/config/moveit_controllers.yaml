@@ -1,0 +1,34 @@
+# MoveIt Controllers Configuration for Valid8 Cell
+#
+# This file configures which ros2_control controllers MoveIt should use
+# for trajectory execution.
+#
+# For UR robots, use the scaled_joint_trajectory_controller which
+# respects the speed scaling on the teach pendant.
+#
+# Reference: https://docs.universal-robots.com/Universal_Robots_ROS_Documentation/doc/ur_tutorials/my_robot_cell/doc/build_moveit_config.html
+
+# Controller manager to use
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+# Controllers definition
+moveit_simple_controller_manager:
+  controller_names:
+    - scaled_joint_trajectory_controller
+    
+  scaled_joint_trajectory_controller:
+    # Action namespace (must match ros2_control controller)
+    action_ns: follow_joint_trajectory
+    
+    # Controller type
+    type: FollowJointTrajectory
+    
+    # Joints controlled by this controller
+    # Note: If using tf_prefix, prepend it to joint names
+    joints:
+      - shoulder_pan_joint
+      - shoulder_lift_joint
+      - elbow_joint
+      - wrist_1_joint
+      - wrist_2_joint
+      - wrist_3_joint

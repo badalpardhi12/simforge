@@ -21,7 +21,8 @@ import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition, UnlessCondition
-from launch.substitutions import LaunchConfiguration, PythonExpression, Command
+from launch.substitutions import LaunchConfiguration, PythonExpression, Command, PathJoinSubstitution
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from ament_index_python.packages import get_package_share_directory
@@ -76,6 +77,18 @@ def generate_launch_description():
         description='Enable perception node'
     )
     
+    use_ur_driver_arg = DeclareLaunchArgument(
+        'use_ur_driver',
+        default_value='true',
+        description='Enable UR Robot Driver for real robot trajectory control'
+    )
+    
+    ur_type_arg = DeclareLaunchArgument(
+        'ur_type',
+        default_value='ur5e',
+        description='Type of UR robot (ur3e, ur5e, ur10e, ur16e, ur20, ur30)'
+    )
+    
     # Default URDF path - combined environment URDF with robot, table, and face
     default_urdf = os.path.join(pkg_share, 'assets', 'valid8_environment.urdf')
     
@@ -94,6 +107,8 @@ def generate_launch_description():
     urdf_path = LaunchConfiguration('urdf_path')
     use_vla = LaunchConfiguration('use_vla')
     use_perception = LaunchConfiguration('use_perception')
+    use_ur_driver = LaunchConfiguration('use_ur_driver')
+    ur_type = LaunchConfiguration('ur_type')
     
     # === Nodes ===
     
@@ -114,6 +129,7 @@ def generate_launch_description():
     )
     
     # 2. Robot Control (v2 - uses Dashboard + Secondary/Realtime interfaces)
+    # This is used when UR driver is NOT enabled (fallback mode)
     robot_control_node = Node(
         package='simforge_server',
         executable='robot_control_node_v2.py',
@@ -125,10 +141,39 @@ def generate_launch_description():
             'state_publish_rate': 50.0,
             'simulation_mode': simulation_mode,
         }],
+        condition=UnlessCondition(use_ur_driver),
+    )
+    
+    # 2a. UR Robot Driver (preferred for real robot trajectory control)
+    # This launches the official Universal Robots ROS 2 driver which provides:
+    # - scaled_joint_trajectory_controller for proper trajectory execution
+    # - Joint state publishing at high frequency
+    # - Dashboard communication
+    # - headless_mode for programmatic control without URCap
+    # NOTE: We use tf_prefix='ur_' to avoid TF conflicts with our valid8_environment.urdf
+    # The UR driver publishes world -> base_link at origin, but we need robot on the table
+    ur_robot_driver_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            PathJoinSubstitution([
+                get_package_share_directory('ur_robot_driver'),
+                'launch',
+                'ur_control.launch.py'
+            ])
+        ]),
+        launch_arguments={
+            'ur_type': ur_type,
+            'robot_ip': robot_ip,
+            'headless_mode': 'true',  # No URCap needed
+            'launch_rviz': 'false',   # We use Foxglove instead
+            'initial_joint_controller': 'scaled_joint_trajectory_controller',
+            'tf_prefix': '',  # Keep empty to use standard frame names
+        }.items(),
+        condition=IfCondition(use_ur_driver),
     )
     
     # 2b. Robot State Publisher (publishes TF transforms from joint_states + combined URDF)
     # This single publisher handles the robot, table, and face - all in one URDF
+    # Only used when NOT using UR driver (UR driver has its own robot_state_publisher)
     robot_state_publisher_node = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
@@ -141,6 +186,97 @@ def generate_launch_description():
             ),
             'publish_frequency': 50.0,
         }],
+        condition=UnlessCondition(use_ur_driver),
+    )
+    
+    # 2b-alt. When using UR driver, we need static transforms to position environment elements
+    # relative to the UR driver's TF tree. The UR driver publishes world -> base_link at origin.
+    # We connect our environment elements (table, face) to the UR driver's base_link frame
+    # using the inverse of the robot's offset from valid8_environment.urdf
+    
+    # Static transform: base_link -> table_link 
+    # Robot is at [-0.6758, 0, 1.03] relative to table origin in valid8_environment.urdf
+    # So table is at [0.6758, 0, -1.03] relative to base_link, then add table's z offset (1.0m)
+    # Table position relative to base_link: [0.6758, 0, 1.0 - 1.03] = [0.6758, 0, -0.03]
+    # Also need to account for robot's -90° yaw: rotate positions
+    # With -90° yaw (robot facing -Y), X->Y and Y->-X
+    # So table at world [0,0,1] with robot at world [-0.6758, 0, 1.03] facing -Y:
+    # In robot's base_link frame: table is at [0 - (-0.6758), 0 - 0, 1.0 - 1.03] = [0.6758, 0, -0.03]
+    # But with the yaw rotation... let me just use world as the parent
+    
+    # Actually, the simplest fix is to NOT fight the UR driver.
+    # The UR driver puts the robot at origin. Let's position our environment relative to the robot.
+    
+    # Table position: If robot base is at world origin, and in our setup robot was at [-0.6758, 0, 1.03],
+    # then table (which was at [0, 0, 1.0]) is at [0.6758, 0, -0.03] relative to robot
+    # But we need to transform this by the robot's yaw (-90°):
+    # After -90° yaw: x' = y, y' = -x -> [0, -0.6758, -0.03]? No that's wrong.
+    # Let's just use world frame from UR driver and position elements there
+    
+    # UR driver's world frame is at origin. We want:
+    # - Robot base_link at origin (UR driver handles this)
+    # - Table at position relative to where robot was in our setup
+    # 
+    # In valid8_environment.urdf:
+    # - table_link at [0, 0, 1.0] in world
+    # - base_link at [-0.6758, 0, 1.03] with -90° yaw in world
+    # - face_link at [0.1742, 0, 1.6] with 90° yaw in world
+    #
+    # When UR driver puts robot at origin (0,0,0) with 0° yaw:
+    # The robot's base_link is at the table surface height (1.03m above floor).
+    # We need to position environment elements relative to this new origin.
+    #
+    # Original relative positions (robot at [-0.6758, 0, 1.03] with -90° yaw):
+    # - Table center at [0, 0, 1.0] -> offset from robot: [0.6758, 0, -0.03]
+    # - Face at [0.1742, 0, 1.6] -> offset from robot: [0.85, 0, 0.57]
+    #
+    # With robot yaw at -90°, the robot was facing -Y direction.
+    # The table is "to the right" (+X) of robot and "behind" (+Y) relative to robot facing.
+    # Face is "in front" and "to the right" (+X) of robot.
+    #
+    # When UR driver puts robot facing +X (0° yaw):
+    # - Table stays at [0.6758, 0, -0.03] (directly to the right of robot base)
+    # - Face at [0.85, 0, 0.57] with 90° yaw
+    #
+    # But we also need to account for the robot's original -90° yaw.
+    # The face was positioned for the robot facing -Y. With robot now facing +X,
+    # the face position needs to rotate by -90° around Z axis.
+    # Rotation: x' = x*cos(-90°) - y*sin(-90°) = y, y' = x*sin(-90°) + y*cos(-90°) = -x
+    # Face [0.85, 0] becomes [0, -0.85] - but this seems wrong for in front of robot
+    #
+    # Actually, let's keep it simple and position things for the UR driver:
+    # - Robot base_link at origin, table is BELOW (-Z) by ~1.03m
+    # - Face is in front of the robot (+X direction), at a reasonable height
+    
+    # Table: Positioned below and slightly in front of the robot
+    # The table surface should be at Z=0 (where robot base sits)
+    # Table visual origin is at its center, so we put table_link at z=-0.03 (table surface ~3cm below robot base)
+    optical_table_static_tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='optical_table_static_tf',
+        arguments=[
+            '--x', '0.3', '--y', '0', '--z', '-0.03',
+            '--frame-id', 'base_link', '--child-frame-id', 'table_link'
+        ],
+        output='screen',
+        condition=IfCondition(use_ur_driver),
+    )
+    
+    # Face: Positioned in front of the robot's typical working area
+    # About 0.5m in front (+X) and at head height relative to table (~0.6m above robot base)
+    # Face oriented to face the robot (yaw = 180° = 3.14159)
+    face_static_tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='face_static_tf',
+        arguments=[
+            '--x', '0.85', '--y', '0', '--z', '0.57',
+            '--roll', '0', '--pitch', '0', '--yaw', '3.14159',
+            '--frame-id', 'base_link', '--child-frame-id', 'face_link'
+        ],
+        output='screen',
+        condition=IfCondition(use_ur_driver),
     )
     
     # 2c. Static Transform Republisher (republishes /tf_static to /tf for Foxglove)
@@ -332,17 +468,22 @@ def generate_launch_description():
         foxglove_port_arg,
         use_vla_arg,
         use_perception_arg,
+        use_ur_driver_arg,
+        ur_type_arg,
         urdf_path_arg,
         
         # Nodes (in dependency order)
         safety_watchdog_node,
-        robot_control_node,
-        robot_state_publisher_node,  # Publishes TF from joint_states + combined URDF
-        static_tf_republisher,       # Republishes static TFs to /tf for Foxglove
+        robot_control_node,           # Only when use_ur_driver:=false
+        ur_robot_driver_launch,       # Only when use_ur_driver:=true
+        robot_state_publisher_node,   # Publishes TF from joint_states + combined URDF (only when NOT using UR driver)
+        optical_table_static_tf,      # Optical table frame (only when using UR driver)
+        face_static_tf,               # Face frame (only when using UR driver)
+        static_tf_republisher,        # Republishes static TFs to /tf for Foxglove
         command_gateway_node,
         perception_node,
         vla_inference_node,
         orchestrator_node,
-        move_group_node,             # MoveIt 2 for IK and path planning
+        move_group_node,              # MoveIt 2 for IK and path planning
         foxglove_bridge_node,
     ])

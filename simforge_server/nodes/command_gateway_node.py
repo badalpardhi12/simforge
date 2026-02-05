@@ -32,8 +32,23 @@ from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import String, Header
 from std_srvs.srv import Trigger
 from geometry_msgs.msg import Pose, Point, Quaternion
-from trajectory_msgs.msg import JointTrajectory
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from sensor_msgs.msg import JointState
+
+# Import FollowJointTrajectory action for UR robot driver
+from rclpy.action import ActionClient
+try:
+    from control_msgs.action import FollowJointTrajectory
+    HAS_FOLLOW_JOINT_TRAJECTORY = True
+except ImportError:
+    HAS_FOLLOW_JOINT_TRAJECTORY = False
+
+# Import custom messages for real robot control
+try:
+    from simforge_msgs.srv import MoveJoints
+    HAS_MOVE_JOINTS = True
+except ImportError:
+    HAS_MOVE_JOINTS = False
 
 import tf2_ros
 from tf2_ros import Buffer, TransformListener
@@ -277,6 +292,31 @@ class CommandGatewayNode(Node):
             '/robot/protective_stop',
             callback_group=self.callback_group
         )
+        
+        # Real robot MoveJoints service client
+        if HAS_MOVE_JOINTS:
+            self.move_joints_client = self.create_client(
+                MoveJoints,
+                '/robot/move_joints',
+                callback_group=self.callback_group
+            )
+            self.get_logger().info("MoveJoints service client initialized for real robot control")
+        else:
+            self.move_joints_client = None
+            self.get_logger().warn("MoveJoints service not available - real robot control disabled")
+        
+        # FollowJointTrajectory action client for UR Robot Driver
+        # This is the preferred method for controlling the real robot with proper trajectory execution
+        self.follow_trajectory_client = None
+        if HAS_FOLLOW_JOINT_TRAJECTORY:
+            # Try scaled_joint_trajectory_controller first (UR driver default), then fall back to joint_trajectory_controller
+            self.follow_trajectory_client = ActionClient(
+                self,
+                FollowJointTrajectory,
+                '/scaled_joint_trajectory_controller/follow_joint_trajectory',
+                callback_group=self.callback_group
+            )
+            self.get_logger().info("FollowJointTrajectory action client initialized for UR robot driver")
         
         # === Register default robot ===
         self.register_robot(self.default_robot)
@@ -813,27 +853,69 @@ class CommandGatewayNode(Node):
                     'status': 'moving',
                 })
                 
-                # Execute movement with COLLISION CHECKING - movement is REJECTED if collision detected
-                if mode in ('simulation', 'both'):
-                    self.get_logger().info(f"Moving to joints: {[f'{j:.2f}' for j in target_joints]}")
-                    movement_success = await self._execute_sim_movement(
-                        target_joints, 
-                        move_speed=move_speed,
-                        require_collision_check=True,  # IMPORTANT: Reject if collision
+                # Execute movement with COLLISION CHECKING
+                # First, plan the trajectory with MoveIt (this gives us timing)
+                sim_success = True
+                real_success = True
+                trajectory_data = None
+                
+                self.get_logger().info(f"Moving to joints: {[f'{j:.2f}' for j in target_joints]}")
+                
+                # Plan trajectory first (needed for both simulation and real robot)
+                if self._has_moveit and self.plan_motion_client:
+                    try:
+                        trajectory_data = self._plan_motion_moveit_sync(
+                            self.sim_joint_positions, target_joints
+                        )
+                        if trajectory_data:
+                            waypoints = trajectory_data.get('waypoints', [])
+                            self.get_logger().info(f"MoveIt planned {len(waypoints)} waypoints")
+                        else:
+                            self.get_logger().warn("MoveIt planning failed - no collision-free path")
+                    except Exception as e:
+                        self.get_logger().warn(f"MoveIt planning error: {e}")
+                
+                # If planning failed and we require collision check, reject this pose
+                if trajectory_data is None:
+                    self.get_logger().warn(f"Pose {pose_name} REJECTED due to collision")
+                    collision_rejected += 1
+                    await safe_send_feedback({
+                        'type': 'rpc_feedback',
+                        'request_id': request_id,
+                        'current_pose_index': i,
+                        'total_poses': total_poses,
+                        'current_pose_name': pose_name,
+                        'status': 'collision_rejected',
+                    })
+                    continue
+                
+                # For 'both' mode: Send trajectory to real robot FIRST (non-blocking),
+                # then execute simulation. Both will use the SAME trajectory.
+                if mode == 'both':
+                    self.get_logger().info("Sending trajectory to real robot (via UR driver)...")
+                    real_success = await self._execute_real_robot_trajectory(
+                        trajectory_data,
+                        velocity_scale=move_speed,
                     )
-                    
-                    if not movement_success:
-                        self.get_logger().warn(f"Pose {pose_name} REJECTED due to collision")
-                        collision_rejected += 1
-                        await safe_send_feedback({
-                            'type': 'rpc_feedback',
-                            'request_id': request_id,
-                            'current_pose_index': i,
-                            'total_poses': total_poses,
-                            'current_pose_name': pose_name,
-                            'status': 'collision_rejected',
-                        })
-                        continue
+                    if not real_success:
+                        self.get_logger().warn(f"Real robot trajectory failed for pose {pose_name}")
+                
+                # Execute simulation using the same trajectory
+                if mode in ('simulation', 'both'):
+                    await self._execute_trajectory(
+                        trajectory_data,
+                        publish_rate=50.0,
+                    )
+                    sim_success = True
+                
+                # For 'real' only mode, just send trajectory to real robot
+                if mode == 'real':
+                    real_success = await self._execute_real_robot_trajectory(
+                        trajectory_data,
+                        velocity_scale=move_speed,
+                    )
+                    if not real_success:
+                        self.get_logger().warn(f"Real robot movement failed for pose {pose_name}")
                 
                 # Send progress update - at pose
                 await safe_send_feedback({
@@ -855,14 +937,56 @@ class CommandGatewayNode(Node):
                 completed += 1
         
             # After all poses, smoothly return to home position
-            if mode in ('simulation', 'both') and not self._proto_sim_stop_requested:
+            home_position = [0.0, -math.pi/2, 0.0, -math.pi/2, 0.0, 0.0]
+            
+            if not self._proto_sim_stop_requested:
                 self.get_logger().info("Returning to home position...")
-                home_position = [0.0, -math.pi/2, 0.0, -math.pi/2, 0.0, 0.0]
-                await self._execute_sim_movement(
-                    home_position,
-                    move_speed=move_speed,
-                    require_collision_check=True,
-                )
+                
+                # Plan trajectory to home
+                home_trajectory = None
+                if self._has_moveit and self.plan_motion_client:
+                    try:
+                        home_trajectory = self._plan_motion_moveit_sync(
+                            self.sim_joint_positions, home_position
+                        )
+                    except Exception as e:
+                        self.get_logger().warn(f"MoveIt planning to home failed: {e}")
+                
+                if home_trajectory:
+                    # For 'both' mode: Send trajectory to real robot first, then simulate
+                    if mode == 'both':
+                        await self._execute_real_robot_trajectory(
+                            home_trajectory,
+                            velocity_scale=0.3,  # Slower for safety
+                        )
+                    
+                    # Execute simulation
+                    if mode in ('simulation', 'both'):
+                        await self._execute_trajectory(
+                            home_trajectory,
+                            publish_rate=50.0,
+                        )
+                    
+                    # For 'real' only
+                    if mode == 'real':
+                        await self._execute_real_robot_trajectory(
+                            home_trajectory,
+                            velocity_scale=0.3,
+                        )
+                else:
+                    # Fallback: direct move
+                    if mode in ('simulation', 'both'):
+                        await self._execute_sim_movement(
+                            home_position,
+                            move_speed=move_speed,
+                            require_collision_check=False,
+                        )
+                    if mode in ('real', 'both'):
+                        await self._execute_real_robot_movement(
+                            home_position,
+                            velocity=0.3,
+                            acceleration=0.3,
+                        )
                 
         finally:
             self._proto_sim_running = False
@@ -1245,8 +1369,27 @@ class CommandGatewayNode(Node):
                     solution = response.solution.joint_state
                     joint_positions = list(solution.position)
                     if len(joint_positions) >= 6:
-                        self.get_logger().debug(f"MoveIt IK success: {[f'{j:.3f}' for j in joint_positions[:6]]}")
-                        return joint_positions[:6]
+                        joints = joint_positions[:6]
+                        
+                        # Validate joints are within UR robot limits
+                        # All UR joints have limits of approximately [-2π, 2π]
+                        # We use slightly larger tolerance to allow the full range
+                        joint_limit = 2.0 * math.pi + 0.1
+                        
+                        joints_valid = True
+                        for i, j in enumerate(joints):
+                            if j < -joint_limit or j > joint_limit:
+                                self.get_logger().warn(
+                                    f"IK solution joint {i} = {j:.3f} outside limits [-{joint_limit:.2f}, {joint_limit:.2f}]"
+                                )
+                                joints_valid = False
+                                break
+                        
+                        if joints_valid:
+                            self.get_logger().info(f"MoveIt IK success: {[f'{j:.3f}' for j in joints]}")
+                            return joints
+                        else:
+                            self.get_logger().warn("IK solution rejected: joints outside limits")
                 else:
                     error_name = error_names.get(response.error_code.val, f"UNKNOWN({response.error_code.val})")
                     self.get_logger().debug(f"MoveIt IK failed: {error_name} for pos={position}")
@@ -1797,6 +1940,191 @@ class CommandGatewayNode(Node):
             'timestamp': time.time(),
         }
         await client.websocket.send(json.dumps(error))
+
+    async def _execute_real_robot_trajectory(
+        self,
+        trajectory_data: Dict[str, Any],
+        velocity_scale: float = 0.5,
+    ) -> bool:
+        """
+        Execute a trajectory on the real robot via FollowJointTrajectory action.
+        
+        This uses the UR Robot Driver's scaled_joint_trajectory_controller which
+        provides proper trajectory execution with timing and velocity control.
+        
+        Args:
+            trajectory_data: Dictionary with 'waypoints' and 'time_from_start' lists
+            velocity_scale: Velocity scaling factor (0.0-1.0)
+            
+        Returns:
+            True if trajectory was accepted and is executing, False otherwise
+        """
+        if not self.follow_trajectory_client:
+            self.get_logger().warn("FollowJointTrajectory action client not available")
+            return False
+        
+        waypoints = trajectory_data.get('waypoints', [])
+        time_from_start = trajectory_data.get('time_from_start', [])
+        
+        if not waypoints:
+            self.get_logger().error("No waypoints in trajectory data")
+            return False
+        
+        # Check if action server is available
+        if not self.follow_trajectory_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().warn("FollowJointTrajectory action server not available (UR driver may not be running)")
+            # Fall back to MoveJoints service if available
+            if self.move_joints_client and len(waypoints) > 0:
+                self.get_logger().info("Falling back to MoveJoints service")
+                return await self._execute_real_robot_movement(
+                    waypoints[-1],  # Just move to final position
+                    velocity=velocity_scale,
+                    acceleration=velocity_scale * 0.8,
+                )
+            return False
+        
+        try:
+            # Build FollowJointTrajectory goal
+            goal = FollowJointTrajectory.Goal()
+            goal.trajectory.joint_names = [
+                'shoulder_pan_joint',
+                'shoulder_lift_joint', 
+                'elbow_joint',
+                'wrist_1_joint',
+                'wrist_2_joint',
+                'wrist_3_joint',
+            ]
+            
+            # Scale timing by velocity (lower velocity = longer duration)
+            time_scale = 1.0 / max(0.1, velocity_scale)
+            
+            # Add trajectory points
+            for i, (wp, t) in enumerate(zip(waypoints, time_from_start)):
+                point = JointTrajectoryPoint()
+                point.positions = list(wp)
+                
+                # Compute velocities between waypoints for smoother motion
+                if i < len(waypoints) - 1 and i > 0:
+                    dt_prev = time_from_start[i] - time_from_start[i-1]
+                    if dt_prev > 0:
+                        velocities = [
+                            (waypoints[i][j] - waypoints[i-1][j]) / dt_prev
+                            for j in range(6)
+                        ]
+                        point.velocities = velocities
+                else:
+                    point.velocities = [0.0] * 6
+                
+                # Scale time by velocity
+                scaled_time = t * time_scale
+                point.time_from_start.sec = int(scaled_time)
+                point.time_from_start.nanosec = int((scaled_time % 1.0) * 1e9)
+                
+                goal.trajectory.points.append(point)
+            
+            self.get_logger().info(
+                f"Sending trajectory to real robot: {len(waypoints)} waypoints, "
+                f"duration={time_from_start[-1] * time_scale:.2f}s (scaled)"
+            )
+            
+            # Send goal (non-blocking)
+            send_goal_future = self.follow_trajectory_client.send_goal_async(goal)
+            
+            # Wait for goal acceptance
+            try:
+                goal_handle = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: rclpy.spin_until_future_complete(self, send_goal_future, timeout_sec=5.0)
+                    ),
+                    timeout=6.0
+                )
+            except asyncio.TimeoutError:
+                self.get_logger().error("Timeout waiting for trajectory goal acceptance")
+                return False
+            
+            if send_goal_future.done():
+                goal_handle = send_goal_future.result()
+                if goal_handle.accepted:
+                    self.get_logger().info("Trajectory goal accepted by UR robot driver")
+                    return True
+                else:
+                    self.get_logger().error("Trajectory goal rejected by UR robot driver")
+                    return False
+            
+            return False
+            
+        except Exception as e:
+            self.get_logger().error(f"Error sending trajectory to real robot: {e}")
+            return False
+
+    async def _execute_real_robot_movement(
+        self,
+        target_joints: List[float],
+        velocity: float = 0.5,
+        acceleration: float = 0.5,
+    ) -> bool:
+        """
+        Execute movement on the real robot via the /robot/move_joints service.
+        
+        This calls the robot_control_node's MoveJoints service which sends URScript
+        commands to the physical UR robot.
+        
+        Args:
+            target_joints: Target joint positions [j0, j1, j2, j3, j4, j5] in radians
+            velocity: Joint velocity scale (0.0 to 1.05)
+            acceleration: Joint acceleration scale (0.0 to 1.4)
+            
+        Returns:
+            True if motion was initiated successfully, False otherwise
+        """
+        if not self.move_joints_client:
+            self.get_logger().error("MoveJoints service client not available")
+            return False
+        
+        # Wait for service to be available (with timeout)
+        if not self.move_joints_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error("MoveJoints service not available after 2s timeout")
+            return False
+        
+        # Create request
+        request = MoveJoints.Request()
+        request.joint_positions = target_joints
+        request.velocity = velocity * 1.05  # Scale to UR robot velocity range
+        request.acceleration = acceleration * 1.4  # Scale to UR robot accel range
+        request.wait_for_completion = False  # Non-blocking, motion runs on robot
+        
+        self.get_logger().info(f"Sending real robot motion: {[f'{j:.3f}' for j in target_joints]}")
+        
+        try:
+            # Call service asynchronously
+            future = self.move_joints_client.call_async(request)
+            
+            # Wait for response (with timeout)
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(None, lambda: rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)),
+                    timeout=6.0
+                )
+            except asyncio.TimeoutError:
+                self.get_logger().error("MoveJoints service call timed out")
+                return False
+            
+            if future.done():
+                result = future.result()
+                if result.success:
+                    self.get_logger().info(f"Real robot motion initiated: {result.message}")
+                    return True
+                else:
+                    self.get_logger().error(f"Real robot motion failed: {result.message}")
+                    return False
+            else:
+                self.get_logger().error("MoveJoints service call incomplete")
+                return False
+                
+        except Exception as e:
+            self.get_logger().error(f"Error calling MoveJoints service: {e}")
+            return False
 
     async def broadcast(self, message: str):
         """Broadcast message to all connected clients."""

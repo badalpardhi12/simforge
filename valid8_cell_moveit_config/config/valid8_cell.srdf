@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Valid8 Cell SRDF (Semantic Robot Description Format)
+
+This file defines:
+- Planning groups (kinematic chains for motion planning)
+- End effectors
+- Virtual joints (if any)
+- Disabled collision pairs (self-collision and environment)
+- Named poses (home, ready, etc.)
+
+The robot base is attached to robot_mount which is on the optical table.
+The planning group covers the 6-DOF arm from base_link to wrist_3_link.
+
+To regenerate with MoveIt Setup Assistant:
+  ros2 launch valid8_cell_moveit_config setup_assistant.launch.py
+
+Based on ur_moveit_config SRDF structure.
+-->
+<robot name="valid8_cell">
+  
+  <!-- ========== Virtual Joint ========== -->
+  <!-- The robot_mount is fixed relative to world (shop_floor -> robot_mount is fixed) -->
+  <!-- MoveIt needs a virtual joint from world to the robot's first link -->
+  
+  <!-- ========== Planning Groups ========== -->
+  
+  <!-- UR5e Arm Planning Group -->
+  <!-- This is the main kinematic chain for motion planning -->
+  <!-- Note: Frame names may have tf_prefix if configured -->
+  <group name="ur_manipulator">
+    <chain base_link="base_link" tip_link="wrist_3_link"/>
+  </group>
+  
+  <!-- ========== Named Poses ========== -->
+  
+  <!-- Home position - all joints at 0 -->
+  <group_state name="home" group="ur_manipulator">
+    <joint name="shoulder_pan_joint" value="0"/>
+    <joint name="shoulder_lift_joint" value="0"/>
+    <joint name="elbow_joint" value="0"/>
+    <joint name="wrist_1_joint" value="0"/>
+    <joint name="wrist_2_joint" value="0"/>
+    <joint name="wrist_3_joint" value="0"/>
+  </group_state>
+  
+  <!-- Ready position - arm up and ready -->
+  <group_state name="ready" group="ur_manipulator">
+    <joint name="shoulder_pan_joint" value="0"/>
+    <joint name="shoulder_lift_joint" value="-1.5708"/>
+    <joint name="elbow_joint" value="1.5708"/>
+    <joint name="wrist_1_joint" value="-1.5708"/>
+    <joint name="wrist_2_joint" value="-1.5708"/>
+    <joint name="wrist_3_joint" value="0"/>
+  </group_state>
+  
+  <!-- Face scanning start position -->
+  <group_state name="face_scan_start" group="ur_manipulator">
+    <joint name="shoulder_pan_joint" value="1.5708"/>
+    <joint name="shoulder_lift_joint" value="-1.2"/>
+    <joint name="elbow_joint" value="1.0"/>
+    <joint name="wrist_1_joint" value="-1.37"/>
+    <joint name="wrist_2_joint" value="-1.5708"/>
+    <joint name="wrist_3_joint" value="0"/>
+  </group_state>
+  
+  <!-- ========== Disabled Collisions ========== -->
+  
+  <!-- Self-collision pairs for UR5e (always in collision or never collide) -->
+  <!-- Adjacent links -->
+  <disable_collisions link1="base_link" link2="base_link_inertia" reason="Adjacent"/>
+  <disable_collisions link1="base_link_inertia" link2="shoulder_link" reason="Adjacent"/>
+  <disable_collisions link1="base_link" link2="shoulder_link" reason="Adjacent"/>
+  <disable_collisions link1="shoulder_link" link2="upper_arm_link" reason="Adjacent"/>
+  <disable_collisions link1="upper_arm_link" link2="forearm_link" reason="Adjacent"/>
+  <disable_collisions link1="forearm_link" link2="wrist_1_link" reason="Adjacent"/>
+  <disable_collisions link1="wrist_1_link" link2="wrist_2_link" reason="Adjacent"/>
+  <disable_collisions link1="wrist_2_link" link2="wrist_3_link" reason="Adjacent"/>
+  
+  <!-- Links that can never collide due to kinematic constraints -->
+  <disable_collisions link1="base_link" link2="upper_arm_link" reason="Never"/>
+  <disable_collisions link1="base_link_inertia" link2="upper_arm_link" reason="Never"/>
+  <disable_collisions link1="shoulder_link" link2="forearm_link" reason="Never"/>
+  <disable_collisions link1="upper_arm_link" link2="wrist_1_link" reason="Never"/>
+  <disable_collisions link1="forearm_link" link2="wrist_2_link" reason="Never"/>
+  <disable_collisions link1="wrist_1_link" link2="wrist_3_link" reason="Never"/>
+  
+  <!-- Robot base to environment (robot is mounted on table) -->
+  <disable_collisions link1="base_link" link2="robot_mount" reason="Adjacent"/>
+  <disable_collisions link1="base_link" link2="shop_floor" reason="Never"/>
+  <disable_collisions link1="shoulder_link" link2="robot_mount" reason="Never"/>
+  
+  <!-- Table collisions (the robot is on the table, some proximity is expected) -->
+  <disable_collisions link1="base_link" link2="table_link" reason="Adjacent"/>
+  
+  <!-- Tool collisions -->
+  <disable_collisions link1="wrist_3_link" link2="tool_base_link" reason="Adjacent"/>
+  <disable_collisions link1="flange" link2="tool_base_link" reason="Adjacent"/>
+  <disable_collisions link1="tool0" link2="tool_base_link" reason="Adjacent"/>
+  <disable_collisions link1="wrist_2_link" link2="tool_base_link" reason="Never"/>
+  <disable_collisions link1="tool_base_link" link2="tool_tip_link" reason="Adjacent"/>
+  
+</robot>

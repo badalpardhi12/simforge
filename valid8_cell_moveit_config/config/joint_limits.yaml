@@ -1,0 +1,51 @@
+# Joint Limits Configuration for Valid8 Cell
+#
+# This file defines joint limits for motion planning including:
+# - Position limits (already in URDF)
+# - Velocity limits
+# - Acceleration limits (IMPORTANT: MoveIt requires these!)
+#
+# The acceleration limits are crucial for the UR Robot Driver's
+# scaled_joint_trajectory_controller. Without them, trajectory
+# execution will fail.
+#
+# Reference: https://docs.universal-robots.com/Universal_Robots_ROS_Documentation/doc/ur_tutorials/my_robot_cell/doc/build_moveit_config.html
+
+# Joint limits for UR5e
+# Note: If using tf_prefix, prepend it to joint names
+joint_limits:
+  shoulder_pan_joint:
+    has_velocity_limits: true
+    max_velocity: 3.14  # rad/s
+    has_acceleration_limits: true
+    max_acceleration: 5.0  # rad/s^2 (reasonable default)
+    
+  shoulder_lift_joint:
+    has_velocity_limits: true
+    max_velocity: 3.14
+    has_acceleration_limits: true
+    max_acceleration: 5.0
+    
+  elbow_joint:
+    has_velocity_limits: true
+    max_velocity: 3.14
+    has_acceleration_limits: true
+    max_acceleration: 5.0
+    
+  wrist_1_joint:
+    has_velocity_limits: true
+    max_velocity: 6.28  # Wrist joints are faster
+    has_acceleration_limits: true
+    max_acceleration: 5.0
+    
+  wrist_2_joint:
+    has_velocity_limits: true
+    max_velocity: 6.28
+    has_acceleration_limits: true
+    max_acceleration: 5.0
+    
+  wrist_3_joint:
+    has_velocity_limits: true
+    max_velocity: 6.28
+    has_acceleration_limits: true
+    max_acceleration: 5.0

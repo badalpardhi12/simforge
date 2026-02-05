@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>valid8_cell_moveit_config</name>
+  <version>1.0.0</version>
+  <description>
+    Valid8 Robot Cell MoveIt Configuration Package
+    
+    Contains MoveIt 2 configuration for the Valid8 workcell:
+    - SRDF (Semantic Robot Description Format)
+    - Kinematics configuration (KDL, IKFast, or other solvers)
+    - OMPL planning configuration
+    - Joint limits with acceleration limits
+    - Controllers configuration for UR Robot Driver
+    - Launch files for move_group and RViz
+    
+    To regenerate this configuration, use MoveIt Setup Assistant:
+      ros2 launch valid8_cell_moveit_config setup_assistant.launch.py
+    
+    Based on Universal Robots ROS 2 custom workcell tutorial:
+    https://docs.universal-robots.com/Universal_Robots_ROS_Documentation/doc/ur_tutorials/my_robot_cell/doc/build_moveit_config.html
+  </description>
+  <maintainer email="badal@valid8.ai">Valid8 Team</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- Cell packages -->
+  <depend>valid8_cell_description</depend>
+  <depend>valid8_cell_control</depend>
+  
+  <!-- MoveIt 2 -->
+  <depend>moveit_ros_move_group</depend>
+  <depend>moveit_ros_planning_interface</depend>
+  <depend>moveit_ros_visualization</depend>
+  <depend>moveit_setup_assistant</depend>
+  <depend>moveit_planners_ompl</depend>
+  <depend>moveit_simple_controller_manager</depend>
+  <depend>moveit_configs_utils</depend>
+  
+  <!-- UR packages -->
+  <depend>ur_robot_driver</depend>
+  
+  <!-- Launch -->
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

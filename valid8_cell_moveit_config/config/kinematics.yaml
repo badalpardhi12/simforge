@@ -1,0 +1,33 @@
+# MoveIt Kinematics Configuration for Valid8 Cell
+#
+# This file configures the kinematics solver for the UR arm planning group.
+# KDLKinematicsPlugin is the default solver and works well for 6-DOF arms.
+#
+# For better performance, consider using:
+# - ur_kinematics/URKinematicsPlugin (UR-specific analytical IK)
+# - pick_ik (newer, modern IK solver)
+#
+# Reference: https://moveit.picknik.ai/main/doc/examples/kinematics_configuration/kinematics_configuration_tutorial.html
+
+ur_manipulator:
+  # Kinematics solver plugin
+  kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
+  
+  # Solver search resolution (radians for revolute joints)
+  kinematics_solver_search_resolution: 0.005
+  
+  # Timeout for IK solution (seconds)
+  kinematics_solver_timeout: 0.05
+  
+  # Number of attempts to find IK solution
+  kinematics_solver_attempts: 3
+  
+# Alternative: Use UR-specific analytical IK solver (faster, more reliable)
+# Uncomment below and comment out the kdl solver above if ur_kinematics is available
+#
+# ur_manipulator:
+#   kinematics_solver: ur_kinematics/URKinematicsPlugin
+#   kinematics_solver_search_resolution: 0.005
+#   kinematics_solver_timeout: 0.05
+#   ur_kinematics_plugin:
+#     solve_type: Manipulation1  # Or Manipulation2, Speed, Distance, etc.

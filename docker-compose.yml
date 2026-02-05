@@ -32,18 +32,26 @@ services:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
       - DISPLAY=${DISPLAY}
+      # Robot configuration
+      - ROBOT_IP=${ROBOT_IP:-192.168.1.9}
+      - UR_TYPE=${UR_TYPE:-ur5e}
+      - USE_MOCK_HARDWARE=${USE_MOCK_HARDWARE:-false}
     volumes:
       # Device access for cameras
       - /dev:/dev
+      # Mount source for hot-reload development
+      - ./valid8_cell_description:/ros2_ws/src/valid8_cell_description:ro
+      - ./valid8_cell_control:/ros2_ws/src/valid8_cell_control:ro
+      - ./valid8_cell_moveit_config:/ros2_ws/src/valid8_cell_moveit_config:ro
+      - ./simforge_server:/ros2_ws/src/simforge_server:ro
+      # Mount launch files to installed location for immediate access
+      - ./simforge_server/launch:/ros2_ws/install/simforge_server/share/simforge_server/launch:ro
     privileged: true
     network_mode: host
     stdin_open: true
     tty: true
     command: >
-      bash -c "
-        source /ros2_ws/install/setup.bash &&
-        ros2 launch simforge_server full_stack.launch.py
-      "
+      bash -c "source /ros2_ws/install/setup.bash && ros2 launch valid8_cell_control full_stack.launch.py robot_ip:=192.168.1.9 ur_type:=ur5e use_mock_hardware:=false headless_mode:=true launch_foxglove:=true launch_moveit:=true launch_command_gateway:=true"
     healthcheck:
       test: ["CMD", "ros2", "topic", "list"]
       interval: 10s
@@ -67,12 +75,13 @@ services:
     network_mode: host
     command: >
       bash -c "
-        source /opt/ros/humble/setup.bash &&
+        source /ros2_ws/install/setup.bash &&
         ros2 launch foxglove_bridge foxglove_bridge_launch.xml
           port:=9091
           address:=0.0.0.0
           send_buffer_limit:=100000000
           use_compression:=true
+          asset_uri_allowlist:='[\"package://.*\", \"file://.*\"]'
       "
 
   # =============================================================================
@@ -92,9 +101,16 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=all
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      # Robot configuration
+      - ROBOT_IP=${ROBOT_IP:-192.168.1.9}
+      - UR_TYPE=${UR_TYPE:-ur5e}
+      - USE_MOCK_HARDWARE=${USE_MOCK_HARDWARE:-false}
     volumes:
       - ./config:/ros2_ws/src/simforge_server/config:ro
       - ./assets:/ros2_ws/src/simforge_server/assets:ro
+      - ./valid8_cell_description:/ros2_ws/src/valid8_cell_description:ro
+      - ./valid8_cell_control:/ros2_ws/src/valid8_cell_control:ro
+      - ./valid8_cell_moveit_config:/ros2_ws/src/valid8_cell_moveit_config:ro
       - /dev:/dev
     privileged: true
     network_mode: host
@@ -103,7 +119,13 @@ services:
     command: >
       bash -c "
         source /ros2_ws/install/setup.bash &&
-        ros2 launch simforge_server full_stack.launch.py
+        ros2 launch valid8_cell_control full_stack.launch.py \
+          robot_ip:=$${ROBOT_IP:-192.168.1.9} \
+          ur_type:=$${UR_TYPE:-ur5e} \
+          use_mock_hardware:=$${USE_MOCK_HARDWARE:-false} \
+          launch_foxglove:=true \
+          launch_moveit:=true \
+          launch_command_gateway:=true
       "
     deploy:
       resources:
@@ -130,12 +152,13 @@ services:
     network_mode: host
     command: >
       bash -c "
-        source /opt/ros/humble/setup.bash &&
+        source /ros2_ws/install/setup.bash &&
         ros2 launch foxglove_bridge foxglove_bridge_launch.xml
           port:=9090
           address:=0.0.0.0
           send_buffer_limit:=100000000
           use_compression:=true
+          asset_uri_allowlist:='[\"package://.*\", \"file://.*\"]'
       "
     depends_on:
       - ros2_server_prod

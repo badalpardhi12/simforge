@@ -28,6 +28,13 @@ from std_srvs.srv import Trigger
 from geometry_msgs.msg import Pose, Wrench
 from sensor_msgs.msg import JointState
 
+# Import custom messages
+try:
+    from simforge_msgs.srv import MoveJoints
+    HAS_MOVE_JOINTS = True
+except ImportError:
+    HAS_MOVE_JOINTS = False
+
 # Import our new UR communication module
 import sys
 import os
@@ -180,6 +187,16 @@ class RobotControlNodeV2(Node):
             self.resume_joint_publishing_callback,
             callback_group=self.callback_group
         )
+        
+        # MoveJoints service - allows external control of robot joints
+        if HAS_MOVE_JOINTS:
+            self.move_joints_srv = self.create_service(
+                MoveJoints,
+                '/robot/move_joints',
+                self.move_joints_callback,
+                callback_group=self.callback_group
+            )
+            self.get_logger().info("MoveJoints service available at /robot/move_joints")
         
         # Flag to pause joint state publishing
         self._joint_pub_paused = False
@@ -334,6 +351,33 @@ class RobotControlNodeV2(Node):
         self.get_logger().info("Joint state publishing RESUMED")
         response.success = True
         response.message = "Joint state publishing resumed"
+        return response
+    
+    def move_joints_callback(self, request, response):
+        """
+        MoveJoints service callback.
+        
+        Moves the real robot to the specified joint positions.
+        """
+        joint_positions = list(request.joint_positions)
+        velocity = request.velocity if request.velocity > 0 else 1.05
+        acceleration = request.acceleration if request.acceleration > 0 else 1.4
+        
+        self.get_logger().info(f"MoveJoints request: {[f'{j:.3f}' for j in joint_positions]}, vel={velocity:.2f}")
+        
+        if len(joint_positions) != 6:
+            response.success = False
+            response.message = f"Expected 6 joint values, got {len(joint_positions)}"
+            return response
+        
+        try:
+            success = self.move_joints(joint_positions, velocity=velocity, acceleration=acceleration)
+            response.success = success
+            response.message = "Motion initiated" if success else "Motion failed"
+        except Exception as e:
+            response.success = False
+            response.message = f"Error: {str(e)}"
+        
         return response
 
     def move_joints(
