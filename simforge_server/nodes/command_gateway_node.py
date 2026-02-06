@@ -258,6 +258,10 @@ class CommandGatewayNode(Node):
         # Proto-sim control flags
         self._proto_sim_running = False
         self._proto_sim_stop_requested = False
+        self._proto_sim_mode = None  # Current execution mode: 'simulation', 'real', 'both'
+        # When True, the joint_state_broadcaster is deactivated so the command
+        # gateway's sim joint states are the ONLY ones on /joint_states.
+        self._jsb_deactivated = False
         
         # TF2 for frame lookups (target object position)
         self.tf_buffer = Buffer()
@@ -784,12 +788,21 @@ class CommandGatewayNode(Node):
         }
 
     async def rpc_prepare_mode(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Pre-flight check for a requested execution mode.
+        """Switch the server into the requested execution mode.
         
-        Called by the client before starting a protocol run to verify that the
-        requested mode (simulation/real/both) can actually execute. For 'real'
-        and 'both' modes this checks the UR driver, controller, and robot
-        program status with generous timeouts.
+        Called by the client before starting a protocol run.  This is the
+        central mode-switching RPC — it does two things:
+        
+        1. **Joint-state ownership** — In simulation-only mode the UR
+           driver's ``joint_state_broadcaster`` controller is *deactivated*
+           so the command gateway is the sole publisher on ``/joint_states``.
+           In real / both modes the broadcaster is *activated* and the
+           command gateway stops publishing simulated states.
+        
+        2. **Pre-flight checks** — For real / both modes the UR driver,
+           MoveIt, and robot program are validated.
+        
+        The client should freeze its UI until this returns.
         
         Returns:
             ready: True if the mode can be used right now
@@ -797,15 +810,38 @@ class CommandGatewayNode(Node):
             can_retry: True if a retry might succeed (e.g. robot booting)
         """
         mode = params.get('mode', 'simulation')
+        self.get_logger().info(f"prepare_mode: switching to '{mode}'")
         
-        if mode == 'simulation':
-            return {'success': True, 'ready': True, 'message': 'Simulation mode always available'}
-        
-        # For real / both — run thorough checks
         checks = []
         all_ok = True
         
-        # 1. FollowJointTrajectory action server (UR driver)
+        # ── 1. Joint-state broadcaster switching ──────────────────────
+        if mode == 'simulation':
+            # Deactivate the UR driver's joint_state_broadcaster so that
+            # only the command gateway publishes sim states on /joint_states.
+            self._set_joint_state_broadcaster(active=False)
+            checks.append(('Joint-state broadcaster deactivated', self._jsb_deactivated))
+        else:
+            # Activate the UR driver's joint_state_broadcaster — the real
+            # robot state should drive the visualisation in real/both modes.
+            self._set_joint_state_broadcaster(active=True)
+            checks.append(('Joint-state broadcaster active', not self._jsb_deactivated))
+        
+        # Store the active mode so _publish_joint_state() knows whether to
+        # actually publish.
+        self._proto_sim_mode = mode
+        
+        # ── 2. Simulation mode — no further checks needed ─────────────
+        if mode == 'simulation':
+            lines = [f"{'✓' if ok else '✗'} {n}" for n, ok in checks]
+            return {
+                'success': True,
+                'ready': True,
+                'message': f'Simulation mode ready\n' + '\n'.join(lines),
+            }
+        
+        # ── 3. Real / Both — pre-flight checks ────────────────────────
+        # 3a. FollowJointTrajectory action server (UR driver)
         fjt_ok = False
         if self.follow_trajectory_client:
             fjt_ok = self.follow_trajectory_client.wait_for_server(timeout_sec=3.0)
@@ -813,7 +849,7 @@ class CommandGatewayNode(Node):
         if not fjt_ok:
             all_ok = False
         
-        # 2. MoveIt ExecuteTrajectory action
+        # 3b. MoveIt ExecuteTrajectory action
         exec_ok = False
         if self.execute_trajectory_client:
             exec_ok = self.execute_trajectory_client.wait_for_server(timeout_sec=3.0)
@@ -821,11 +857,10 @@ class CommandGatewayNode(Node):
         if not exec_ok:
             all_ok = False
         
-        # 3. Robot program running
+        # 3c. Robot program running
         checks.append(('Robot Program Running', self._robot_program_running))
         if not self._robot_program_running:
             all_ok = False
-            # Try to resend
             self.get_logger().info("Robot program not running — attempting resend for prepare_mode")
             try:
                 ready = await self._ensure_robot_ready(timeout=10.0)
@@ -1013,12 +1048,13 @@ class CommandGatewayNode(Node):
         # Add collision objects to planning scene
         self._add_collision_objects_to_planning_scene()
         
-        # Pause real robot's joint state publishing during simulation
-        if mode in ('simulation', 'both'):
-            try:
-                await self._pause_real_robot_joint_publishing()
-            except Exception as e:
-                self.get_logger().error(f"Failed to pause joint publishing: {e}")
+        # Ensure joint_state_broadcaster state matches the mode.
+        # prepare_mode already did this, but guard against direct calls.
+        if mode == 'simulation':
+            self._set_joint_state_broadcaster(active=False)
+        else:
+            self._set_joint_state_broadcaster(active=True)
+        self._proto_sim_mode = mode
         
         # === FIRST: Move robot to home position before starting protocol ===
         home_position = [0.0, -math.pi/2, 0.0, -math.pi/2, 0.0, 0.0]
@@ -1380,8 +1416,11 @@ class CommandGatewayNode(Node):
                 
         finally:
             self._proto_sim_running = False
-            if mode in ('simulation', 'both'):
-                await self._resume_real_robot_joint_publishing()
+            # Always re-activate the joint_state_broadcaster when proto-sim
+            # ends so that the UR driver's real joint states resume on
+            # /joint_states (normal idle state).
+            self._set_joint_state_broadcaster(active=True)
+            self._proto_sim_mode = None
         
         # Final result
         result = {
@@ -2330,7 +2369,16 @@ class CommandGatewayNode(Node):
                 await asyncio.sleep(sleep_time)
 
     def _publish_joint_state(self) -> None:
-        """Publish current simulated joint state."""
+        """Publish current simulated joint state.
+        
+        Only publishes when the active mode is 'simulation'.  In real / both
+        modes the UR driver's joint_state_broadcaster owns /joint_states and
+        we must NOT interleave simulated values — that causes the robot
+        visualisation to flicker between real and sim positions.
+        """
+        if self._proto_sim_mode not in (None, 'simulation'):
+            return  # real / both — UR driver owns /joint_states
+        
         msg = JointState()
         msg.header = Header()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -2372,6 +2420,64 @@ class CommandGatewayNode(Node):
     def _robot_program_running_callback(self, msg) -> None:
         """Callback for robot_program_running topic."""
         self._robot_program_running = msg.data
+
+    def _set_joint_state_broadcaster(self, active: bool) -> None:
+        """
+        Activate or deactivate the joint_state_broadcaster controller.
+        
+        In simulation-only mode we deactivate it so the UR driver's real joint
+        states don't interleave with the command gateway's simulated joint
+        states on /joint_states — which causes glitchy robot visualization.
+        
+        We reactivate it when entering real/both mode or when proto-sim ends.
+        """
+        target_state = "active" if active else "inactive"
+        current_state = "deactivated" if self._jsb_deactivated else "active"
+        
+        # Skip if already in the desired state
+        if active and not self._jsb_deactivated:
+            return
+        if not active and self._jsb_deactivated:
+            return
+        
+        try:
+            from controller_manager_msgs.srv import SwitchController
+            
+            if not hasattr(self, '_switch_controller_client'):
+                self._switch_controller_client = self.create_client(
+                    SwitchController,
+                    '/controller_manager/switch_controller'
+                )
+            
+            if not self._switch_controller_client.wait_for_service(timeout_sec=2.0):
+                self.get_logger().warn("switch_controller service not available")
+                return
+            
+            request = SwitchController.Request()
+            request.strictness = SwitchController.Request.BEST_EFFORT
+            
+            if active:
+                request.activate_controllers = ['joint_state_broadcaster']
+                request.deactivate_controllers = []
+            else:
+                request.activate_controllers = []
+                request.deactivate_controllers = ['joint_state_broadcaster']
+            
+            future = self._switch_controller_client.call_async(request)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
+            
+            if future.done() and future.result().ok:
+                self._jsb_deactivated = not active
+                self.get_logger().info(
+                    f"joint_state_broadcaster {'activated' if active else 'deactivated'} "
+                    f"for {'real/both' if active else 'simulation-only'} mode"
+                )
+            else:
+                self.get_logger().warn(
+                    f"Failed to {'activate' if active else 'deactivate'} joint_state_broadcaster"
+                )
+        except Exception as e:
+            self.get_logger().warn(f"Error switching joint_state_broadcaster: {e}")
 
     async def _ensure_robot_ready(self, timeout: float = 15.0) -> bool:
         """

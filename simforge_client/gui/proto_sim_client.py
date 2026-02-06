@@ -704,17 +704,13 @@ class ProtoSimClientFrame(wx.Frame):
         )
         self._log(f"Starting protocol: {total_poses} poses, mode={mode}")
         
-        # For real / both modes, run a pre-flight check with a progress dialog
-        if mode in ("real", "both"):
-            self.start_btn.Enable(False)
-            self._log("Checking robot readiness...")
-            self._run_async(self._prepare_and_run(robot, target_object, params, mode, total_poses))
-        else:
-            # Simulation — run immediately
-            self.start_btn.Enable(False)
-            self.stop_btn.Enable(True)
-            self._running_simulation = True
-            self._run_async(self._run_protocol(robot, target_object, params, mode))
+        # ALL modes go through prepare_mode first.
+        # This switches the server's joint-state ownership (deactivates
+        # the UR driver's joint_state_broadcaster in sim mode, activates
+        # it for real/both) and runs pre-flight checks for real/both.
+        self.start_btn.Enable(False)
+        self._log(f"Switching to {mode} mode…")
+        self._run_async(self._prepare_and_run(robot, target_object, params, mode, total_poses))
     
     async def _prepare_and_run(
         self,
@@ -724,20 +720,30 @@ class ProtoSimClientFrame(wx.Frame):
         mode: str,
         total_poses: int,
     ) -> None:
-        """Pre-flight check for real/both modes, then run the protocol.
+        """Switch server mode and pre-flight check, then run the protocol.
         
-        Calls the server's prepare_mode RPC to validate that the real robot
-        is reachable and the program is running. Shows a brief freeze/wait
-        while the server checks. If the check fails the user gets a dialog
-        with the option to retry, switch to simulation, or cancel.
+        Calls the server's ``prepare_mode`` RPC which:
+        * Switches joint-state ownership (deactivates the UR driver's
+          joint_state_broadcaster in sim mode, activates it for real/both).
+        * For real/both modes validates the UR driver, MoveIt, and the
+          robot program.
+        
+        The UI is frozen (Start disabled, progress label updated) until
+        the server confirms readiness.  If the check fails the user gets
+        a dialog with the option to retry, switch to simulation, or cancel.
         """
         try:
-            wx.CallAfter(self.progress_label.SetLabel, "Checking robot readiness…")
+            wx.CallAfter(
+                self.progress_label.SetLabel,
+                f"Switching to {mode} mode…"
+            )
             
-            response = await self._client.call_rpc("prepare_mode", {"mode": mode}, timeout=30.0)
+            response = await self._client.call_rpc(
+                "prepare_mode", {"mode": mode}, timeout=30.0
+            )
             
             if response.get("ready"):
-                self._log(f"✓ Robot ready for {mode} mode")
+                self._log(f"✓ {mode} mode ready")
                 self._log(response.get("message", ""))
                 # Proceed with execution
                 self._running_simulation = True
@@ -753,34 +759,36 @@ class ProtoSimClientFrame(wx.Frame):
                 user_choice = await self._show_mode_check_dialog(mode, msg, can_retry)
                 
                 if user_choice == "retry":
-                    self._log("Retrying robot readiness check...")
+                    self._log("Retrying mode switch...")
                     await self._prepare_and_run(robot, target_object, params, mode, total_poses)
                     return
                 elif user_choice == "simulation":
                     self._log("Switching to Simulation Only mode")
                     wx.CallAfter(self.sim_mode_radio.SetValue, True)
-                    self._running_simulation = True
-                    wx.CallAfter(self.stop_btn.Enable, True)
-                    await self._run_protocol(robot, target_object, params, "simulation")
+                    # Re-call prepare_mode for simulation so JSB is deactivated
+                    await self._prepare_and_run(
+                        robot, target_object, params, "simulation", total_poses
+                    )
+                    return
                 else:
                     self._log("Cancelled by user")
                     wx.CallAfter(self.start_btn.Enable, True)
                     wx.CallAfter(self.progress_label.SetLabel, "Ready")
                     
         except Exception as e:
-            self._log(f"Pre-flight check error: {e}")
+            self._log(f"Mode switch error: {e}")
             # Offer to fall back to simulation
             user_choice = await self._show_mode_check_dialog(
                 mode,
-                f"Could not reach server for pre-flight check:\n{e}",
+                f"Could not reach server for mode switch:\n{e}",
                 can_retry=True,
             )
             if user_choice == "simulation":
                 self._log("Falling back to Simulation Only mode")
                 wx.CallAfter(self.sim_mode_radio.SetValue, True)
-                self._running_simulation = True
-                wx.CallAfter(self.stop_btn.Enable, True)
-                await self._run_protocol(robot, target_object, params, "simulation")
+                await self._prepare_and_run(
+                    robot, target_object, params, "simulation", total_poses
+                )
             elif user_choice == "retry":
                 await self._prepare_and_run(robot, target_object, params, mode, total_poses)
             else:
