@@ -200,6 +200,12 @@ def generate_launch_description():
             "description_package": "valid8_cell_description",
             "description_file": "valid8_cell.urdf.xacro",
             
+            # Use our custom controller config with relaxed path tolerances
+            # Default 0.2 rad tolerance causes PATH_TOLERANCE_VIOLATED aborts;
+            # our config uses 0.5 rad for the scaled_joint_trajectory_controller
+            "runtime_config_package": "valid8_cell_control",
+            "controllers_file": "ur_controllers.yaml",
+            
             # Disable UR driver's RViz (we launch our own if needed)
             "launch_rviz": "false",
             

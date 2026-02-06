@@ -1206,6 +1206,38 @@ class CommandGatewayNode(Node):
                 real_duration = 0.0
                 
                 if mode in ('both', 'real'):
+                    # Re-read the real robot state right before execution.
+                    # Planning may have taken many seconds; the state used
+                    # for planning could be stale, causing PATH_TOLERANCE_VIOLATED.
+                    if self.real_robot_joint_positions:
+                        fresh_start = list(self.real_robot_joint_positions)
+                        drift = max(abs(fresh_start[j] - start_joints[j]) for j in range(6))
+                        if drift > 0.05:  # > 3 degrees
+                            self.get_logger().warn(
+                                f"Robot drifted {math.degrees(drift):.1f}° during planning — "
+                                f"re-planning from fresh state"
+                            )
+                            start_joints = fresh_start
+                            self.sim_joint_positions = list(fresh_start)
+                            # Re-plan with the fresh start
+                            trajectory_data = self._plan_motion_moveit_sync(
+                                start_joints, target_joints,
+                                velocity_scale=move_speed,
+                                acceleration_scale=move_speed,
+                            )
+                            if trajectory_data is None:
+                                self.get_logger().warn(f"Re-plan from fresh state failed")
+                                collision_rejected += 1
+                                await safe_send_feedback({
+                                    'type': 'rpc_feedback',
+                                    'request_id': request_id,
+                                    'current_pose_index': i,
+                                    'total_poses': total_poses,
+                                    'current_pose_name': pose_name,
+                                    'status': 'collision_rejected',
+                                })
+                                continue
+                    
                     self.get_logger().info("Sending trajectory to real robot (via UR driver)...")
                     real_success, real_duration = await self._execute_real_robot_trajectory(
                         trajectory_data,
@@ -1729,6 +1761,9 @@ class CommandGatewayNode(Node):
                                 break
                         
                         if joints_valid:
+                            # Normalize to [-π, π] to avoid huge sweeps that
+                            # collide or exceed velocity limits.
+                            joints = self._normalize_joint_angles(joints, seed_joints)
                             self.get_logger().info(f"MoveIt IK success: {[f'{j:.3f}' for j in joints]}")
                             return joints
                         else:
@@ -1742,7 +1777,40 @@ class CommandGatewayNode(Node):
         except Exception as e:
             self.get_logger().warn(f"MoveIt IK call failed: {e}")
             return None
-    
+
+    @staticmethod
+    def _normalize_joint_angles(
+        joints: List[float],
+        seed: Optional[List[float]] = None,
+    ) -> List[float]:
+        """Normalize joint angles to the equivalent value closest to the seed.
+        
+        UR joints are continuous and IK may return values like 4.53 rad
+        which is equivalent to 4.53 - 2π ≈ -1.75 rad.  If the seed
+        (current robot state) is -1.57 rad, the -1.75 solution is much
+        closer and avoids a huge sweep through collision space.
+        
+        For each joint we pick the k*2π offset that minimises |j - seed_j|.
+        """
+        TWO_PI = 2.0 * math.pi
+        result = list(joints)
+        if seed is None:
+            # Just wrap to [-π, π]
+            for i in range(len(result)):
+                while result[i] > math.pi:
+                    result[i] -= TWO_PI
+                while result[i] < -math.pi:
+                    result[i] += TWO_PI
+            return result
+        
+        for i in range(min(len(result), len(seed))):
+            # Pick the 2π-offset of result[i] closest to seed[i]
+            diff = result[i] - seed[i]
+            # Number of full rotations to remove
+            k = round(diff / TWO_PI)
+            result[i] -= k * TWO_PI
+        return result
+
     def _solve_ik_analytical(
         self,
         position: Tuple[float, float, float],

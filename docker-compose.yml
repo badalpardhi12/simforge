@@ -55,6 +55,7 @@ services:
       - ./valid8_cell_description/urdf:/ros2_ws/install/valid8_cell_description/share/valid8_cell_description/urdf
       - ./valid8_cell_description/meshes:/ros2_ws/install/valid8_cell_description/share/valid8_cell_description/meshes:ro
       - ./valid8_cell_control/launch:/ros2_ws/install/valid8_cell_control/share/valid8_cell_control/launch:ro
+      - ./valid8_cell_control/config:/ros2_ws/install/valid8_cell_control/share/valid8_cell_control/config:ro
       - ./valid8_cell_moveit_config/config:/ros2_ws/install/valid8_cell_moveit_config/share/valid8_cell_moveit_config/config
       - ./valid8_cell_moveit_config/launch:/ros2_ws/install/valid8_cell_moveit_config/share/valid8_cell_moveit_config/launch:ro
     privileged: true

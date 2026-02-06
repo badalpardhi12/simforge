@@ -571,7 +571,11 @@ class ProtoSimClientFrame(wx.Frame):
             self._log(f"Error fetching environment info: {e}")
     
     async def _fetch_robot_status(self) -> None:
-        """Fetch real robot connection status and update mode button availability."""
+        """Fetch real robot connection status and update status indicator.
+        
+        This no longer disables mode radio buttons — all modes are always
+        selectable. The server validates at execution time via prepare_mode.
+        """
         if not self._client:
             return
         
@@ -580,26 +584,34 @@ class ProtoSimClientFrame(wx.Frame):
             
             if response.get("success"):
                 real_robot_available = response.get("real_robot_available", False)
-                available_modes = response.get("available_modes", ["simulation"])
                 connection_details = response.get("connection_details", {})
+                robot_program = connection_details.get("robot_program_running", False)
+                
+                # Update connection status indicator
+                wx.CallAfter(
+                    self._update_robot_status_indicator,
+                    real_robot_available,
+                    robot_program,
+                    connection_details,
+                )
                 
                 # Log connection status
-                if real_robot_available:
-                    self._log("✓ Real robot available - all modes enabled")
+                if real_robot_available and robot_program:
+                    self._log("✓ Real robot connected and program running")
+                elif real_robot_available:
+                    self._log("⚠ Real robot reachable but program not running")
                 else:
-                    self._log("⚠ Real robot not connected - simulation only mode")
+                    self._log("⚠ Real robot not connected (will be checked before execution)")
                     for key, value in connection_details.items():
-                        self._log(f"  {key}: {value}")
-                
-                # Update mode button availability
-                wx.CallAfter(self._update_mode_availability, available_modes)
+                        if isinstance(value, str):
+                            self._log(f"  {key}: {value}")
             else:
                 self._log(f"Could not get robot status: {response.get('error', 'Unknown')}")
-                wx.CallAfter(self._update_mode_availability, ["simulation"])
+                wx.CallAfter(self._update_robot_status_indicator, False, False, {})
                 
         except Exception as e:
             self._log(f"Error fetching robot status: {e}")
-            wx.CallAfter(self._update_mode_availability, ["simulation"])
+            wx.CallAfter(self._update_robot_status_indicator, False, False, {})
     
     def _update_robot_status_indicator(
         self,
