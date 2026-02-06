@@ -277,6 +277,11 @@ class ProtoSimClientFrame(wx.Frame):
         robot_sizer.Add(self.real_mode_radio, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         robot_sizer.Add(self.both_mode_radio, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         
+        # Refresh button to check robot status
+        self.refresh_status_btn = wx.Button(panel, label="↻ Refresh")
+        self.refresh_status_btn.SetToolTip("Check real robot connection status")
+        robot_sizer.Add(self.refresh_status_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        
         main_sizer.Add(robot_sizer, 0, wx.EXPAND | wx.ALL, 10)
         
         # === Target Object Selection ===
@@ -413,6 +418,7 @@ class ProtoSimClientFrame(wx.Frame):
         self.start_btn.Bind(wx.EVT_BUTTON, lambda e: self._on_start())
         self.stop_btn.Bind(wx.EVT_BUTTON, lambda e: self._on_stop())
         self.estop_btn.Bind(wx.EVT_BUTTON, lambda e: self._on_estop())
+        self.refresh_status_btn.Bind(wx.EVT_BUTTON, lambda e: self._on_refresh_status())
         
         # Bind parameter changes to update pose count
         for control in self.parameter_controls.values():
@@ -512,6 +518,14 @@ class ProtoSimClientFrame(wx.Frame):
         self._update_connection_status(False)
         self._log("Disconnected")
     
+    def _on_refresh_status(self) -> None:
+        """Handle refresh status button click."""
+        if not self._connected:
+            self._log("Not connected to server")
+            return
+        self._log("Refreshing robot status...")
+        self._run_async(self._fetch_robot_status())
+    
     async def _fetch_environment_info(self) -> None:
         """Fetch available robots, objects, and their transforms from server."""
         if not self._client:
@@ -539,9 +553,67 @@ class ProtoSimClientFrame(wx.Frame):
                         self._log(f"  {obj}: pos=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
             else:
                 self._log(f"Failed to get environment info: {response.get('error', 'Unknown error')}")
+            
+            # Also fetch robot connection status to enable/disable mode buttons
+            await self._fetch_robot_status()
                 
         except Exception as e:
             self._log(f"Error fetching environment info: {e}")
+    
+    async def _fetch_robot_status(self) -> None:
+        """Fetch real robot connection status and update mode button availability."""
+        if not self._client:
+            return
+        
+        try:
+            response = await self._client.call_rpc("get_robot_status", {})
+            
+            if response.get("success"):
+                real_robot_available = response.get("real_robot_available", False)
+                available_modes = response.get("available_modes", ["simulation"])
+                connection_details = response.get("connection_details", {})
+                
+                # Log connection status
+                if real_robot_available:
+                    self._log("✓ Real robot available - all modes enabled")
+                else:
+                    self._log("⚠ Real robot not connected - simulation only mode")
+                    for key, value in connection_details.items():
+                        self._log(f"  {key}: {value}")
+                
+                # Update mode button availability
+                wx.CallAfter(self._update_mode_availability, available_modes)
+            else:
+                self._log(f"Could not get robot status: {response.get('error', 'Unknown')}")
+                wx.CallAfter(self._update_mode_availability, ["simulation"])
+                
+        except Exception as e:
+            self._log(f"Error fetching robot status: {e}")
+            wx.CallAfter(self._update_mode_availability, ["simulation"])
+    
+    def _update_mode_availability(self, available_modes: list) -> None:
+        """Enable/disable mode radio buttons based on available modes."""
+        # Simulation is always available
+        self.sim_mode_radio.Enable(True)
+        
+        # Real and Both modes depend on real robot availability
+        real_available = "real" in available_modes
+        both_available = "both" in available_modes
+        
+        self.real_mode_radio.Enable(real_available)
+        self.both_mode_radio.Enable(both_available)
+        
+        # Update labels to show availability
+        if real_available:
+            self.real_mode_radio.SetLabel("Real Robot")
+            self.both_mode_radio.SetLabel("Both (Sim + Real)")
+        else:
+            self.real_mode_radio.SetLabel("Real Robot (unavailable)")
+            self.both_mode_radio.SetLabel("Both (unavailable)")
+        
+        # If current selection is now unavailable, switch to simulation
+        if not real_available and (self.real_mode_radio.GetValue() or self.both_mode_radio.GetValue()):
+            self.sim_mode_radio.SetValue(True)
     
     def _update_robot_choices(self) -> None:
         """Update robot dropdown."""
