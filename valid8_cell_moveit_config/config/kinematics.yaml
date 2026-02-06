@@ -21,13 +21,3 @@ ur_manipulator:
   
   # Number of attempts to find IK solution
   kinematics_solver_attempts: 3
-  
-# Alternative: Use UR-specific analytical IK solver (faster, more reliable)
-# Uncomment below and comment out the kdl solver above if ur_kinematics is available
-#
-# ur_manipulator:
-#   kinematics_solver: ur_kinematics/URKinematicsPlugin
-#   kinematics_solver_search_resolution: 0.005
-#   kinematics_solver_timeout: 0.05
-#   ur_kinematics_plugin:
-#     solve_type: Manipulation1  # Or Manipulation2, Speed, Distance, etc.

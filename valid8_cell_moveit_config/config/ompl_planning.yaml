@@ -4,21 +4,9 @@
 # for the UR arm planning group.
 #
 # Reference: https://moveit.picknik.ai/main/doc/examples/ompl_interface/ompl_interface_tutorial.html
-
-planning_plugins:
-  - ompl_interface/OMPLPlanner
-
-# Request adapters (pre/post processing of planning requests)
-request_adapters:
-  - default_planning_request_adapters/ResolveConstraintFrames
-  - default_planning_request_adapters/ValidateWorkspaceBounds
-  - default_planning_request_adapters/CheckStartStateBounds
-  - default_planning_request_adapters/CheckStartStateCollision
-
-# Response adapters
-response_adapters:
-  - default_planning_response_adapters/AddTimeOptimalParameterization
-  - default_planning_response_adapters/ValidateSolution
+#
+# NOTE: planning_plugin and request_adapters are configured in the launch file
+# to avoid type conflicts (string vs list format)
 
 # OMPL planner configurations
 planner_configs:

@@ -268,7 +268,7 @@ class ProtoSimClientFrame(wx.Frame):
         self.robot_choice = wx.Choice(panel, choices=[])
         robot_sizer.Add(self.robot_choice, 1, wx.ALL, 5)
         
-        # Execution mode
+        # Execution mode — always enabled, server validates at execution time
         self.sim_mode_radio = wx.RadioButton(panel, label="Simulation Only", style=wx.RB_GROUP)
         self.real_mode_radio = wx.RadioButton(panel, label="Real Robot")
         self.both_mode_radio = wx.RadioButton(panel, label="Both (Sim + Real)")
@@ -276,6 +276,16 @@ class ProtoSimClientFrame(wx.Frame):
         robot_sizer.Add(self.sim_mode_radio, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         robot_sizer.Add(self.real_mode_radio, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         robot_sizer.Add(self.both_mode_radio, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        
+        # Robot connection status indicator (informational, does NOT gate mode selection)
+        self.robot_status_indicator = wx.StaticText(panel, label="\u25CF")
+        self.robot_status_indicator.SetForegroundColour(wx.Colour(150, 150, 150))  # grey = unknown
+        self.robot_status_indicator.SetToolTip("Robot connection status (click Refresh)")
+        robot_sizer.Add(self.robot_status_indicator, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 2)
+        
+        self.robot_status_label = wx.StaticText(panel, label="")
+        self.robot_status_label.SetFont(wx.Font(8, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_ITALIC, wx.FONTWEIGHT_NORMAL))
+        robot_sizer.Add(self.robot_status_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         
         # Refresh button to check robot status
         self.refresh_status_btn = wx.Button(panel, label="↻ Refresh")
@@ -591,29 +601,39 @@ class ProtoSimClientFrame(wx.Frame):
             self._log(f"Error fetching robot status: {e}")
             wx.CallAfter(self._update_mode_availability, ["simulation"])
     
-    def _update_mode_availability(self, available_modes: list) -> None:
-        """Enable/disable mode radio buttons based on available modes."""
-        # Simulation is always available
-        self.sim_mode_radio.Enable(True)
+    def _update_robot_status_indicator(
+        self,
+        robot_available: bool,
+        program_running: bool,
+        connection_details: dict,
+    ) -> None:
+        """Update the robot connection status indicator (dot + label).
         
-        # Real and Both modes depend on real robot availability
-        real_available = "real" in available_modes
-        both_available = "both" in available_modes
-        
-        self.real_mode_radio.Enable(real_available)
-        self.both_mode_radio.Enable(both_available)
-        
-        # Update labels to show availability
-        if real_available:
-            self.real_mode_radio.SetLabel("Real Robot")
-            self.both_mode_radio.SetLabel("Both (Sim + Real)")
+        This is purely informational — mode radio buttons stay enabled.
+        """
+        if robot_available and program_running:
+            self.robot_status_indicator.SetForegroundColour(wx.Colour(0, 180, 0))   # green
+            self.robot_status_indicator.SetLabel("\u25CF")
+            self.robot_status_label.SetLabel("Robot ready")
+            self.robot_status_label.SetForegroundColour(wx.Colour(0, 140, 0))
+        elif robot_available:
+            self.robot_status_indicator.SetForegroundColour(wx.Colour(220, 180, 0)) # amber
+            self.robot_status_indicator.SetLabel("\u25CF")
+            self.robot_status_label.SetLabel("Robot reachable")
+            self.robot_status_label.SetForegroundColour(wx.Colour(180, 140, 0))
         else:
-            self.real_mode_radio.SetLabel("Real Robot (unavailable)")
-            self.both_mode_radio.SetLabel("Both (unavailable)")
+            self.robot_status_indicator.SetForegroundColour(wx.Colour(180, 0, 0))   # red
+            self.robot_status_indicator.SetLabel("\u25CF")
+            self.robot_status_label.SetLabel("Robot offline")
+            self.robot_status_label.SetForegroundColour(wx.Colour(150, 0, 0))
         
-        # If current selection is now unavailable, switch to simulation
-        if not real_available and (self.real_mode_radio.GetValue() or self.both_mode_radio.GetValue()):
-            self.sim_mode_radio.SetValue(True)
+        tip_lines = []
+        for k, v in connection_details.items():
+            tip_lines.append(f"{k}: {v}")
+        self.robot_status_indicator.SetToolTip("\n".join(tip_lines) if tip_lines else "No details")
+        
+        self.robot_status_indicator.Refresh()
+        self.robot_status_label.Refresh()
     
     def _update_robot_choices(self) -> None:
         """Update robot dropdown."""
@@ -672,14 +692,137 @@ class ProtoSimClientFrame(wx.Frame):
         )
         self._log(f"Starting protocol: {total_poses} poses, mode={mode}")
         
-        # Update UI
-        self.start_btn.Enable(False)
-        self.stop_btn.Enable(True)
-        self._running_simulation = True
-        
-        # Run the protocol
-        self._run_async(self._run_protocol(robot, target_object, params, mode))
+        # For real / both modes, run a pre-flight check with a progress dialog
+        if mode in ("real", "both"):
+            self.start_btn.Enable(False)
+            self._log("Checking robot readiness...")
+            self._run_async(self._prepare_and_run(robot, target_object, params, mode, total_poses))
+        else:
+            # Simulation — run immediately
+            self.start_btn.Enable(False)
+            self.stop_btn.Enable(True)
+            self._running_simulation = True
+            self._run_async(self._run_protocol(robot, target_object, params, mode))
     
+    async def _prepare_and_run(
+        self,
+        robot: str,
+        target_object: str,
+        params: ProtoSimParameters,
+        mode: str,
+        total_poses: int,
+    ) -> None:
+        """Pre-flight check for real/both modes, then run the protocol.
+        
+        Calls the server's prepare_mode RPC to validate that the real robot
+        is reachable and the program is running. Shows a brief freeze/wait
+        while the server checks. If the check fails the user gets a dialog
+        with the option to retry, switch to simulation, or cancel.
+        """
+        try:
+            wx.CallAfter(self.progress_label.SetLabel, "Checking robot readiness…")
+            
+            response = await self._client.call_rpc("prepare_mode", {"mode": mode}, timeout=30.0)
+            
+            if response.get("ready"):
+                self._log(f"✓ Robot ready for {mode} mode")
+                self._log(response.get("message", ""))
+                # Proceed with execution
+                self._running_simulation = True
+                wx.CallAfter(self.stop_btn.Enable, True)
+                await self._run_protocol(robot, target_object, params, mode)
+            else:
+                msg = response.get("message", "Robot not ready")
+                self._log(f"✗ {msg}")
+                
+                can_retry = response.get("can_retry", False)
+                
+                # Show dialog on the GUI thread and wait for user decision
+                user_choice = await self._show_mode_check_dialog(mode, msg, can_retry)
+                
+                if user_choice == "retry":
+                    self._log("Retrying robot readiness check...")
+                    await self._prepare_and_run(robot, target_object, params, mode, total_poses)
+                    return
+                elif user_choice == "simulation":
+                    self._log("Switching to Simulation Only mode")
+                    wx.CallAfter(self.sim_mode_radio.SetValue, True)
+                    self._running_simulation = True
+                    wx.CallAfter(self.stop_btn.Enable, True)
+                    await self._run_protocol(robot, target_object, params, "simulation")
+                else:
+                    self._log("Cancelled by user")
+                    wx.CallAfter(self.start_btn.Enable, True)
+                    wx.CallAfter(self.progress_label.SetLabel, "Ready")
+                    
+        except Exception as e:
+            self._log(f"Pre-flight check error: {e}")
+            # Offer to fall back to simulation
+            user_choice = await self._show_mode_check_dialog(
+                mode,
+                f"Could not reach server for pre-flight check:\n{e}",
+                can_retry=True,
+            )
+            if user_choice == "simulation":
+                self._log("Falling back to Simulation Only mode")
+                wx.CallAfter(self.sim_mode_radio.SetValue, True)
+                self._running_simulation = True
+                wx.CallAfter(self.stop_btn.Enable, True)
+                await self._run_protocol(robot, target_object, params, "simulation")
+            elif user_choice == "retry":
+                await self._prepare_and_run(robot, target_object, params, mode, total_poses)
+            else:
+                wx.CallAfter(self.start_btn.Enable, True)
+                wx.CallAfter(self.progress_label.SetLabel, "Ready")
+    
+    async def _show_mode_check_dialog(
+        self, mode: str, message: str, can_retry: bool
+    ) -> str:
+        """Show a dialog on the GUI thread and return the user's choice.
+        
+        Returns one of: 'retry', 'simulation', 'cancel'
+        """
+        future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+        
+        def _show():
+            dlg = wx.Dialog(self, title=f"{mode.title()} Mode — Pre-flight Check", size=(480, 280))
+            sizer = wx.BoxSizer(wx.VERTICAL)
+            
+            msg_ctrl = wx.TextCtrl(
+                dlg, value=message,
+                style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_NO_VSCROLL,
+                size=(-1, 120),
+            )
+            msg_ctrl.SetFont(wx.Font(10, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
+            sizer.Add(msg_ctrl, 1, wx.EXPAND | wx.ALL, 10)
+            
+            btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            if can_retry:
+                retry_btn = wx.Button(dlg, label="Retry")
+                retry_btn.Bind(wx.EVT_BUTTON, lambda e: (dlg.EndModal(1)))
+                btn_sizer.Add(retry_btn, 0, wx.ALL, 5)
+            
+            sim_btn = wx.Button(dlg, label="Use Simulation Only")
+            sim_btn.Bind(wx.EVT_BUTTON, lambda e: (dlg.EndModal(2)))
+            btn_sizer.Add(sim_btn, 0, wx.ALL, 5)
+            
+            cancel_btn = wx.Button(dlg, label="Cancel")
+            cancel_btn.Bind(wx.EVT_BUTTON, lambda e: (dlg.EndModal(0)))
+            btn_sizer.Add(cancel_btn, 0, wx.ALL, 5)
+            
+            sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.BOTTOM, 10)
+            dlg.SetSizer(sizer)
+            
+            result = dlg.ShowModal()
+            dlg.Destroy()
+            
+            choice = {0: "cancel", 1: "retry", 2: "simulation"}.get(result, "cancel")
+            # Resolve the future from the async loop thread
+            self._loop.call_soon_threadsafe(future.set_result, choice)
+        
+        wx.CallAfter(_show)
+        return await future
+
     async def _run_protocol(
         self,
         robot: str,

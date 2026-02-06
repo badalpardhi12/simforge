@@ -36,22 +36,33 @@ services:
       - ROBOT_IP=${ROBOT_IP:-192.168.1.9}
       - UR_TYPE=${UR_TYPE:-ur5e}
       - USE_MOCK_HARDWARE=${USE_MOCK_HARDWARE:-false}
+      # Headless mode: IP for robot to connect back to ROS driver
+      - REVERSE_IP=${REVERSE_IP:-192.168.1.12}
     volumes:
       # Device access for cameras
       - /dev:/dev
+      # Mount entrypoint for hot-reload (overrides baked-in version)
+      - ./docker/ros_entrypoint.sh:/ros_entrypoint.sh:ro
       # Mount source for hot-reload development
-      - ./valid8_cell_description:/ros2_ws/src/valid8_cell_description:ro
+      # Note: description and moveit_config are writable for startup pipeline to generate URDF/SRDF
+      - ./valid8_cell_description:/ros2_ws/src/valid8_cell_description
       - ./valid8_cell_control:/ros2_ws/src/valid8_cell_control:ro
-      - ./valid8_cell_moveit_config:/ros2_ws/src/valid8_cell_moveit_config:ro
+      - ./valid8_cell_moveit_config:/ros2_ws/src/valid8_cell_moveit_config
       - ./simforge_server:/ros2_ws/src/simforge_server:ro
       # Mount launch files to installed location for immediate access
       - ./simforge_server/launch:/ros2_ws/install/simforge_server/share/simforge_server/launch:ro
+      # Mount description files to installed location (needed by UR driver's FindPackageShare)
+      - ./valid8_cell_description/urdf:/ros2_ws/install/valid8_cell_description/share/valid8_cell_description/urdf
+      - ./valid8_cell_description/meshes:/ros2_ws/install/valid8_cell_description/share/valid8_cell_description/meshes:ro
+      - ./valid8_cell_control/launch:/ros2_ws/install/valid8_cell_control/share/valid8_cell_control/launch:ro
+      - ./valid8_cell_moveit_config/config:/ros2_ws/install/valid8_cell_moveit_config/share/valid8_cell_moveit_config/config
+      - ./valid8_cell_moveit_config/launch:/ros2_ws/install/valid8_cell_moveit_config/share/valid8_cell_moveit_config/launch:ro
     privileged: true
     network_mode: host
     stdin_open: true
     tty: true
-    command: >
-      bash -c "source /ros2_ws/install/setup.bash && ros2 launch valid8_cell_control full_stack.launch.py robot_ip:=192.168.1.9 ur_type:=ur5e use_mock_hardware:=false headless_mode:=true launch_foxglove:=true launch_moveit:=true launch_command_gateway:=true"
+    # Command runs AFTER entrypoint (which handles startup pipeline)
+    command: bash -c "source /ros2_ws/install/setup.bash && ros2 launch valid8_cell_control full_stack.launch.py robot_ip:=$${ROBOT_IP:-192.168.1.9} ur_type:=$${UR_TYPE:-ur5e} use_mock_hardware:=$${USE_MOCK_HARDWARE:-false} launch_foxglove:=true launch_moveit:=true launch_command_gateway:=true reverse_ip:=$${REVERSE_IP:-192.168.1.12} 2>&1 | grep -v 'Robot receive timeout'"
     healthcheck:
       test: ["CMD", "ros2", "topic", "list"]
       interval: 10s
@@ -105,12 +116,15 @@ services:
       - ROBOT_IP=${ROBOT_IP:-192.168.1.9}
       - UR_TYPE=${UR_TYPE:-ur5e}
       - USE_MOCK_HARDWARE=${USE_MOCK_HARDWARE:-false}
+      # Headless mode: IP for robot to connect back to ROS driver
+      - REVERSE_IP=${REVERSE_IP:-192.168.1.12}
     volumes:
       - ./config:/ros2_ws/src/simforge_server/config:ro
       - ./assets:/ros2_ws/src/simforge_server/assets:ro
-      - ./valid8_cell_description:/ros2_ws/src/valid8_cell_description:ro
+      # Note: description and moveit_config are writable for startup pipeline to generate URDF/SRDF
+      - ./valid8_cell_description:/ros2_ws/src/valid8_cell_description
       - ./valid8_cell_control:/ros2_ws/src/valid8_cell_control:ro
-      - ./valid8_cell_moveit_config:/ros2_ws/src/valid8_cell_moveit_config:ro
+      - ./valid8_cell_moveit_config:/ros2_ws/src/valid8_cell_moveit_config
       - /dev:/dev
     privileged: true
     network_mode: host
@@ -125,7 +139,8 @@ services:
           use_mock_hardware:=$${USE_MOCK_HARDWARE:-false} \
           launch_foxglove:=true \
           launch_moveit:=true \
-          launch_command_gateway:=true
+          launch_command_gateway:=true \
+          reverse_ip:=$${REVERSE_IP:-192.168.1.12}
       "
     deploy:
       resources:

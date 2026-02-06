@@ -42,6 +42,8 @@ from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
     GroupAction,
+    ExecuteProcess,
+    TimerAction,
 )
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -67,6 +69,7 @@ def generate_launch_description():
     launch_command_gateway = LaunchConfiguration("launch_command_gateway")
     foxglove_port = LaunchConfiguration("foxglove_port")
     websocket_port = LaunchConfiguration("websocket_port")
+    reverse_ip = LaunchConfiguration("reverse_ip")
     
     # ========== Declare Arguments ==========
     declared_arguments = []
@@ -157,9 +160,25 @@ def generate_launch_description():
         )
     )
     
-    # ========== UR Robot Driver (standard UR description) ==========
-    # Use the standard UR description package - the robot TF tree will be
-    # published by the UR driver's robot_state_publisher
+    # Headless mode network configuration
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "reverse_ip",
+            default_value="192.168.1.12",
+            description="IP address of the ROS host machine for headless mode. "
+                       "The robot URScript connects back to this IP. "
+                       "Must be the actual IP, not 0.0.0.0.",
+        )
+    )
+    
+    # ========== UR Robot Driver (custom workcell description) ==========
+    # Use our custom workcell description which includes:
+    # - Shop floor, table, face fixture
+    # - Robot positioned ON the table (not at world origin)
+    # - iPhone tool attached to wrist_3_link
+    # 
+    # This properly integrates following the UR custom workcell tutorial:
+    # https://docs.universal-robots.com/Universal_Robots_ROS_Documentation/doc/ur_tutorials/
     ur_control_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             PathJoinSubstitution([
@@ -176,10 +195,10 @@ def generate_launch_description():
             # TF prefix for multi-robot support
             "tf_prefix": tf_prefix,
             
-            # Use default UR description (robot only, no workcell)
-            # We add workcell transforms separately below
-            "description_package": "ur_description",
-            "description_file": "ur.urdf.xacro",
+            # Use our CUSTOM workcell description with robot on table
+            # This includes the full TF tree: world -> shop_floor -> robot_mount -> robot
+            "description_package": "valid8_cell_description",
+            "description_file": "valid8_cell.urdf.xacro",
             
             # Disable UR driver's RViz (we launch our own if needed)
             "launch_rviz": "false",
@@ -190,93 +209,15 @@ def generate_launch_description():
             # Headless mode - no URCap required
             "headless_mode": "true",
             
+            # Activate the joint controller on startup
+            "activate_joint_controller": "true",
+            
+            # Reverse IP for headless mode - robot connects back to this address
+            "reverse_ip": reverse_ip,
+            
             # Mock hardware for simulation
             "use_fake_hardware": use_mock_hardware,
         }.items(),
-    )
-    
-    # ========== Workcell Static Transforms ==========
-    # The UR driver already publishes world -> base_link at origin (from ur.urdf.xacro)
-    # So we position all workcell elements relative to where they should be in the robot's frame
-    # 
-    # In our workcell design:
-    # - Robot base_link is at world [-0.6758, 0, 1.03] with -90° yaw
-    # - shop_floor is at world [0, 0, 0]
-    # - table_link is at world [0, 0, 1.0]
-    # - face_link is at world [0.1742, 0, 1.6] with +90° yaw
-    # - robot_mount is at world [-0.6758, 0, 1.03] with -90° yaw (same as robot)
-    #
-    # But since UR driver places robot at world origin, we need to adjust:
-    # - base_link is at origin (from UR driver)
-    # - We publish shop_floor, table, face, robot_mount relative to base_link
-    
-    # base_link -> robot_mount (robot_mount is at same position as base_link, just a reference frame)
-    # This is needed for MoveIt SRDF compatibility
-    base_to_robot_mount = Node(
-        package="tf2_ros",
-        executable="static_transform_publisher",
-        name="base_to_robot_mount_publisher",
-        arguments=[
-            "--x", "0",
-            "--y", "0",
-            "--z", "0",
-            "--frame-id", "base_link",
-            "--child-frame-id", "robot_mount",
-        ],
-    )
-    
-    # base_link -> shop_floor
-    # Robot is at [-0.6758, 0, 1.03] with -90° yaw in world
-    # shop_floor is at [0, 0, 0] in world
-    # In robot's frame (base_link), shop_floor is at inverse transform:
-    # After -90° yaw rotation: X'=Y, Y'=-X
-    # Offset: [0 - (-0.6758), 0 - 0, 0 - 1.03] = [0.6758, 0, -1.03]
-    # In rotated frame: [0, 0.6758, -1.03] with +90° yaw
-    base_to_shop_floor = Node(
-        package="tf2_ros",
-        executable="static_transform_publisher",
-        name="base_to_shop_floor_publisher",
-        arguments=[
-            "--x", "0",
-            "--y", "0.6758",
-            "--z", "-1.03",
-            "--yaw", "1.5708",
-            "--pitch", "0",
-            "--roll", "0",
-            "--frame-id", "base_link",
-            "--child-frame-id", "shop_floor",
-        ],
-    )
-    
-    # shop_floor -> table_link (table at z=1.0m in world = z=1.0 in shop_floor)
-    shop_floor_to_table = Node(
-        package="tf2_ros",
-        executable="static_transform_publisher",
-        name="shop_floor_to_table_publisher",
-        arguments=[
-            "--x", "0",
-            "--y", "0",
-            "--z", "1.0",
-            "--frame-id", "shop_floor",
-            "--child-frame-id", "table_link",
-        ],
-    )
-    
-    # shop_floor -> face_link ([0.1742, 0, 1.6] with 90° yaw relative to shop_floor)
-    shop_floor_to_face = Node(
-        package="tf2_ros",
-        executable="static_transform_publisher",
-        name="shop_floor_to_face_publisher",
-        arguments=[
-            "--x", "0.1742",
-            "--y", "0",
-            "--z", "1.6",
-            "--yaw", "1.5708",
-            "--pitch", "0",
-            "--roll", "0",
-            "--frame-id", "shop_floor",
-            "--child-frame-id", "face_link",
-        ],
     )
     
     # ========== MoveIt move_group ==========
@@ -343,17 +284,53 @@ def generate_launch_description():
         condition=IfCondition(launch_rviz),
     )
     
+    # ========== Headless Mode Activation ==========
+    # In headless mode, the robot_program_running starts as false, which causes
+    # controller_stopper to deactivate controllers. We need to:
+    # 1. Call resend_robot_program to start the URScript on the robot
+    # 2. Wait for robot_program_running to become true
+    # 3. controller_stopper will then auto-activate the scaled_joint_trajectory_controller
+    # 
+    # CRITICAL ORDER: resend_robot_program FIRST, then wait. The controller_stopper
+    # node (from ur_robot_driver) watches robot_program_running and automatically
+    # activates/deactivates controllers. If we manually activate the controller
+    # while robot_program_running is false, controller_stopper immediately
+    # deactivates it again (race condition).
+    headless_activation = TimerAction(
+        period=15.0,  # Wait 15 seconds for UR driver to be fully ready
+        actions=[
+            ExecuteProcess(
+                cmd=[
+                    "bash", "-c",
+                    ". /ros2_ws/install/setup.bash && "
+                    "echo '[headless_keepalive] Starting headless mode keepalive monitor' && "
+                    "while true; do "
+                    "  RUNNING=$(ros2 topic echo /io_and_status_controller/robot_program_running --once 2>/dev/null | grep -c 'true' || true); "
+                    "  if [ \"$RUNNING\" = \"0\" ]; then "
+                    "    echo '[headless_keepalive] robot_program_running is false, resending program...'; "
+                    "    ros2 service call /io_and_status_controller/resend_robot_program std_srvs/srv/Trigger 2>/dev/null && "
+                    "    echo '[headless_keepalive] Robot program resent, waiting for controller_stopper to activate controllers...'; "
+                    "    sleep 3; "
+                    "    CTRL_STATE=$(ros2 control list_controllers 2>/dev/null | grep scaled_joint_trajectory_controller | grep -c active || true); "
+                    "    if [ \"$CTRL_STATE\" = \"0\" ]; then "
+                    "      echo '[headless_keepalive] Controller still inactive, forcing activation...'; "
+                    "      ros2 control set_controller_state scaled_joint_trajectory_controller active 2>/dev/null || true; "
+                    "    fi; "
+                    "  fi; "
+                    "  sleep 5; "
+                    "done"
+                ],
+                output="screen",
+            ),
+        ],
+    )
+
     return LaunchDescription(
         declared_arguments
         + [
-            # Core robot control (includes robot_state_publisher)
+            # Core robot control (includes robot_state_publisher with full workcell TF tree)
+            # Robot is properly positioned on table via valid8_cell.urdf.xacro
             ur_control_launch,
-            
-            # Workcell static transforms (relative to base_link since UR driver places robot at origin)
-            base_to_robot_mount,
-            base_to_shop_floor,
-            shop_floor_to_table,
-            shop_floor_to_face,
             
             # Motion planning
             moveit_launch,
@@ -364,5 +341,8 @@ def generate_launch_description():
             
             # Application layer
             command_gateway_node,
+            
+            # Headless mode activation (delayed to ensure driver is ready)
+            headless_activation,
         ]
     )

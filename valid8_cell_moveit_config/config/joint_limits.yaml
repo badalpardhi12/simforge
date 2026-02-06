@@ -11,6 +11,12 @@
 #
 # Reference: https://docs.universal-robots.com/Universal_Robots_ROS_Documentation/doc/ur_tutorials/my_robot_cell/doc/build_moveit_config.html
 
+# Default velocity and acceleration scaling factors
+# These are applied to ALL planned trajectories and can be overridden per-request
+# Start with conservative values (0.1-0.3) for testing, increase up to 1.0 for production
+default_velocity_scaling_factor: 0.1
+default_acceleration_scaling_factor: 0.1
+
 # Joint limits for UR5e
 # Note: If using tf_prefix, prepend it to joint names
 joint_limits:
