@@ -13,45 +13,55 @@
 
 # Default velocity and acceleration scaling factors
 # These are applied to ALL planned trajectories and can be overridden per-request
-# Start with conservative values (0.1-0.3) for testing, increase up to 1.0 for production
+# IMPORTANT: Keep these conservative! The UR5e's hardware max velocities are very high
+# (3.14 rad/s shoulder, 6.28 rad/s wrist) but external control via ROS2 should use
+# much lower limits to avoid velocity-limit protective stops on the teach pendant.
+# The actual commanded velocity = max_velocity × scaling_factor.
 default_velocity_scaling_factor: 0.1
 default_acceleration_scaling_factor: 0.1
 
 # Joint limits for UR5e
-# Note: If using tf_prefix, prepend it to joint names
+# Note: These are PLANNING limits, NOT the hardware maximums.
+# The UR5e hardware maximums are 3.14 rad/s (shoulder/elbow) and 6.28 rad/s (wrist),
+# but using those values causes velocity-limit protective stops when the robot controller
+# applies its own safety checks. We use ~30% of hardware max as our planning ceiling.
+# Combined with velocity_scaling_factor (0.1-0.5), actual velocities will be safe.
+#
+# The max_acceleration is also reduced from 5.0 to 2.5 rad/s^2 to avoid jerky motion
+# and acceleration-triggered protective stops.
 joint_limits:
   shoulder_pan_joint:
     has_velocity_limits: true
-    max_velocity: 3.14  # rad/s
+    max_velocity: 1.0  # rad/s (~32% of 3.14 hardware max)
     has_acceleration_limits: true
-    max_acceleration: 5.0  # rad/s^2 (reasonable default)
+    max_acceleration: 2.5  # rad/s^2 (reduced from 5.0)
     
   shoulder_lift_joint:
     has_velocity_limits: true
-    max_velocity: 3.14
+    max_velocity: 1.0
     has_acceleration_limits: true
-    max_acceleration: 5.0
+    max_acceleration: 2.5
     
   elbow_joint:
     has_velocity_limits: true
-    max_velocity: 3.14
+    max_velocity: 1.0
     has_acceleration_limits: true
-    max_acceleration: 5.0
+    max_acceleration: 2.5
     
   wrist_1_joint:
     has_velocity_limits: true
-    max_velocity: 6.28  # Wrist joints are faster
+    max_velocity: 1.5  # rad/s (~24% of 6.28 hardware max)
     has_acceleration_limits: true
-    max_acceleration: 5.0
+    max_acceleration: 2.5
     
   wrist_2_joint:
     has_velocity_limits: true
-    max_velocity: 6.28
+    max_velocity: 1.5
     has_acceleration_limits: true
-    max_acceleration: 5.0
+    max_acceleration: 2.5
     
   wrist_3_joint:
     has_velocity_limits: true
-    max_velocity: 6.28
+    max_velocity: 1.5
     has_acceleration_limits: true
-    max_acceleration: 5.0
+    max_acceleration: 2.5

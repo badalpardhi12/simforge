@@ -897,9 +897,16 @@ class CommandGatewayNode(Node):
         robot_name = params.get('robot_name', self.default_robot)
         idle_time = params.get('idle_time', 2.0)
         mode = params.get('mode', 'simulation')
-        # Default to conservative speed (0.3 = 30% of max velocity/acceleration)
-        # Higher values risk velocity limit violations on the UR controller
-        move_speed = min(0.5, params.get('move_speed', 0.3))
+        # Default to conservative speed for real robot safety.
+        # The velocity_scale is multiplied by joint_limits.yaml max_velocity values.
+        # With max_velocity=1.0 rad/s (shoulder) and 1.5 rad/s (wrist), a scale of 0.3
+        # gives actual velocities of 0.3 and 0.45 rad/s respectively — safe for UR5e.
+        # Cap at 0.3 for real/both modes to prevent velocity-limit protective stops.
+        requested_speed = params.get('move_speed', 0.3)
+        if mode in ('real', 'both'):
+            move_speed = min(0.3, requested_speed)
+        else:
+            move_speed = min(0.5, requested_speed)
         
         # Pre-flight validation for real robot modes
         if mode in ('real', 'both'):
@@ -1256,6 +1263,20 @@ class CommandGatewayNode(Node):
                             'current_pose_name': pose_name,
                             'status': 'real_robot_failed',
                         })
+                        # After a failure (likely protective stop), wait and try to
+                        # recover the robot program before the next pose.
+                        self.get_logger().info(
+                            "Waiting 5s for robot recovery after execution failure..."
+                        )
+                        await asyncio.sleep(5.0)
+                        # Try to re-establish the robot program
+                        recovered = await self._ensure_robot_ready(timeout=15.0)
+                        if not recovered:
+                            self.get_logger().error(
+                                "Robot not recoverable after protective stop — "
+                                "stopping proto-sim early"
+                            )
+                            break  # Exit the pose loop entirely
                         continue  # Skip to next pose - don't count as completed
                     else:
                         # Sync simulation to target after real robot completes
@@ -2172,13 +2193,25 @@ class CommandGatewayNode(Node):
                         t = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
                         time_from_start.append(t)
                     
-                    # Log trajectory details
+                    # Log trajectory details including peak velocities for debugging
                     has_velocities = any(len(p.velocities) > 0 for p in trajectory.points)
                     has_accelerations = any(len(p.accelerations) > 0 for p in trajectory.points)
+                    
+                    # Calculate peak velocities per joint for velocity-limit debugging
+                    peak_vel_str = ""
+                    if has_velocities:
+                        num_joints = len(trajectory.joint_names)
+                        peak_vels = [0.0] * num_joints
+                        for point in trajectory.points:
+                            for j in range(min(num_joints, len(point.velocities))):
+                                peak_vels[j] = max(peak_vels[j], abs(point.velocities[j]))
+                        peak_vel_str = f", peak_vel=[{', '.join(f'{v:.2f}' for v in peak_vels)}] rad/s"
+                    
                     self.get_logger().info(
                         f"MoveIt trajectory: {len(trajectory.points)} points, "
                         f"duration={time_from_start[-1]:.2f}s, "
-                        f"has_vel={has_velocities}, has_accel={has_accelerations}"
+                        f"vel_scale={velocity_scale}, accel_scale={acceleration_scale}"
+                        f"{peak_vel_str}"
                     )
                     
                     return {
