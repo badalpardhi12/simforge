@@ -1156,8 +1156,16 @@ class CommandGatewayNode(Node):
                 self.get_logger().info(f"Pose {i+1}/{total_poses}: {pose_name}")
                 self.get_logger().info(f"  Position: ({position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f})")
                 
-                # Solve IK for this pose, using current joints as seed for continuity
-                target_joints = self._solve_ik_for_pose(position, orientation, seed_joints=self.sim_joint_positions)
+                # Solve IK for this pose, using current joints as seed for continuity.
+                # In real/both mode, use the real robot's actual position as seed
+                # so that IK finds the nearest configuration to where the robot
+                # physically is (especially important after a prior failure left
+                # the robot mid-trajectory).
+                if mode in ('both', 'real') and self.real_robot_joint_positions:
+                    ik_seed = list(self.real_robot_joint_positions)
+                else:
+                    ik_seed = self.sim_joint_positions
+                target_joints = self._solve_ik_for_pose(position, orientation, seed_joints=ik_seed)
                 
                 if target_joints is None:
                     self.get_logger().warn(f"IK failed for pose {pose_name}")
@@ -1281,16 +1289,82 @@ class CommandGatewayNode(Node):
                                 })
                                 continue
                     
-                    self.get_logger().info("Sending trajectory to real robot (via UR driver)...")
-                    real_success, real_duration = await self._execute_real_robot_trajectory(
-                        trajectory_data,
-                        velocity_scale=move_speed,
-                        wait_for_completion=True,  # CRITICAL: Wait for robot to finish
-                    )
+                    # ---------- execute with automatic retry ----------
+                    # RTDE stream glitches ("Failed to read from stream") cause the
+                    # scaled_joint_trajectory_controller to deactivate mid-trajectory,
+                    # producing INVALID_GOAL or PATH_TOLERANCE_VIOLATED.  The UR
+                    # driver's controller_stopper re-activates the controller within
+                    # a few seconds.  Instead of skipping the pose we re-plan from
+                    # the robot's current position and retry (up to MAX_RETRIES).
+                    MAX_RETRIES = 2
+                    real_success = False
+                    real_duration = 0.0
+                    for attempt in range(1 + MAX_RETRIES):
+                        self.get_logger().info(
+                            f"Sending trajectory to real robot "
+                            f"(attempt {attempt + 1}/{1 + MAX_RETRIES})…"
+                        )
+                        real_success, real_duration = await self._execute_real_robot_trajectory(
+                            trajectory_data,
+                            velocity_scale=move_speed,
+                            wait_for_completion=True,
+                        )
+                        if real_success:
+                            break  # trajectory completed
+
+                        # --- failure path ---
+                        self.get_logger().warn(
+                            f"Trajectory attempt {attempt + 1} FAILED for "
+                            f"pose {pose_name}"
+                        )
+                        if attempt >= MAX_RETRIES:
+                            break  # exhausted retries
+
+                        # Wait for controller_stopper to reactivate the controller
+                        self.get_logger().info(
+                            "Waiting 5 s for RTDE reconnect / controller reactivation…"
+                        )
+                        await asyncio.sleep(5.0)
+
+                        # Ensure robot program is running again
+                        recovered = await self._ensure_robot_ready(timeout=15.0)
+                        if not recovered:
+                            self.get_logger().error(
+                                "Robot not recoverable — aborting retries"
+                            )
+                            break
+
+                        # Re-plan from the robot's *current* position
+                        if self.real_robot_joint_positions:
+                            retry_start = list(self.real_robot_joint_positions)
+                            self.sim_joint_positions = list(retry_start)
+                            self.get_logger().info(
+                                f"Re-planning from REAL state: "
+                                f"{[f'{j:.2f}' for j in retry_start]}"
+                            )
+                            trajectory_data = self._plan_motion_moveit_sync(
+                                retry_start, target_joints,
+                                velocity_scale=move_speed,
+                                acceleration_scale=move_speed,
+                            )
+                            if trajectory_data is None:
+                                self.get_logger().error(
+                                    "Re-plan from current state failed — "
+                                    "aborting retries"
+                                )
+                                break
+                        else:
+                            self.get_logger().error(
+                                "No real robot state available for re-plan"
+                            )
+                            break
+
                     if not real_success:
-                        self.get_logger().error(f"Real robot trajectory FAILED for pose {pose_name}")
+                        self.get_logger().error(
+                            f"Real robot trajectory FAILED for pose {pose_name} "
+                            f"after {min(attempt + 1, 1 + MAX_RETRIES)} attempt(s)"
+                        )
                         real_failed += 1
-                        # Send failure feedback for this pose
                         await safe_send_feedback({
                             'type': 'rpc_feedback',
                             'request_id': request_id,
@@ -1299,21 +1373,18 @@ class CommandGatewayNode(Node):
                             'current_pose_name': pose_name,
                             'status': 'real_robot_failed',
                         })
-                        # After a failure (likely protective stop), wait and try to
-                        # recover the robot program before the next pose.
+                        # Final recovery attempt before moving to the next pose
                         self.get_logger().info(
-                            "Waiting 5s for robot recovery after execution failure..."
+                            "Waiting 5 s for robot recovery before next pose…"
                         )
                         await asyncio.sleep(5.0)
-                        # Try to re-establish the robot program
                         recovered = await self._ensure_robot_ready(timeout=15.0)
                         if not recovered:
                             self.get_logger().error(
-                                "Robot not recoverable after protective stop — "
-                                "stopping proto-sim early"
+                                "Robot not recoverable — stopping proto-sim early"
                             )
-                            break  # Exit the pose loop entirely
-                        continue  # Skip to next pose - don't count as completed
+                            break
+                        continue  # skip to next pose
                     else:
                         # Sync simulation to target after real robot completes
                         self.sim_joint_positions = list(target_joints)
@@ -1385,12 +1456,50 @@ class CommandGatewayNode(Node):
                 if home_trajectory:
                     # Execute return home trajectory with wait for completion
                     if mode in ('both', 'real'):
-                        _, _ = await self._execute_real_robot_trajectory(
-                            home_trajectory,
-                            velocity_scale=0.3,  # Slower for safety
-                            wait_for_completion=True,
-                        )
-                        self.sim_joint_positions = list(home_position)
+                        # Retry logic for return-home (same as pose execution)
+                        home_success = False
+                        for attempt in range(1 + 2):  # up to 2 retries
+                            self.get_logger().info(
+                                f"Return home attempt {attempt + 1}/3…"
+                            )
+                            home_success, _ = await self._execute_real_robot_trajectory(
+                                home_trajectory,
+                                velocity_scale=0.3,
+                                wait_for_completion=True,
+                            )
+                            if home_success:
+                                self.sim_joint_positions = list(home_position)
+                                break
+                            # Wait for controller recovery
+                            self.get_logger().warn(
+                                f"Return home attempt {attempt + 1} failed"
+                            )
+                            if attempt < 2:
+                                await asyncio.sleep(5.0)
+                                recovered = await self._ensure_robot_ready(timeout=15.0)
+                                if not recovered:
+                                    self.get_logger().error(
+                                        "Robot not recoverable — cannot return home"
+                                    )
+                                    break
+                                # Re-plan from current position
+                                if self.real_robot_joint_positions:
+                                    home_start_joints = list(self.real_robot_joint_positions)
+                                    self.sim_joint_positions = list(home_start_joints)
+                                    home_trajectory = self._plan_motion_moveit_sync(
+                                        home_start_joints, home_position,
+                                        velocity_scale=min(0.3, move_speed),
+                                        acceleration_scale=min(0.3, move_speed),
+                                    )
+                                    if home_trajectory is None:
+                                        self.get_logger().error(
+                                            "Re-plan to home failed"
+                                        )
+                                        break
+                        if not home_success:
+                            self.get_logger().error(
+                                "Failed to return home after all attempts"
+                            )
                     
                     # Execute simulation (only in simulation-only mode)
                     if mode == 'simulation':

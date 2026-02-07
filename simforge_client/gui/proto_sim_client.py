@@ -268,14 +268,14 @@ class ProtoSimClientFrame(wx.Frame):
         self.robot_choice = wx.Choice(panel, choices=[])
         robot_sizer.Add(self.robot_choice, 1, wx.ALL, 5)
         
-        # Execution mode — always enabled, server validates at execution time
+        # Execution mode — two options:
+        #   "Simulation Only" → mode="simulation"
+        #   "Real Robot"      → mode="both" (sim + real combined)
         self.sim_mode_radio = wx.RadioButton(panel, label="Simulation Only", style=wx.RB_GROUP)
         self.real_mode_radio = wx.RadioButton(panel, label="Real Robot")
-        self.both_mode_radio = wx.RadioButton(panel, label="Both (Sim + Real)")
         
         robot_sizer.Add(self.sim_mode_radio, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         robot_sizer.Add(self.real_mode_radio, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
-        robot_sizer.Add(self.both_mode_radio, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         
         # Robot connection status indicator (informational, does NOT gate mode selection)
         self.robot_status_indicator = wx.StaticText(panel, label="\u25CF")
@@ -687,10 +687,9 @@ class ProtoSimClientFrame(wx.Frame):
             return
         
         # Determine execution mode
+        # "Simulation Only" → simulation, "Real Robot" → both (sim + real)
         if self.sim_mode_radio.GetValue():
             mode = "simulation"
-        elif self.real_mode_radio.GetValue():
-            mode = "real"
         else:
             mode = "both"
         
