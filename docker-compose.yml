@@ -1,14 +1,18 @@
 # Simforge Docker Compose Configuration
 #
-# This file orchestrates all services for the Simforge distributed system.
-#
 # Usage:
-#   Development (x86):  docker-compose --profile dev up
-#   Production (Thor):  docker-compose --profile prod up
+#   Development (x86):  docker compose --profile dev up
+#   Production (Jetson): docker compose --profile prod up
+#
+# Environment Variables:
+#   ROBOT_IP    - IP address of the UR robot (default: 192.168.1.9)
+#   UR_TYPE     - Robot model (default: ur5e)
+#   REVERSE_IP  - IP for robot to connect back to ROS driver (default: 192.168.1.12)
+#   USE_MOCK_HARDWARE - Use simulated hardware (default: false)
 
 services:
   # =============================================================================
-  # ROS 2 Server (AI Workstation - Development)
+  # ROS 2 Server — Development (x86 AI Workstation)
   # =============================================================================
   ros2_server_dev:
     build:
@@ -18,7 +22,6 @@ services:
     container_name: simforge_server_dev
     profiles:
       - dev
-    # GPU support - uncomment when nvidia-container-toolkit is configured with Docker Desktop
     deploy:
       resources:
         reservations:
@@ -32,26 +35,19 @@ services:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
       - DISPLAY=${DISPLAY}
-      # Robot configuration
       - ROBOT_IP=${ROBOT_IP:-192.168.1.9}
       - UR_TYPE=${UR_TYPE:-ur5e}
       - USE_MOCK_HARDWARE=${USE_MOCK_HARDWARE:-false}
-      # Headless mode: IP for robot to connect back to ROS driver
       - REVERSE_IP=${REVERSE_IP:-192.168.1.12}
     volumes:
-      # Device access for cameras
       - /dev:/dev
-      # Mount entrypoint for hot-reload (overrides baked-in version)
       - ./docker/ros_entrypoint.sh:/ros_entrypoint.sh:ro
-      # Mount source for hot-reload development
-      # Note: description and moveit_config are writable for startup pipeline to generate URDF/SRDF
+      # Source mounts for hot-reload development
       - ./valid8_cell_description:/ros2_ws/src/valid8_cell_description
       - ./valid8_cell_control:/ros2_ws/src/valid8_cell_control:ro
       - ./valid8_cell_moveit_config:/ros2_ws/src/valid8_cell_moveit_config
       - ./simforge_server:/ros2_ws/src/simforge_server:ro
-      # Mount launch files to installed location for immediate access
-      - ./simforge_server/launch:/ros2_ws/install/simforge_server/share/simforge_server/launch:ro
-      # Mount description files to installed location (needed by UR driver's FindPackageShare)
+      # Install-space mounts (FindPackageShare resolution)
       - ./valid8_cell_description/urdf:/ros2_ws/install/valid8_cell_description/share/valid8_cell_description/urdf
       - ./valid8_cell_description/meshes:/ros2_ws/install/valid8_cell_description/share/valid8_cell_description/meshes:ro
       - ./valid8_cell_control/launch:/ros2_ws/install/valid8_cell_control/share/valid8_cell_control/launch:ro
@@ -62,8 +58,17 @@ services:
     network_mode: host
     stdin_open: true
     tty: true
-    # Command runs AFTER entrypoint (which handles startup pipeline)
-    command: bash -c "source /ros2_ws/install/setup.bash && ros2 launch valid8_cell_control full_stack.launch.py robot_ip:=$${ROBOT_IP:-192.168.1.9} ur_type:=$${UR_TYPE:-ur5e} use_mock_hardware:=$${USE_MOCK_HARDWARE:-false} launch_foxglove:=true launch_moveit:=true launch_command_gateway:=true reverse_ip:=$${REVERSE_IP:-192.168.1.12} 2>&1 | grep -v 'Robot receive timeout'"
+    command: >-
+      bash -c "source /ros2_ws/install/setup.bash &&
+      ros2 launch valid8_cell_control full_stack.launch.py
+        robot_ip:=$${ROBOT_IP:-192.168.1.9}
+        ur_type:=$${UR_TYPE:-ur5e}
+        use_mock_hardware:=$${USE_MOCK_HARDWARE:-false}
+        launch_foxglove:=true
+        launch_moveit:=true
+        launch_command_gateway:=true
+        reverse_ip:=$${REVERSE_IP:-192.168.1.12}
+        2>&1 | grep -v 'Robot receive timeout'"
     healthcheck:
       test: ["CMD", "ros2", "topic", "list"]
       interval: 10s
@@ -71,33 +76,7 @@ services:
       retries: 3
 
   # =============================================================================
-  # Foxglove Bridge (Development)
-  # =============================================================================
-  foxglove_bridge_dev:
-    image: simforge_server:dev-x86
-    container_name: simforge_foxglove_dev
-    profiles:
-      - dev
-    depends_on:
-      ros2_server_dev:
-        condition: service_started
-    environment:
-      - ROS_DOMAIN_ID=42
-      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    network_mode: host
-    command: >
-      bash -c "
-        source /ros2_ws/install/setup.bash &&
-        ros2 launch foxglove_bridge foxglove_bridge_launch.xml
-          port:=9091
-          address:=0.0.0.0
-          send_buffer_limit:=100000000
-          use_compression:=true
-          asset_uri_allowlist:='[\"package://.*\", \"file://.*\"]'
-      "
-
-  # =============================================================================
-  # ROS 2 Server (Jetson Thor - Production)
+  # ROS 2 Server — Production (Jetson Thor)
   # =============================================================================
   ros2_server_prod:
     build:
@@ -107,42 +86,6 @@ services:
     container_name: simforge_server_prod
     profiles:
       - prod
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=all
-      - ROS_DOMAIN_ID=42
-      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-      # Robot configuration
-      - ROBOT_IP=${ROBOT_IP:-192.168.1.9}
-      - UR_TYPE=${UR_TYPE:-ur5e}
-      - USE_MOCK_HARDWARE=${USE_MOCK_HARDWARE:-false}
-      # Headless mode: IP for robot to connect back to ROS driver
-      - REVERSE_IP=${REVERSE_IP:-192.168.1.12}
-    volumes:
-      - ./config:/ros2_ws/src/simforge_server/config:ro
-      - ./assets:/ros2_ws/src/simforge_server/assets:ro
-      # Note: description and moveit_config are writable for startup pipeline to generate URDF/SRDF
-      - ./valid8_cell_description:/ros2_ws/src/valid8_cell_description
-      - ./valid8_cell_control:/ros2_ws/src/valid8_cell_control:ro
-      - ./valid8_cell_moveit_config:/ros2_ws/src/valid8_cell_moveit_config
-      - /dev:/dev
-    privileged: true
-    network_mode: host
-    stdin_open: true
-    tty: true
-    command: >
-      bash -c "
-        source /ros2_ws/install/setup.bash &&
-        ros2 launch valid8_cell_control full_stack.launch.py \
-          robot_ip:=$${ROBOT_IP:-192.168.1.9} \
-          ur_type:=$${UR_TYPE:-ur5e} \
-          use_mock_hardware:=$${USE_MOCK_HARDWARE:-false} \
-          launch_foxglove:=true \
-          launch_moveit:=true \
-          launch_command_gateway:=true \
-          reverse_ip:=$${REVERSE_IP:-192.168.1.12}
-      "
     deploy:
       resources:
         reservations:
@@ -150,41 +93,37 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-
-  # =============================================================================
-  # Foxglove Bridge (Production)
-  # =============================================================================
-  foxglove_bridge_prod:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.server.l4t
-    image: simforge_server:prod-l4t
-    container_name: simforge_foxglove_prod
-    profiles:
-      - prod
+    runtime: nvidia
     environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - ROBOT_IP=${ROBOT_IP:-192.168.1.9}
+      - UR_TYPE=${UR_TYPE:-ur5e}
+      - USE_MOCK_HARDWARE=${USE_MOCK_HARDWARE:-false}
+      - REVERSE_IP=${REVERSE_IP:-192.168.1.12}
+    volumes:
+      - /dev:/dev
+      - ./valid8_cell_description:/ros2_ws/src/valid8_cell_description
+      - ./valid8_cell_control:/ros2_ws/src/valid8_cell_control:ro
+      - ./valid8_cell_moveit_config:/ros2_ws/src/valid8_cell_moveit_config
+    privileged: true
     network_mode: host
-    command: >
-      bash -c "
-        source /ros2_ws/install/setup.bash &&
-        ros2 launch foxglove_bridge foxglove_bridge_launch.xml
-          port:=9090
-          address:=0.0.0.0
-          send_buffer_limit:=100000000
-          use_compression:=true
-          asset_uri_allowlist:='[\"package://.*\", \"file://.*\"]'
-      "
-    depends_on:
-      - ros2_server_prod
-
-# =============================================================================
-# Networks
-# =============================================================================
-networks:
-  simforge_net:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.28.0.0/16
+    stdin_open: true
+    tty: true
+    command: >-
+      bash -c "source /ros2_ws/install/setup.bash &&
+      ros2 launch valid8_cell_control full_stack.launch.py
+        robot_ip:=$${ROBOT_IP:-192.168.1.9}
+        ur_type:=$${UR_TYPE:-ur5e}
+        use_mock_hardware:=$${USE_MOCK_HARDWARE:-false}
+        launch_foxglove:=true
+        launch_moveit:=true
+        launch_command_gateway:=true
+        reverse_ip:=$${REVERSE_IP:-192.168.1.12}"
+    healthcheck:
+      test: ["CMD", "ros2", "topic", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
