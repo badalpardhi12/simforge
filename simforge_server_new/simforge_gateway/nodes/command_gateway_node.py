@@ -156,10 +156,18 @@ class CommandGatewayNode(Node):
         self.declare_parameter("websocket_port", 8766)
         self.declare_parameter("websocket_host", "0.0.0.0")
         self.declare_parameter("max_clients", 5)
+        # Motion scaling — configurable at launch time.
+        # These are the MoveIt planning request scaling factors that
+        # multiply against the per-joint limits in joint_limits.yaml.
+        # Effective speed = per-joint limit × scaling factor.
+        self.declare_parameter("max_velocity_scaling", 0.2)
+        self.declare_parameter("max_acceleration_scaling", 0.2)
 
         self.ws_port = self.get_parameter("websocket_port").value
         self.ws_host = self.get_parameter("websocket_host").value
         self.max_clients = self.get_parameter("max_clients").value
+        self.max_velocity_scaling = self.get_parameter("max_velocity_scaling").value
+        self.max_acceleration_scaling = self.get_parameter("max_acceleration_scaling").value
 
         self.cb_group = ReentrantCallbackGroup()
 
@@ -251,6 +259,10 @@ class CommandGatewayNode(Node):
             f"Command Gateway initialised – WS on {self.ws_host}:{self.ws_port}"
         )
         self.get_logger().info(f"Robots: {list(ROBOT_CONFIG.keys())}")
+        self.get_logger().info(
+            f"Motion scaling: vel={self.max_velocity_scaling}, "
+            f"accel={self.max_acceleration_scaling}"
+        )
 
     # ─────────────────────────────────────────────────────────────────
     # Joint state callback
@@ -474,10 +486,19 @@ class CommandGatewayNode(Node):
         self,
         robot_name: str,
         target_joints: List[float],
-        velocity_scaling: float = 0.5,
-        acceleration_scaling: float = 0.5,
+        velocity_scaling: Optional[float] = None,
+        acceleration_scaling: Optional[float] = None,
     ) -> Optional[RobotTrajectory]:
-        """Call /plan_kinematic_path and return RobotTrajectory or None."""
+        """Call /plan_kinematic_path and return RobotTrajectory or None.
+
+        velocity_scaling / acceleration_scaling default to the ROS parameters
+        max_velocity_scaling / max_acceleration_scaling when not provided.
+        """
+        if velocity_scaling is None:
+            velocity_scaling = self.max_velocity_scaling
+        if acceleration_scaling is None:
+            acceleration_scaling = self.max_acceleration_scaling
+
         cfg = ROBOT_CONFIG[robot_name]
 
         req = GetMotionPlan.Request()
@@ -702,7 +723,7 @@ class CommandGatewayNode(Node):
         robot_name: str,
         position: List[float],
         orientation: List[float],
-        velocity_scaling: float = 0.5,
+        velocity_scaling: Optional[float] = None,
     ) -> str:
         """
         Full pipeline: IK → Plan → Execute.
@@ -781,7 +802,6 @@ class CommandGatewayNode(Node):
 
         trajectory = await self._plan_to_joints(
             robot_name, cfg["home_position"],
-            velocity_scaling=0.5, acceleration_scaling=0.5,
         )
         if trajectory is None:
             self.get_logger().warn(f"Cannot plan home for {robot_name}")
@@ -1383,11 +1403,9 @@ class CommandGatewayNode(Node):
         idle_time = params.get("idle_time", 2.0)
         mode = params.get("mode", "simulation")
         # Cap speed for safety, matching original server behaviour.
-        requested_speed = params.get("move_speed", 0.3)
-        if mode in ("real", "both"):
-            move_speed = min(0.3, requested_speed)
-        else:
-            move_speed = min(0.5, requested_speed)
+        requested_speed = params.get("move_speed", self.max_velocity_scaling)
+        # Clamp to the configured maximum; never exceed the ROS parameter.
+        move_speed = min(self.max_velocity_scaling, requested_speed)
 
         if robot_name not in ROBOT_CONFIG:
             await self._send_error(

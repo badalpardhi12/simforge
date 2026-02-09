@@ -1,19 +1,20 @@
 # Joint limits configuration for Valid8 Dual Cell
 # Override default joint limits from URDF for safety
 #
-# Velocities are capped well below hardware max to prevent protective stops:
-#   Shoulder/Elbow: 1.0 rad/s (HW max 3.14)
-#   Wrist: 1.5 rad/s (HW max 6.28)
+# These are the ABSOLUTE CEILING for joint velocities/accelerations.
+# The MoveIt planning request scaling factors (max_velocity_scaling,
+# max_acceleration_scaling — configurable as ROS params on the gateway
+# node, default 0.2) multiply against these values.
 #
-# NOTE: default_velocity/acceleration_scaling_factor COMPOUND with the
-# per-request scaling factors set in _plan_to_joints() (default 0.3).
-# If this file sets 0.1 and the request sets 0.3, the effective cap is
-# 0.1 × 0.3 = 0.03 of the per-joint max — absurdly slow (~1.7°/s for
-# shoulder joints), causing densely-packed waypoints and visible jerkiness
-# on non-RT systems.  Set these to 1.0 so the per-joint limits above are
-# the true ceiling and only the per-request scaling controls speed.
+# Effective speed = per-joint limit × scaling factor.
+# Example: shoulder at 0.5 rad/s × 0.2 scaling = 0.1 rad/s (~5.7°/s)
+#
+# Hardware maximums for reference:
+#   Shoulder/Elbow: 3.14 rad/s (180°/s)
+#   Wrist: 6.28 rad/s (360°/s)
 
-# Global scaling (applied on top of per-joint limits)
+# Global scaling (applied on top of per-joint limits).
+# Keep at 1.0 — per-request scaling from the gateway controls speed.
 default_velocity_scaling_factor: 1.0
 default_acceleration_scaling_factor: 1.0
 
@@ -21,63 +22,63 @@ joint_limits:
   # Nakul UR5e joints
   nakul_shoulder_pan_joint:
     has_velocity_limits: true
-    max_velocity: 1.0
+    max_velocity: 0.5
     has_acceleration_limits: true
-    max_acceleration: 2.5
+    max_acceleration: 1.5
   nakul_shoulder_lift_joint:
     has_velocity_limits: true
-    max_velocity: 1.0
+    max_velocity: 0.5
     has_acceleration_limits: true
-    max_acceleration: 2.5
+    max_acceleration: 1.5
   nakul_elbow_joint:
     has_velocity_limits: true
-    max_velocity: 1.0
+    max_velocity: 0.5
     has_acceleration_limits: true
-    max_acceleration: 2.5
+    max_acceleration: 1.5
   nakul_wrist_1_joint:
     has_velocity_limits: true
-    max_velocity: 1.5
+    max_velocity: 0.75
     has_acceleration_limits: true
-    max_acceleration: 2.5
+    max_acceleration: 1.5
   nakul_wrist_2_joint:
     has_velocity_limits: true
-    max_velocity: 1.5
+    max_velocity: 0.75
     has_acceleration_limits: true
-    max_acceleration: 2.5
+    max_acceleration: 1.5
   nakul_wrist_3_joint:
     has_velocity_limits: true
-    max_velocity: 1.5
+    max_velocity: 0.75
     has_acceleration_limits: true
-    max_acceleration: 2.5
+    max_acceleration: 1.5
 
   # Sahadev UR5e joints
   sahadev_shoulder_pan_joint:
     has_velocity_limits: true
-    max_velocity: 1.0
+    max_velocity: 0.5
     has_acceleration_limits: true
-    max_acceleration: 2.5
+    max_acceleration: 1.5
   sahadev_shoulder_lift_joint:
     has_velocity_limits: true
-    max_velocity: 1.0
+    max_velocity: 0.5
     has_acceleration_limits: true
-    max_acceleration: 2.5
+    max_acceleration: 1.5
   sahadev_elbow_joint:
     has_velocity_limits: true
-    max_velocity: 1.0
+    max_velocity: 0.5
     has_acceleration_limits: true
-    max_acceleration: 2.5
+    max_acceleration: 1.5
   sahadev_wrist_1_joint:
     has_velocity_limits: true
-    max_velocity: 1.5
+    max_velocity: 0.75
     has_acceleration_limits: true
-    max_acceleration: 2.5
+    max_acceleration: 1.5
   sahadev_wrist_2_joint:
     has_velocity_limits: true
-    max_velocity: 1.5
+    max_velocity: 0.75
     has_acceleration_limits: true
-    max_acceleration: 2.5
+    max_acceleration: 1.5
   sahadev_wrist_3_joint:
     has_velocity_limits: true
-    max_velocity: 1.5
+    max_velocity: 0.75
     has_acceleration_limits: true
-    max_acceleration: 2.5
+    max_acceleration: 1.5
