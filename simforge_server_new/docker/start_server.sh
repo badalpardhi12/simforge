@@ -25,11 +25,12 @@ MODE="${1:---sim}"
 NAKUL_IP="${NAKUL_ROBOT_IP:-192.168.1.9}"
 SAHADEV_IP="${SAHADEV_ROBOT_IP:-192.168.1.16}"
 
-# ── Signal file used by the gateway to request mode switch ──
+# ── Signal files shared with the gateway ──
 MODE_SWITCH_FILE="/tmp/simforge_mode_switch"
 CURRENT_MODE_FILE="/tmp/simforge_current_mode"
+STACK_READY_FILE="/tmp/simforge_stack_ready"
 
-rm -f "$MODE_SWITCH_FILE"
+rm -f "$MODE_SWITCH_FILE" "$STACK_READY_FILE"
 
 # ── Map flag to use_fake_hardware value ──
 get_hardware_flag() {
@@ -40,6 +41,40 @@ get_hardware_flag() {
     esac
 }
 
+# ── Wait for ROS2 topics to be actively publishing ──
+wait_for_stack_health() {
+    local max_wait=60
+    local elapsed=0
+    echo "Waiting for ROS2 stack to become healthy..."
+
+    while [ $elapsed -lt $max_wait ]; do
+        # Check if /joint_states has publishers
+        JS_COUNT=$(ros2 topic info /joint_states 2>/dev/null | grep -c "Publisher count:" || echo "0")
+        JS_PUBS=$(ros2 topic info /joint_states 2>/dev/null | grep "Publisher count:" | awk '{print $3}' || echo "0")
+
+        # Check if /robot_description has publishers
+        RD_PUBS=$(ros2 topic info /robot_description 2>/dev/null | grep "Publisher count:" | awk '{print $3}' || echo "0")
+
+        # Check if move_group node is alive (MoveIt)
+        MG_ALIVE=$(ros2 node list 2>/dev/null | grep -c "move_group" || echo "0")
+
+        echo "  [${elapsed}s] joint_states pubs=$JS_PUBS, robot_description pubs=$RD_PUBS, move_group=$MG_ALIVE"
+
+        if [ "$JS_PUBS" -gt 0 ] 2>/dev/null && \
+           [ "$RD_PUBS" -gt 0 ] 2>/dev/null && \
+           [ "$MG_ALIVE" -gt 0 ] 2>/dev/null; then
+            echo "ROS2 stack is healthy!"
+            return 0
+        fi
+
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+
+    echo "WARNING: ROS2 stack health check timed out after ${max_wait}s"
+    return 1
+}
+
 # ── Start the ROS2 stack (everything except gateway) ──
 start_ros_stack() {
     local use_fake="$1"
@@ -48,6 +83,9 @@ start_ros_stack() {
     echo "  Nakul IP:   $NAKUL_IP"
     echo "  Sahadev IP: $SAHADEV_IP"
     echo "============================================"
+
+    # Clear ready signal — not ready until health check passes
+    rm -f "$STACK_READY_FILE"
 
     if [ "$use_fake" = "true" ]; then
         # Simulation mode — use sim.launch.py without the gateway
@@ -71,16 +109,27 @@ start_ros_stack() {
     ROS_STACK_PID=$!
     echo "ROS2 stack PID: $ROS_STACK_PID"
 
-    # Record current mode
+    # Wait for the stack to actually become healthy before signaling ready
+    if wait_for_stack_health; then
+        echo "Stack health verified — signaling ready"
+    else
+        echo "Stack health check failed — signaling ready anyway (gateway will verify)"
+    fi
+
+    # NOW record the current mode and signal readiness
     if [ "$use_fake" = "true" ]; then
         echo "simulation" > "$CURRENT_MODE_FILE"
     else
         echo "real" > "$CURRENT_MODE_FILE"
     fi
+    echo "ready" > "$STACK_READY_FILE"
 }
 
 # ── Stop the ROS2 stack ──
 stop_ros_stack() {
+    # Immediately clear readiness signals so the gateway knows the stack is down
+    rm -f "$STACK_READY_FILE"
+    rm -f "$CURRENT_MODE_FILE"
     if [ -n "$ROS_STACK_PID" ] && kill -0 "$ROS_STACK_PID" 2>/dev/null; then
         echo "Stopping ROS2 stack (PID $ROS_STACK_PID)..."
         # Send SIGINT first for graceful shutdown
@@ -118,7 +167,7 @@ cleanup() {
     if [ -n "$GATEWAY_PID" ] && kill -0 "$GATEWAY_PID" 2>/dev/null; then
         kill "$GATEWAY_PID" 2>/dev/null || true
     fi
-    rm -f "$MODE_SWITCH_FILE" "$CURRENT_MODE_FILE"
+    rm -f "$MODE_SWITCH_FILE" "$CURRENT_MODE_FILE" "$STACK_READY_FILE"
     exit 0
 }
 trap cleanup SIGINT SIGTERM EXIT

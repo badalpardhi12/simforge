@@ -103,6 +103,7 @@ KNOWN_OBJECTS = ["face_link", "table_link", "shop_floor"]
 # ── Mode-switch signal files (shared with start_server.sh) ───
 MODE_SWITCH_FILE = "/tmp/simforge_mode_switch"
 CURRENT_MODE_FILE = "/tmp/simforge_current_mode"
+STACK_READY_FILE = "/tmp/simforge_stack_ready"
 
 
 # ── Helper dataclasses ───────────────────────────────────────────────
@@ -993,90 +994,185 @@ class CommandGatewayNode(Node):
         with open(MODE_SWITCH_FILE, "w") as f:
             f.write(mode)
 
-    async def _wait_for_ros_stack(self, timeout: float = 90.0) -> bool:
+    async def _wait_for_ros_stack(
+        self,
+        target_mode: str,
+        timeout: float = 120.0,
+        progress_cb=None,
+    ) -> dict:
         """Wait for the ROS2 stack to come back up after a mode switch.
 
-        Waits for the supervisor to finish the mode switch (signal file
-        consumed), then waits for all services and action servers to
-        become ready.
-        """
-        self.get_logger().info("Waiting for ROS2 stack to come back up…")
+        Uses a robust multi-phase approach:
+          Phase 1 – Wait for supervisor to consume the mode-switch signal file
+                   AND clear the old readiness signals (STACK_READY_FILE gone,
+                   CURRENT_MODE_FILE cleared).
+          Phase 2 – Wait for STACK_READY_FILE to appear (written by
+                   start_server.sh only after joint_states, robot_description,
+                   and move_group are publishing).
+          Phase 3 – Verify CURRENT_MODE_FILE matches the target mode.
+          Phase 4 – Wait for fresh joint states on the gateway side
+                   (timestamp > switch_start_time).
+          Phase 5 – Verify MoveIt services are responsive.
+          Phase 6 – (Real mode only) Wait for robot_program_running.
 
-        # Phase 1: wait for the supervisor to consume the signal file
-        # (indicates old stack is being torn down / new one starting)
-        phase1_deadline = time.monotonic() + 30.0
+        Returns a dict with {"ok": bool, "phase": str, "message": str}.
+        """
+        switch_start = time.monotonic()
+        overall_deadline = switch_start + timeout
+
+        async def _report(phase: str, detail: str):
+            msg = f"[{phase}] {detail}"
+            self.get_logger().info(msg)
+            if progress_cb:
+                try:
+                    await progress_cb(phase, detail)
+                except Exception:
+                    pass
+
+        # ── Phase 1: wait for supervisor to pick up the signal ───────
+        await _report("Phase 1/6", "Waiting for supervisor to pick up mode-switch signal…")
+        phase1_deadline = min(switch_start + 30.0, overall_deadline)
         while time.monotonic() < phase1_deadline:
-            if not os.path.exists(MODE_SWITCH_FILE):
-                self.get_logger().info(
-                    "Supervisor consumed mode-switch signal — "
-                    "new stack is starting"
-                )
+            signal_gone = not os.path.exists(MODE_SWITCH_FILE)
+            ready_gone = not os.path.exists(STACK_READY_FILE)
+            if signal_gone and ready_gone:
+                await _report("Phase 1/6",
+                    "Supervisor picked up signal — old stack tearing down")
                 break
             await asyncio.sleep(0.5)
         else:
-            self.get_logger().warn(
-                "Mode-switch signal file still present after 30s — "
-                "supervisor may not have processed it. Proceeding anyway."
-            )
+            # Even if we timed out here, continue — maybe the signal
+            # was already consumed and we missed it.
+            await _report("Phase 1/6",
+                "Signal wait timed out — proceeding to Phase 2")
 
-        # Phase 2: wait for ALL new services + ALL trajectory action servers
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        # ── Phase 2: wait for STACK_READY_FILE ──────────────────────
+        await _report("Phase 2/6", "Waiting for new ROS2 stack to become healthy…")
+        phase2_deadline = min(time.monotonic() + 90.0, overall_deadline)
+        stack_ready = False
+        while time.monotonic() < phase2_deadline:
+            if os.path.exists(STACK_READY_FILE):
+                await _report("Phase 2/6",
+                    "Stack ready signal received — supervisor health check passed")
+                stack_ready = True
+                break
+            await asyncio.sleep(1.0)
+        if not stack_ready:
+            return {
+                "ok": False,
+                "phase": "Phase 2/6",
+                "message": (
+                    "Timed out waiting for ROS2 stack to become healthy. "
+                    "The supervisor health check (joint_states, robot_description, "
+                    "move_group) did not pass within 90s."),
+            }
+
+        # ── Phase 3: verify CURRENT_MODE_FILE matches target ────────
+        await _report("Phase 3/6", "Verifying mode file matches target…")
+        file_mode = self._read_current_mode()
+        target_is_real = target_mode in ("real", "both")
+        file_is_real = file_mode in ("real", "both")
+        if target_is_real != file_is_real:
+            return {
+                "ok": False,
+                "phase": "Phase 3/6",
+                "message": (
+                    f"Mode mismatch: requested '{target_mode}' but "
+                    f"supervisor reported '{file_mode}'"),
+            }
+        await _report("Phase 3/6", f"Mode file confirmed: {file_mode}")
+
+        # ── Phase 4: wait for fresh joint states ────────────────────
+        await _report("Phase 4/6", "Waiting for fresh joint states…")
+        phase4_deadline = min(time.monotonic() + 20.0, overall_deadline)
+        while time.monotonic() < phase4_deadline:
+            all_fresh = True
+            for rn in ROBOT_CONFIG:
+                st = self._robot_states.get(rn)
+                if not st or st.last_update < switch_start or len(st.joint_positions) != 6:
+                    all_fresh = False
+                    break
+            if all_fresh:
+                await _report("Phase 4/6",
+                    "Fresh joint states received for all robots")
+                break
+            await asyncio.sleep(0.5)
+        else:
+            # Log which robots are missing
+            missing = []
+            for rn in ROBOT_CONFIG:
+                st = self._robot_states.get(rn)
+                if not st or st.last_update < switch_start or len(st.joint_positions) != 6:
+                    missing.append(rn)
+            await _report("Phase 4/6",
+                f"Joint state timeout — missing: {missing}. Proceeding anyway.")
+
+        # ── Phase 5: verify MoveIt services respond ─────────────────
+        await _report("Phase 5/6", "Verifying MoveIt services…")
+        phase5_deadline = min(time.monotonic() + 15.0, overall_deadline)
+        while time.monotonic() < phase5_deadline:
             ik_ok = self._ik_client.service_is_ready()
             plan_ok = self._plan_client.service_is_ready()
-
-            # Check ALL trajectory action servers (both robots)
-            all_traj_ok = True
+            all_traj_ok = all(
+                tc.server_is_ready() for tc in self._traj_clients.values()
+            )
+            if ik_ok and plan_ok and all_traj_ok:
+                await _report("Phase 5/6",
+                    "All MoveIt services and trajectory servers ready")
+                break
+            await asyncio.sleep(1.0)
+        else:
+            not_ready = []
+            if not self._ik_client.service_is_ready():
+                not_ready.append("compute_ik")
+            if not self._plan_client.service_is_ready():
+                not_ready.append("plan_kinematic_path")
             for rname, tc in self._traj_clients.items():
                 if not tc.server_is_ready():
-                    all_traj_ok = False
-                    break
+                    not_ready.append(f"{rname}_trajectory")
+            return {
+                "ok": False,
+                "phase": "Phase 5/6",
+                "message": (
+                    f"MoveIt services not ready after stack health passed. "
+                    f"Missing: {not_ready}"),
+            }
 
-            if ik_ok and plan_ok and all_traj_ok:
-                # Extra settle time — let controllers fully activate
-                await asyncio.sleep(3.0)
-                self.get_logger().info(
-                    "ROS2 stack is back up — all services ready"
+        # ── Phase 6: (real mode) wait for robot programs ────────────
+        current_mode = self._read_current_mode()
+        if current_mode in ("real", "both"):
+            await _report("Phase 6/6",
+                "Waiting for robot programs to start running…")
+            phase6_deadline = min(time.monotonic() + 30.0, overall_deadline)
+            while time.monotonic() < phase6_deadline:
+                all_running = all(
+                    self._robot_program_running.get(rn, False)
+                    for rn in ROBOT_CONFIG
                 )
-
-                # Phase 3: in real mode, wait for robot programs to be running
-                current_mode = self._read_current_mode()
-                if current_mode in ("real", "both"):
-                    self.get_logger().info(
-                        "Waiting for robot programs to start running…"
-                    )
-                    prog_deadline = time.monotonic() + 30.0
-                    while time.monotonic() < prog_deadline:
-                        all_running = all(
-                            self._robot_program_running.get(rn, False)
-                            for rn in ROBOT_CONFIG
+                if all_running:
+                    await _report("Phase 6/6",
+                        "All robot programs running")
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                for rn in ROBOT_CONFIG:
+                    if not self._robot_program_running.get(rn, False):
+                        self.get_logger().warn(
+                            f"Robot program NOT running on {rn} — "
+                            f"will retry via resend_robot_program before "
+                            f"first trajectory"
                         )
-                        if all_running:
-                            self.get_logger().info(
-                                "All robot programs running — "
-                                "ready for trajectory execution"
-                            )
-                            break
-                        await asyncio.sleep(0.5)
-                    else:
-                        # Not all programs running — log which ones
-                        for rn in ROBOT_CONFIG:
-                            running = self._robot_program_running.get(rn, False)
-                            if not running:
-                                self.get_logger().warn(
-                                    f"Robot program NOT running on {rn} "
-                                    f"(will retry via resend_robot_program "
-                                    f"before first trajectory)"
-                                )
+        else:
+            await _report("Phase 6/6", "Simulation mode — skipping robot program check")
 
-                return True
-
-            await asyncio.sleep(1.0)
-
-        self.get_logger().error(
-            f"ROS2 stack did not come back up within {timeout}s"
-        )
-        return False
+        elapsed = time.monotonic() - switch_start
+        await _report("Complete",
+            f"Stack ready in {elapsed:.1f}s")
+        return {
+            "ok": True,
+            "phase": "Complete",
+            "message": f"ROS2 stack ready in {elapsed:.1f}s",
+        }
 
     async def _rpc_prepare_mode(self, params):
         """Handle mode switching between simulation and real robot.
@@ -1113,48 +1209,56 @@ class CommandGatewayNode(Node):
                 f"(use_fake_hardware: {not need_real})"
             )
 
+            # Invalidate cached joint state timestamps so Phase 4 of
+            # _wait_for_ros_stack will wait for genuinely new data from
+            # the new stack.
+            for rn in ROBOT_CONFIG:
+                st = self._robot_states.get(rn)
+                if st:
+                    st.last_update = 0.0
+
+            # Reset robot_program_running flags (old stack is going away)
+            for rn in ROBOT_CONFIG:
+                self._robot_program_running[rn] = False
+
             # Signal the supervisor script
             self._request_mode_switch(mode)
 
-            # Give the supervisor a moment to pick up the signal file
-            # and start the teardown. The supervisor checks every 1s.
-            self.get_logger().info("Waiting for supervisor to process mode switch…")
-            await asyncio.sleep(2.0)
+            # Collect progress phases for the client
+            progress_log: list = []
 
-            # Wait for the new stack to come up
-            stack_ok = await self._wait_for_ros_stack(timeout=90.0)
-            if not stack_ok:
+            async def _progress_cb(phase: str, detail: str):
+                progress_log.append({"phase": phase, "detail": detail})
+
+            # Wait for the new stack to come up with full verification
+            result = await self._wait_for_ros_stack(
+                target_mode=mode, timeout=120.0, progress_cb=_progress_cb,
+            )
+
+            if not result["ok"]:
                 return {
                     "success": True,
                     "ready": False,
                     "message": (
-                        f"Mode switch to {mode} was requested but the "
-                        "ROS2 stack did not come back up in time. "
-                        "Check robot connections and try again."
+                        f"Mode switch to {mode} failed at {result['phase']}: "
+                        f"{result['message']}"
                     ),
                     "can_retry": True,
+                    "phases": progress_log,
                 }
 
             # Update internal state
             self._current_mode = mode
 
-            # Re-read TF and let joint states start flowing
-            self.get_logger().info("Waiting for joint states to stabilize…")
-            await asyncio.sleep(2.0)
-
-            # Verify we have fresh joint states
-            for rn in ROBOT_CONFIG:
-                st = self._robot_states.get(rn)
-                if not st or len(st.joint_positions) != 6:
-                    self.get_logger().warn(
-                        f"No joint state received for {rn} yet"
-                    )
-
             return {
                 "success": True,
                 "ready": True,
-                "message": f"Switched to {mode} mode — all services ready",
+                "message": (
+                    f"Switched to {mode} mode — "
+                    f"{result['message']}"
+                ),
                 "can_retry": False,
+                "phases": progress_log,
             }
 
         # ── Same mode — just verify services are up ──────────────────

@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable, Tuple
@@ -573,57 +574,143 @@ class ProtoSimClientFrame(wx.Frame):
         self._run_async(self._switch_mode(mode))
 
     async def _switch_mode(self, mode: str) -> None:
-        """Perform the mode switch RPC with a blocking progress dialog."""
-        # Show a blocking progress dialog on the GUI thread
-        progress_future: asyncio.Future[None] = asyncio.get_event_loop().create_future()
+        """Perform the mode switch RPC with a blocking progress dialog.
+
+        The server returns phased progress information so the user can
+        see exactly what is happening (teardown → health check → joint
+        states → MoveIt → robot programs).  If the switch fails, a
+        MessageDialog shows the phase that failed and the error detail.
+        """
         dlg_ref: list = []  # mutable container so the callback can store the dialog
+        start_time = time.time()
 
         def _show_progress():
             dlg = wx.ProgressDialog(
-                f"Switching to {mode.title()} mode",
-                f"Preparing {mode} mode — please wait…\n"
-                "The server is restarting the ROS2 stack.",
+                f"Switching to {mode.title()} Mode",
+                f"Requesting mode switch to {mode}…\n"
+                "Waiting for server to restart the ROS2 stack.\n"
+                "This may take 30–60 seconds.",
                 maximum=100,
                 parent=self,
-                style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE,
+                style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE | wx.PD_CAN_ABORT,
             )
-            dlg.Pulse()  # indeterminate progress
+            dlg.Pulse()
             dlg_ref.append(dlg)
 
         wx.CallAfter(_show_progress)
         # Give wx a moment to display the dialog
         await asyncio.sleep(0.3)
 
+        # Periodically pulse the dialog to keep it alive and show elapsed time
+        async def _pulse_loop():
+            while getattr(self, '_mode_switching', False):
+                elapsed = int(time.time() - start_time)
+                def _update(e=elapsed):
+                    if dlg_ref and dlg_ref[0]:
+                        dlg_ref[0].Pulse(
+                            f"Switching to {mode} mode… ({e}s elapsed)\n"
+                            "Server is verifying all services are ready.\n"
+                            "Please wait — do not close this window."
+                        )
+                wx.CallAfter(_update)
+                await asyncio.sleep(1.0)
+
+        pulse_task = asyncio.ensure_future(_pulse_loop())
+
         try:
             response = await self._client.call_rpc(
                 "prepare_mode", {"mode": mode}, timeout=120.0
             )
 
+            elapsed = int(time.time() - start_time)
+
             if response.get("ready"):
                 self._server_mode = mode
                 self._mode_ready = True
-                self._log(f"✓ {mode} mode ready")
                 msg = response.get("message", "")
+                self._log(f"✓ {mode} mode ready ({elapsed}s)")
                 if msg:
                     self._log(f"  {msg}")
+
+                # Log phase details if provided
+                phases = response.get("phases", [])
+                for p in phases:
+                    self._log(f"  {p.get('phase', '')}: {p.get('detail', '')}")
+
                 # Refresh robot status indicator after mode change
                 await self._fetch_robot_status()
             else:
                 self._mode_ready = False
                 err = response.get("message", "Unknown error")
-                self._log(f"✗ Mode switch failed: {err}")
+                self._log(f"✗ Mode switch failed ({elapsed}s): {err}")
+
+                # Log phase details
+                phases = response.get("phases", [])
+                for p in phases:
+                    self._log(f"  {p.get('phase', '')}: {p.get('detail', '')}")
+
+                # Show error dialog with details
+                def _show_error(error_msg=err, phase_list=phases):
+                    detail_lines = [f"Mode switch to {mode} failed:\n"]
+                    detail_lines.append(f"Error: {error_msg}\n")
+                    if phase_list:
+                        detail_lines.append("Progress phases:")
+                        for p in phase_list:
+                            detail_lines.append(
+                                f"  {p.get('phase', '')}: {p.get('detail', '')}"
+                            )
+                    wx.MessageDialog(
+                        self,
+                        "\n".join(detail_lines),
+                        "Mode Switch Failed",
+                        wx.OK | wx.ICON_ERROR,
+                    ).ShowModal()
+                wx.CallAfter(_show_error)
+
                 # Revert the radio button to match actual server state
                 wx.CallAfter(self._revert_radio_to_server_mode)
-        except Exception as e:
+
+        except asyncio.TimeoutError:
+            elapsed = int(time.time() - start_time)
             self._mode_ready = False
-            self._log(f"✗ Mode switch error: {e}")
+            self._log(f"✗ Mode switch timed out after {elapsed}s")
+            def _show_timeout():
+                wx.MessageDialog(
+                    self,
+                    f"Mode switch to {mode} timed out after {elapsed}s.\n\n"
+                    "The server may still be starting up.\n"
+                    "Check the server logs and try again.",
+                    "Mode Switch Timeout",
+                    wx.OK | wx.ICON_WARNING,
+                ).ShowModal()
+            wx.CallAfter(_show_timeout)
             wx.CallAfter(self._revert_radio_to_server_mode)
+
+        except Exception as e:
+            elapsed = int(time.time() - start_time)
+            self._mode_ready = False
+            self._log(f"✗ Mode switch error ({elapsed}s): {e}")
+            def _show_exc(exc=e):
+                wx.MessageDialog(
+                    self,
+                    f"Mode switch to {mode} failed:\n\n{exc}\n\n"
+                    "Check the server connection and try again.",
+                    "Mode Switch Error",
+                    wx.OK | wx.ICON_ERROR,
+                ).ShowModal()
+            wx.CallAfter(_show_exc)
+            wx.CallAfter(self._revert_radio_to_server_mode)
+
         finally:
             self._mode_switching = False
+            pulse_task.cancel()
             # Dismiss the progress dialog
             def _close_dlg():
                 if dlg_ref:
-                    dlg_ref[0].Destroy()
+                    try:
+                        dlg_ref[0].Destroy()
+                    except Exception:
+                        pass
             wx.CallAfter(_close_dlg)
 
     def _revert_radio_to_server_mode(self) -> None:
@@ -849,9 +936,13 @@ class ProtoSimClientFrame(wx.Frame):
                     self._mode_ready = True
                     self._log(f"✓ {mode} mode ready")
                     self._log(response.get("message", ""))
+                    for p in response.get("phases", []):
+                        self._log(f"  {p.get('phase','')}: {p.get('detail','')}")
                 else:
                     msg = response.get("message", "Robot not ready")
                     self._log(f"✗ {msg}")
+                    for p in response.get("phases", []):
+                        self._log(f"  {p.get('phase','')}: {p.get('detail','')}")
                     can_retry = response.get("can_retry", False)
                     user_choice = await self._show_mode_check_dialog(mode, msg, can_retry)
                     if user_choice == "retry":
