@@ -611,13 +611,61 @@ class CommandGatewayNode(Node):
             goal = FollowJointTrajectory.Goal()
             goal.trajectory = trajectory.joint_trajectory
 
-            # ── Fix: strip duplicate-time leading point ─────────────
+            # ── Fix: detect and repair broken timestamps ────────────
+            # When Ruckig smoothing fails (e.g. missing jerk limits),
+            # MoveIt may produce trajectories where ALL waypoints have
+            # time_from_start = 0.  The controller rejects these with
+            # "Time between points is not strictly increasing".
+            #
+            # Strategy:
+            # 1. Strip a duplicate-time leading point (original fix).
+            # 2. If remaining points still have zero/non-increasing
+            #    timestamps, assign conservative linear spacing so the
+            #    trajectory is at least executable (albeit unsmoothed).
             pts = goal.trajectory.points
+
+            # Step 1: strip a zero-time leading point
             if len(pts) >= 2:
                 t0 = pts[0].time_from_start.sec + pts[0].time_from_start.nanosec * 1e-9
                 t1 = pts[1].time_from_start.sec + pts[1].time_from_start.nanosec * 1e-9
                 if t0 >= t1 or t0 == 0.0:
-                    goal.trajectory.points = list(pts[1:])
+                    pts = list(pts[1:])
+                    goal.trajectory.points = pts
+
+            # Step 2: detect all-zero / non-increasing timestamps
+            if len(pts) >= 2:
+                times = [
+                    p.time_from_start.sec + p.time_from_start.nanosec * 1e-9
+                    for p in pts
+                ]
+                monotonic = all(times[i] < times[i + 1] for i in range(len(times) - 1))
+                if not monotonic:
+                    # Compute per-point spacing from max joint displacement
+                    # using a conservative speed (0.15 rad/s).
+                    CONSERVATIVE_SPEED = 0.15  # rad/s fallback
+                    cumulative = 0.0
+                    for idx in range(len(pts)):
+                        if idx == 0:
+                            # First point at a small offset so t > 0
+                            cumulative = 0.1
+                        else:
+                            prev_pos = pts[idx - 1].positions
+                            curr_pos = pts[idx].positions
+                            max_delta = max(
+                                abs(curr_pos[j] - prev_pos[j])
+                                for j in range(min(len(curr_pos), len(prev_pos)))
+                            ) if prev_pos and curr_pos else 0.5
+                            dt = max(max_delta / CONSERVATIVE_SPEED, 0.5)
+                            cumulative += dt
+                        secs = int(cumulative)
+                        nsecs = int((cumulative - secs) * 1e9)
+                        pts[idx].time_from_start.sec = secs
+                        pts[idx].time_from_start.nanosec = nsecs
+                    self.get_logger().warn(
+                        f"Repaired {len(pts)} zero-timestamp waypoints "
+                        f"for {robot_name} (Ruckig likely failed — "
+                        f"total duration {cumulative:.1f}s)"
+                    )
 
             n_pts = len(goal.trajectory.points)
             self.get_logger().info(

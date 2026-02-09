@@ -12,6 +12,11 @@
 # Hardware maximums for reference:
 #   Shoulder/Elbow: 3.14 rad/s (180°/s)
 #   Wrist: 6.28 rad/s (360°/s)
+#
+# Jerk limits are REQUIRED for the Ruckig trajectory smoother.
+# Without them Ruckig defaults to 1000 rad/s³ which is incompatible
+# with conservative vel/accel limits and causes -100 InvalidInput.
+# Rule of thumb: max_jerk ≈ max_acceleration / 0.15 s ramp time.
 
 # Global scaling (applied on top of per-joint limits).
 # Keep at 1.0 — per-request scaling from the gateway controls speed.
@@ -25,31 +30,43 @@ joint_limits:
     max_velocity: 0.5
     has_acceleration_limits: true
     max_acceleration: 1.5
+    has_jerk_limits: true
+    max_jerk: 10.0
   nakul_shoulder_lift_joint:
     has_velocity_limits: true
     max_velocity: 0.5
     has_acceleration_limits: true
     max_acceleration: 1.5
+    has_jerk_limits: true
+    max_jerk: 10.0
   nakul_elbow_joint:
     has_velocity_limits: true
     max_velocity: 0.5
     has_acceleration_limits: true
     max_acceleration: 1.5
+    has_jerk_limits: true
+    max_jerk: 10.0
   nakul_wrist_1_joint:
     has_velocity_limits: true
     max_velocity: 0.75
     has_acceleration_limits: true
     max_acceleration: 1.5
+    has_jerk_limits: true
+    max_jerk: 10.0
   nakul_wrist_2_joint:
     has_velocity_limits: true
     max_velocity: 0.75
     has_acceleration_limits: true
     max_acceleration: 1.5
+    has_jerk_limits: true
+    max_jerk: 10.0
   nakul_wrist_3_joint:
     has_velocity_limits: true
     max_velocity: 0.75
     has_acceleration_limits: true
     max_acceleration: 1.5
+    has_jerk_limits: true
+    max_jerk: 10.0
 
   # Sahadev UR5e joints
   sahadev_shoulder_pan_joint:
@@ -57,28 +74,40 @@ joint_limits:
     max_velocity: 0.5
     has_acceleration_limits: true
     max_acceleration: 1.5
+    has_jerk_limits: true
+    max_jerk: 10.0
   sahadev_shoulder_lift_joint:
     has_velocity_limits: true
     max_velocity: 0.5
     has_acceleration_limits: true
     max_acceleration: 1.5
+    has_jerk_limits: true
+    max_jerk: 10.0
   sahadev_elbow_joint:
     has_velocity_limits: true
     max_velocity: 0.5
     has_acceleration_limits: true
     max_acceleration: 1.5
+    has_jerk_limits: true
+    max_jerk: 10.0
   sahadev_wrist_1_joint:
     has_velocity_limits: true
     max_velocity: 0.75
     has_acceleration_limits: true
     max_acceleration: 1.5
+    has_jerk_limits: true
+    max_jerk: 10.0
   sahadev_wrist_2_joint:
     has_velocity_limits: true
     max_velocity: 0.75
     has_acceleration_limits: true
     max_acceleration: 1.5
+    has_jerk_limits: true
+    max_jerk: 10.0
   sahadev_wrist_3_joint:
     has_velocity_limits: true
     max_velocity: 0.75
     has_acceleration_limits: true
     max_acceleration: 1.5
+    has_jerk_limits: true
+    max_jerk: 10.0
