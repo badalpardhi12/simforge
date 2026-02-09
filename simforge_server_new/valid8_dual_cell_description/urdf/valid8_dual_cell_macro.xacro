@@ -177,7 +177,7 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
         </material>
       </visual>
       <collision>
-        <origin xyz="-0.065 0 0.02" rpy="0 0 0"/>
+        <origin xyz="-0.065 0 0.02" rpy="1.57 0 0"/>
         <geometry>
           <box size="0.3 0.13 0.055"/>
         </geometry>
@@ -192,11 +192,13 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
     <link name="nakul_tool_tip_link"/>
     
     <joint name="nakul_wrist_3_to_tool" type="fixed">
-      <!-- Tool attached to wrist_3_link matching Genesis convention:
-           xyz='-0.08 0 0' rpy='0 0 0' (no rotation).
-           This ensures tool_tip_link has the SAME orientation as wrist_3_link,
-           so IK + look-at (Z-axis pointing at target) works correctly. -->
-      <origin xyz="-0.08 0 0" rpy="0 0 0"/>
+      <!-- Tool attached to wrist_3_link with offset matching the old server:
+           xyz='-0.08 0 0.05' rpy='1.57 0 0' (90° X rotation).
+           The 90° X rotation is required because the client's _look_at_quaternion
+           generates Y-axis as the tool-forward direction, and this rotation
+           maps tool_tip_link's frame so Y-axis aligns with the physical
+           iPhone pointing direction. -->
+      <origin xyz="-0.08 0 0.05" rpy="1.57 0 0"/>
       <parent link="nakul_wrist_3_link"/>
       <child link="nakul_tool_base_link"/>
     </joint>
