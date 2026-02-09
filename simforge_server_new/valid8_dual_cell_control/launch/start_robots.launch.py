@@ -235,6 +235,13 @@ def launch_setup(context, *args, **kwargs):
 
         # Controller Stopper for Nakul — monitors robot program state
         # and automatically resends the URScript in headless mode.
+        #
+        # CRITICAL: In a dual-robot setup with a shared controller_manager,
+        # the controller_stopper calls list_controllers on the GLOBAL
+        # controller_manager and deactivates everything NOT in
+        # consistent_controllers.  We MUST include the other robot's
+        # controllers here so that when nakul's program drops, it does
+        # NOT deactivate sahadev's controllers (and vice-versa).
         nakul_controller_stopper = Node(
             package="ur_robot_driver",
             executable="controller_stopper_node",
@@ -246,9 +253,18 @@ def launch_setup(context, *args, **kwargs):
                 {"joint_controller_active": True},
                 {
                     "consistent_controllers": [
+                        # Nakul's own always-on controllers
                         "nakul_io_and_status_controller",
                         "nakul_force_torque_sensor_broadcaster",
                         "nakul_speed_scaling_state_broadcaster",
+                        # Sahadev's controllers — MUST be protected
+                        # so nakul's stopper doesn't deactivate them
+                        "sahadev_io_and_status_controller",
+                        "sahadev_force_torque_sensor_broadcaster",
+                        "sahadev_speed_scaling_state_broadcaster",
+                        "sahadev_scaled_joint_trajectory_controller",
+                        # Shared controllers
+                        "joint_state_broadcaster",
                     ],
                 },
                 {
@@ -264,6 +280,8 @@ def launch_setup(context, *args, **kwargs):
         )
 
         # Controller Stopper for Sahadev
+        # (see nakul_controller_stopper comment for why we include
+        # the other robot's controllers in consistent_controllers)
         sahadev_controller_stopper = Node(
             package="ur_robot_driver",
             executable="controller_stopper_node",
@@ -275,9 +293,18 @@ def launch_setup(context, *args, **kwargs):
                 {"joint_controller_active": True},
                 {
                     "consistent_controllers": [
+                        # Sahadev's own always-on controllers
                         "sahadev_io_and_status_controller",
                         "sahadev_force_torque_sensor_broadcaster",
                         "sahadev_speed_scaling_state_broadcaster",
+                        # Nakul's controllers — MUST be protected
+                        # so sahadev's stopper doesn't deactivate them
+                        "nakul_io_and_status_controller",
+                        "nakul_force_torque_sensor_broadcaster",
+                        "nakul_speed_scaling_state_broadcaster",
+                        "nakul_scaled_joint_trajectory_controller",
+                        # Shared controllers
+                        "joint_state_broadcaster",
                     ],
                 },
                 {
