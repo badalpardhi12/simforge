@@ -2,10 +2,12 @@
 
 planning_plugin: ompl_interface/OMPLPlanner
 # NOTE: Adapter order matters — they are applied in the listed sequence.
-# AddTimeOptimalParameterization must come AFTER geometric smoothing so
-# that timing is computed on the smoothed (shorter) path.
-# FixStartStateBounds is required to handle start-state noise from the
-# real robot (joint_states latency on non-RT systems).
+# In MoveIt2 Humble all adapters live in a single request_adapters chain.
+# FixStartState* adapters run BEFORE the planner.
+# AddTimeOptimalParameterization runs AFTER planning to add timing.
+# AddRuckigTrajectorySmoothing runs LAST to produce jerk-limited
+# (C³-continuous) trajectories, eliminating velocity/acceleration
+# discontinuities that cause jitter on non-RT systems.
 request_adapters: >-
   default_planner_request_adapters/FixWorkspaceBounds
   default_planner_request_adapters/FixStartStateBounds
@@ -13,6 +15,7 @@ request_adapters: >-
   default_planner_request_adapters/FixStartStatePathConstraints
   default_planner_request_adapters/ResolveConstraintFrames
   default_planner_request_adapters/AddTimeOptimalParameterization
+  default_planner_request_adapters/AddRuckigTrajectorySmoothing
 
 start_state_max_bounds_error: 0.1
 
@@ -165,7 +168,7 @@ nakul_arm:
     - SPARS
     - SPARStwo
   projection_evaluator: joints(nakul_shoulder_pan_joint,nakul_shoulder_lift_joint)
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.05
 
 sahadev_arm:
   default_planner_config: RRTConnect
@@ -194,7 +197,7 @@ sahadev_arm:
     - SPARS
     - SPARStwo
   projection_evaluator: joints(sahadev_shoulder_pan_joint,sahadev_shoulder_lift_joint)
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.05
 
 dual_arms:
   default_planner_config: RRTConnect
@@ -204,4 +207,4 @@ dual_arms:
     - PRM
     - PRMstar
   projection_evaluator: joints(nakul_shoulder_pan_joint,sahadev_shoulder_pan_joint)
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.05

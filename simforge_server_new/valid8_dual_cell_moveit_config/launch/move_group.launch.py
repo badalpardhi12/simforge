@@ -137,12 +137,13 @@ def launch_setup(context, *args, **kwargs):
     ompl_pipeline_config = {
         "ompl": {
             "planning_plugin": "ompl_interface/OMPLPlanner",
-            "request_adapters": "default_planner_request_adapters/AddTimeOptimalParameterization "
-                                "default_planner_request_adapters/ResolveConstraintFrames "
-                                "default_planner_request_adapters/FixWorkspaceBounds "
+            "request_adapters": "default_planner_request_adapters/FixWorkspaceBounds "
                                 "default_planner_request_adapters/FixStartStateBounds "
                                 "default_planner_request_adapters/FixStartStateCollision "
-                                "default_planner_request_adapters/FixStartStatePathConstraints",
+                                "default_planner_request_adapters/FixStartStatePathConstraints "
+                                "default_planner_request_adapters/ResolveConstraintFrames "
+                                "default_planner_request_adapters/AddTimeOptimalParameterization "
+                                "default_planner_request_adapters/AddRuckigTrajectorySmoothing",
             "start_state_max_bounds_error": 0.1,
         }
     }
@@ -195,12 +196,13 @@ def launch_setup(context, *args, **kwargs):
         "move_group": {
             "planning_plugin": "ompl_interface/OMPLPlanner",
             "request_adapters":
-                "default_planner_request_adapters/AddTimeOptimalParameterization "
-                "default_planner_request_adapters/ResolveConstraintFrames "
                 "default_planner_request_adapters/FixWorkspaceBounds "
                 "default_planner_request_adapters/FixStartStateBounds "
                 "default_planner_request_adapters/FixStartStateCollision "
-                "default_planner_request_adapters/FixStartStatePathConstraints",
+                "default_planner_request_adapters/FixStartStatePathConstraints "
+                "default_planner_request_adapters/ResolveConstraintFrames "
+                "default_planner_request_adapters/AddTimeOptimalParameterization "
+                "default_planner_request_adapters/AddRuckigTrajectorySmoothing",
             "start_state_max_bounds_error": 0.1,
         }
     }

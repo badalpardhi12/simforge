@@ -474,8 +474,8 @@ class CommandGatewayNode(Node):
         self,
         robot_name: str,
         target_joints: List[float],
-        velocity_scaling: float = 0.3,
-        acceleration_scaling: float = 0.3,
+        velocity_scaling: float = 0.5,
+        acceleration_scaling: float = 0.5,
     ) -> Optional[RobotTrajectory]:
         """Call /plan_kinematic_path and return RobotTrajectory or None."""
         cfg = ROBOT_CONFIG[robot_name]
@@ -484,8 +484,8 @@ class CommandGatewayNode(Node):
         mp = req.motion_plan_request
 
         mp.group_name = cfg["planning_group"]
-        mp.num_planning_attempts = 20
-        mp.allowed_planning_time = 10.0
+        mp.num_planning_attempts = 5
+        mp.allowed_planning_time = 5.0
         mp.max_velocity_scaling_factor = velocity_scaling
         mp.max_acceleration_scaling_factor = acceleration_scaling
 
@@ -702,7 +702,7 @@ class CommandGatewayNode(Node):
         robot_name: str,
         position: List[float],
         orientation: List[float],
-        velocity_scaling: float = 0.3,
+        velocity_scaling: float = 0.5,
     ) -> str:
         """
         Full pipeline: IK → Plan → Execute.
@@ -781,7 +781,7 @@ class CommandGatewayNode(Node):
 
         trajectory = await self._plan_to_joints(
             robot_name, cfg["home_position"],
-            velocity_scaling=0.3, acceleration_scaling=0.3,
+            velocity_scaling=0.5, acceleration_scaling=0.5,
         )
         if trajectory is None:
             self.get_logger().warn(f"Cannot plan home for {robot_name}")
