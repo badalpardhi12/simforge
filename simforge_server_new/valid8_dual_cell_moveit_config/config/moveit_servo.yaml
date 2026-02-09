@@ -1,0 +1,36 @@
+# MoveIt Servo Configuration for Valid8 Dual Cell
+# Enables real-time jogging/servoing of robot arms
+
+# General settings
+use_gazebo: false
+status_topic: ~/status
+command_in_type: speed_units
+scale:
+  linear: 0.4
+  rotational: 0.8
+  joint: 0.5
+
+# Topics
+command_out_topic: /nakul_scaled_joint_trajectory_controller/joint_trajectory
+joint_topic: /joint_states
+
+# Incoming commands
+move_group_name: nakul_arm
+ee_frame_name: nakul_tool0
+robot_link_command_frame: nakul_base_link
+planning_frame: world
+
+# Settings for real-time control
+incoming_command_timeout: 0.1
+num_outgoing_halt_msgs_to_publish: 4
+publish_period: 0.034  # ~30 Hz
+halt_all_joints_in_collision: true
+halt_all_joints_in_singularity: true
+
+# Collision checking
+check_collisions: true
+collision_check_rate: 50.0
+
+# Joint limits
+joint_limit_margin: 0.1
+low_latency_mode: false

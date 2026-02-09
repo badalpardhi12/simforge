@@ -1,0 +1,44 @@
+# MoveIt Controller Manager Configuration for Valid8 Dual Cell
+# Maps MoveIt planning groups to ros2_control controllers
+#
+# Structure must match what MoveIt expects:
+#   moveit_controller_manager: <plugin>
+#   moveit_simple_controller_manager:
+#     controller_names: [...]
+#     <controller_name>:
+#       action_ns: ...
+#       type: ...
+#       joints: [...]
+
+# Controller manager to use
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+# Controllers definition
+moveit_simple_controller_manager:
+  controller_names:
+    - nakul_scaled_joint_trajectory_controller
+    - sahadev_scaled_joint_trajectory_controller
+
+  nakul_scaled_joint_trajectory_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - nakul_shoulder_pan_joint
+      - nakul_shoulder_lift_joint
+      - nakul_elbow_joint
+      - nakul_wrist_1_joint
+      - nakul_wrist_2_joint
+      - nakul_wrist_3_joint
+
+  sahadev_scaled_joint_trajectory_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - sahadev_shoulder_pan_joint
+      - sahadev_shoulder_lift_joint
+      - sahadev_elbow_joint
+      - sahadev_wrist_1_joint
+      - sahadev_wrist_2_joint
+      - sahadev_wrist_3_joint

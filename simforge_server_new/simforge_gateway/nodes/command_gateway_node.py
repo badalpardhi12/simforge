@@ -16,6 +16,7 @@ Compatible with simforge_client RPC protocol.
 
 import asyncio
 import json
+import os
 import time
 import math
 import traceback
@@ -28,7 +29,8 @@ from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
+from std_srvs.srv import Trigger
 from geometry_msgs.msg import Pose, PoseStamped, Point, Quaternion
 from sensor_msgs.msg import JointState
 
@@ -97,6 +99,10 @@ ROBOT_CONFIG = {
 }
 
 KNOWN_OBJECTS = ["face_link", "table_link", "shop_floor"]
+
+# ── Mode-switch signal files (shared with start_server.sh) ───
+MODE_SWITCH_FILE = "/tmp/simforge_mode_switch"
+CURRENT_MODE_FILE = "/tmp/simforge_current_mode"
 
 
 # ── Helper dataclasses ───────────────────────────────────────────────
@@ -169,6 +175,9 @@ class CommandGatewayNode(Node):
         self._proto_sim_running = False
         self._proto_sim_stop = False
 
+        # Hardware mode tracking
+        self._current_mode = self._read_current_mode()
+
         # ── Publishers ───────────────────────────────────────────────
         self.heartbeat_pub = self.create_publisher(String, "/safety/heartbeat", 10)
         self.estop_pub = self.create_publisher(String, "/safety/emergency_stop", 10)
@@ -197,6 +206,38 @@ class CommandGatewayNode(Node):
         self._plan_client = self.create_client(
             GetMotionPlan, "/plan_kinematic_path", callback_group=self.cb_group
         )
+
+        # ── Robot-program-running state (real hardware only) ─────────
+        # The UR driver's io_and_status_controller publishes whether the
+        # URScript program is currently running on the robot.  Trajectory
+        # commands are silently dropped by the hardware interface when
+        # the program is NOT running.
+        # In headless mode, the program can be re-sent via the
+        # resend_robot_program service.
+        self._robot_program_running: Dict[str, bool] = {
+            n: False for n in ROBOT_CONFIG
+        }
+        self._resend_program_clients: Dict[str, Any] = {}
+        for robot_name, cfg in ROBOT_CONFIG.items():
+            prefix = cfg["prefix"]
+            # Subscribe to program running state
+            topic = f"/{prefix}io_and_status_controller/robot_program_running"
+            self.create_subscription(
+                Bool, topic,
+                lambda msg, rn=robot_name: self._on_robot_program_running(rn, msg),
+                10,
+            )
+            self.get_logger().info(
+                f"Subscribed to robot_program_running for {robot_name}: {topic}"
+            )
+            # Service client for resending the URScript program
+            srv_name = f"/{prefix}io_and_status_controller/resend_robot_program"
+            self._resend_program_clients[robot_name] = self.create_client(
+                Trigger, srv_name, callback_group=self.cb_group
+            )
+            self.get_logger().info(
+                f"Resend program service for {robot_name}: {srv_name}"
+            )
 
         # ── TF2 ──────────────────────────────────────────────────────
         self.tf_buffer = Buffer()
@@ -228,6 +269,95 @@ class CommandGatewayNode(Node):
                 st.joint_positions = positions
                 st.joint_velocities = velocities
                 st.last_update = time.time()
+
+    # ─────────────────────────────────────────────────────────────────
+    # Robot-program-running state (real hardware)
+    # ─────────────────────────────────────────────────────────────────
+
+    def _on_robot_program_running(self, robot_name: str, msg: Bool):
+        """Callback for {prefix}_io_and_status_controller/robot_program_running."""
+        prev = self._robot_program_running.get(robot_name, False)
+        self._robot_program_running[robot_name] = msg.data
+        if msg.data != prev:
+            self.get_logger().info(
+                f"Robot program running [{robot_name}]: {msg.data}"
+            )
+
+    async def _ensure_robot_ready(
+        self, robot_name: str, timeout: float = 15.0
+    ) -> bool:
+        """
+        Ensure the UR robot program is running before executing a trajectory.
+
+        In headless mode, the UR driver sends a URScript program to the robot
+        when the hardware interface activates.  If the program stops (e.g.
+        protective stop, teach pendant interaction), the io_and_status_controller
+        publishes False on robot_program_running.  The hardware interface's
+        write() will then refuse to send motion commands, causing trajectory
+        timeouts.
+
+        This method checks the flag, calls resend_robot_program if needed,
+        and waits until the flag becomes True.
+
+        In simulation mode, the flag is always False (no io_and_status_controller)
+        but robot_program_running isn't needed — so we skip the check.
+        """
+        current_mode = self._read_current_mode()
+        if current_mode == "simulation":
+            # In simulation, robot_program_running doesn't exist / isn't needed
+            return True
+
+        # Already running?
+        if self._robot_program_running.get(robot_name, False):
+            return True
+
+        self.get_logger().warn(
+            f"Robot program NOT running on {robot_name} — "
+            f"attempting resend_robot_program…"
+        )
+
+        # Try to call resend_robot_program
+        resend_client = self._resend_program_clients.get(robot_name)
+        if resend_client and resend_client.service_is_ready():
+            try:
+                future = resend_client.call_async(Trigger.Request())
+                result = await await_ros_future(future, timeout=5.0)
+                if result.success:
+                    self.get_logger().info(
+                        f"resend_robot_program succeeded for {robot_name}"
+                    )
+                else:
+                    self.get_logger().warn(
+                        f"resend_robot_program returned non-success "
+                        f"for {robot_name}: {result.message}"
+                    )
+            except Exception as e:
+                self.get_logger().error(
+                    f"resend_robot_program failed for {robot_name}: {e}"
+                )
+        else:
+            self.get_logger().warn(
+                f"resend_robot_program service not available for {robot_name}"
+            )
+
+        # Wait for robot_program_running to become True
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._robot_program_running.get(robot_name, False):
+                self.get_logger().info(
+                    f"Robot program now running on {robot_name} "
+                    f"— ready for trajectory execution"
+                )
+                # Extra settle time for controller_stopper to reactivate controllers
+                await asyncio.sleep(1.0)
+                return True
+            await asyncio.sleep(0.5)
+
+        self.get_logger().error(
+            f"Timeout ({timeout}s) waiting for robot_program_running "
+            f"on {robot_name}"
+        )
+        return False
 
     # ─────────────────────────────────────────────────────────────────
     # MoveIt helpers (IK, plan, execute)
@@ -425,6 +555,17 @@ class CommandGatewayNode(Node):
         else:
             self.get_logger().error(
                 f"Trajectory action server not available for {robot_name}"
+            )
+            return False
+
+        # ── Ensure the UR robot program is running ──────────────
+        # Without this, the hardware interface silently drops all
+        # motion commands and the trajectory action times out.
+        ready = await self._ensure_robot_ready(robot_name, timeout=15.0)
+        if not ready:
+            self.get_logger().error(
+                f"Robot program not running on {robot_name} — "
+                f"cannot execute trajectory"
             )
             return False
 
@@ -811,27 +952,212 @@ class CommandGatewayNode(Node):
             and self._plan_client.service_is_ready()
         )
 
+        current_mode = self._read_current_mode()
+        is_real = current_mode in ("real", "both")
+        prog_running = self._robot_program_running.get(rn, False)
+
         return {
             "success": True,
-            "real_robot_available": traj_ok and has_joints,
+            "real_robot_available": is_real and traj_ok and has_joints,
             "simulation_available": True,
-            "available_modes": ["simulation"],
+            "available_modes": ["simulation", "real"],
+            "current_mode": current_mode,
             "connection_details": {
                 "follow_trajectory_action": (
                     "available" if traj_ok else "not_available"
                 ),
                 "moveit": "available" if moveit_ok else "not_available",
+                "robot_program_running": prog_running,
             },
             "current_joint_positions": (
                 st.joint_positions if has_joints else list(cfg["home_position"])
             ),
-            "position_source": "real_robot" if has_joints else "default",
+            "position_source": "real_robot" if (is_real and has_joints) else "default",
         }
 
+    # ── Mode switching helpers ───────────────────────────────────────
+
+    @staticmethod
+    def _read_current_mode() -> str:
+        """Read the current hardware mode from the signal file."""
+        try:
+            if os.path.exists(CURRENT_MODE_FILE):
+                with open(CURRENT_MODE_FILE, "r") as f:
+                    return f.read().strip()
+        except Exception:
+            pass
+        return "simulation"
+
+    def _request_mode_switch(self, mode: str) -> None:
+        """Write a mode-switch request for start_server.sh to pick up."""
+        with open(MODE_SWITCH_FILE, "w") as f:
+            f.write(mode)
+
+    async def _wait_for_ros_stack(self, timeout: float = 90.0) -> bool:
+        """Wait for the ROS2 stack to come back up after a mode switch.
+
+        Waits for the supervisor to finish the mode switch (signal file
+        consumed), then waits for all services and action servers to
+        become ready.
+        """
+        self.get_logger().info("Waiting for ROS2 stack to come back up…")
+
+        # Phase 1: wait for the supervisor to consume the signal file
+        # (indicates old stack is being torn down / new one starting)
+        phase1_deadline = time.monotonic() + 30.0
+        while time.monotonic() < phase1_deadline:
+            if not os.path.exists(MODE_SWITCH_FILE):
+                self.get_logger().info(
+                    "Supervisor consumed mode-switch signal — "
+                    "new stack is starting"
+                )
+                break
+            await asyncio.sleep(0.5)
+        else:
+            self.get_logger().warn(
+                "Mode-switch signal file still present after 30s — "
+                "supervisor may not have processed it. Proceeding anyway."
+            )
+
+        # Phase 2: wait for ALL new services + ALL trajectory action servers
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ik_ok = self._ik_client.service_is_ready()
+            plan_ok = self._plan_client.service_is_ready()
+
+            # Check ALL trajectory action servers (both robots)
+            all_traj_ok = True
+            for rname, tc in self._traj_clients.items():
+                if not tc.server_is_ready():
+                    all_traj_ok = False
+                    break
+
+            if ik_ok and plan_ok and all_traj_ok:
+                # Extra settle time — let controllers fully activate
+                await asyncio.sleep(3.0)
+                self.get_logger().info(
+                    "ROS2 stack is back up — all services ready"
+                )
+
+                # Phase 3: in real mode, wait for robot programs to be running
+                current_mode = self._read_current_mode()
+                if current_mode in ("real", "both"):
+                    self.get_logger().info(
+                        "Waiting for robot programs to start running…"
+                    )
+                    prog_deadline = time.monotonic() + 30.0
+                    while time.monotonic() < prog_deadline:
+                        all_running = all(
+                            self._robot_program_running.get(rn, False)
+                            for rn in ROBOT_CONFIG
+                        )
+                        if all_running:
+                            self.get_logger().info(
+                                "All robot programs running — "
+                                "ready for trajectory execution"
+                            )
+                            break
+                        await asyncio.sleep(0.5)
+                    else:
+                        # Not all programs running — log which ones
+                        for rn in ROBOT_CONFIG:
+                            running = self._robot_program_running.get(rn, False)
+                            if not running:
+                                self.get_logger().warn(
+                                    f"Robot program NOT running on {rn} "
+                                    f"(will retry via resend_robot_program "
+                                    f"before first trajectory)"
+                                )
+
+                return True
+
+            await asyncio.sleep(1.0)
+
+        self.get_logger().error(
+            f"ROS2 stack did not come back up within {timeout}s"
+        )
+        return False
+
     async def _rpc_prepare_mode(self, params):
+        """Handle mode switching between simulation and real robot.
+
+        When the requested mode differs from the current mode, this
+        writes a signal file that the supervisor script (start_server.sh)
+        picks up.  The supervisor tears down the current ROS2 stack
+        (ros2_control_node, move_group, robot_state_publisher, controllers)
+        and restarts it with the appropriate ``use_fake_hardware`` setting.
+
+        The gateway node itself stays alive throughout because it runs as
+        a separate process managed by the supervisor.
+        """
         mode = params.get("mode", "simulation")
         self.get_logger().info(f"Preparing mode: {mode}")
 
+        current_mode = self._read_current_mode()
+        # Normalize: "both" is treated like "real" for hardware purposes
+        need_real = mode in ("real", "both")
+        have_real = current_mode in ("real", "both")
+
+        if need_real != have_real:
+            # ── Mode switch required ─────────────────────────────────
+            if self._proto_sim_running:
+                return {
+                    "success": False,
+                    "ready": False,
+                    "message": "Cannot switch mode while a protocol is running",
+                    "can_retry": True,
+                }
+
+            self.get_logger().info(
+                f"Mode switch: {current_mode} → {mode}  "
+                f"(use_fake_hardware: {not need_real})"
+            )
+
+            # Signal the supervisor script
+            self._request_mode_switch(mode)
+
+            # Give the supervisor a moment to pick up the signal file
+            # and start the teardown. The supervisor checks every 1s.
+            self.get_logger().info("Waiting for supervisor to process mode switch…")
+            await asyncio.sleep(2.0)
+
+            # Wait for the new stack to come up
+            stack_ok = await self._wait_for_ros_stack(timeout=90.0)
+            if not stack_ok:
+                return {
+                    "success": True,
+                    "ready": False,
+                    "message": (
+                        f"Mode switch to {mode} was requested but the "
+                        "ROS2 stack did not come back up in time. "
+                        "Check robot connections and try again."
+                    ),
+                    "can_retry": True,
+                }
+
+            # Update internal state
+            self._current_mode = mode
+
+            # Re-read TF and let joint states start flowing
+            self.get_logger().info("Waiting for joint states to stabilize…")
+            await asyncio.sleep(2.0)
+
+            # Verify we have fresh joint states
+            for rn in ROBOT_CONFIG:
+                st = self._robot_states.get(rn)
+                if not st or len(st.joint_positions) != 6:
+                    self.get_logger().warn(
+                        f"No joint state received for {rn} yet"
+                    )
+
+            return {
+                "success": True,
+                "ready": True,
+                "message": f"Switched to {mode} mode — all services ready",
+                "can_retry": False,
+            }
+
+        # ── Same mode — just verify services are up ──────────────────
         moveit_ok = await self._wait_for_moveit(timeout=30.0)
         if not moveit_ok:
             return {
@@ -953,7 +1279,8 @@ class CommandGatewayNode(Node):
 
             self.get_logger().info(
                 f"  [{i+1}/{total}] {pose_name} → "
-                f"pos=({position[0]:.3f},{position[1]:.3f},{position[2]:.3f})"
+                f"pos=({position[0]:.3f},{position[1]:.3f},{position[2]:.3f}) "
+                f"quat=({orientation[0]:.4f},{orientation[1]:.4f},{orientation[2]:.4f},{orientation[3]:.4f})"
             )
 
             result = await self._move_to_pose(

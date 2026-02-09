@@ -1,0 +1,64 @@
+# Simforge Server New - Dual UR5e Robot Cell
+#
+# Docker Compose configuration for running the dual robot cell server
+# Uses network_mode: host for direct port access (matching original simforge_server)
+#
+# Ports (exposed directly on host via host networking):
+#   9090  - Foxglove Bridge WebSocket (connect from Foxglove Studio)
+#   8766  - Command Gateway WebSocket (connect from simforge_client)
+#
+# Usage:
+#   Simulation:  docker compose --profile sim up
+#   Production:  docker compose --profile prod up
+#
+# The server supports runtime sim↔real switching from the client GUI.
+# When started with --profile sim, the ROS2 stack uses mock hardware.
+# The client can request a switch to real robot mode via the prepare_mode RPC,
+# which triggers the supervisor script to restart the ROS2 stack with
+# use_fake_hardware:=false (connecting to physical robots at configured IPs).
+
+services:
+  # ============================================================
+  # Simulation Mode - Uses fake hardware for testing
+  # Supports runtime switching to real robot via client GUI
+  # ============================================================
+  simforge-server-sim:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: simforge-server-sim
+    hostname: simforge-server-sim
+    environment:
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - NAKUL_ROBOT_IP=${NAKUL_ROBOT_IP:-192.168.1.9}
+      - SAHADEV_ROBOT_IP=${SAHADEV_ROBOT_IP:-192.168.1.16}
+    network_mode: host
+    stdin_open: true
+    tty: true
+    command: /start_server.sh --sim
+    profiles:
+      - sim
+
+  # ============================================================
+  # Real Robot Mode - Starts with real hardware connected
+  # Supports runtime switching to simulation via client GUI
+  # ============================================================
+  simforge-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: simforge-server
+    hostname: simforge-server
+    environment:
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - NAKUL_ROBOT_IP=${NAKUL_ROBOT_IP:-192.168.1.9}
+      - SAHADEV_ROBOT_IP=${SAHADEV_ROBOT_IP:-192.168.1.16}
+    network_mode: host
+    privileged: true
+    stdin_open: true
+    tty: true
+    command: /start_server.sh --real
+    profiles:
+      - prod

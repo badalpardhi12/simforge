@@ -1,0 +1,76 @@
+# Joint limits configuration for Valid8 Dual Cell
+# Override default joint limits from URDF for safety
+#
+# Velocities are capped well below hardware max to prevent protective stops:
+#   Shoulder/Elbow: 1.0 rad/s (HW max 3.14)
+#   Wrist: 1.5 rad/s (HW max 6.28)
+# Default scaling further reduces these by 10x for safe planning.
+
+# Global scaling (applied on top of per-joint limits)
+default_velocity_scaling_factor: 0.1
+default_acceleration_scaling_factor: 0.1
+
+joint_limits:
+  # Nakul UR5e joints
+  nakul_shoulder_pan_joint:
+    has_velocity_limits: true
+    max_velocity: 1.0
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+  nakul_shoulder_lift_joint:
+    has_velocity_limits: true
+    max_velocity: 1.0
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+  nakul_elbow_joint:
+    has_velocity_limits: true
+    max_velocity: 1.0
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+  nakul_wrist_1_joint:
+    has_velocity_limits: true
+    max_velocity: 1.5
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+  nakul_wrist_2_joint:
+    has_velocity_limits: true
+    max_velocity: 1.5
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+  nakul_wrist_3_joint:
+    has_velocity_limits: true
+    max_velocity: 1.5
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+
+  # Sahadev UR5e joints
+  sahadev_shoulder_pan_joint:
+    has_velocity_limits: true
+    max_velocity: 1.0
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+  sahadev_shoulder_lift_joint:
+    has_velocity_limits: true
+    max_velocity: 1.0
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+  sahadev_elbow_joint:
+    has_velocity_limits: true
+    max_velocity: 1.0
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+  sahadev_wrist_1_joint:
+    has_velocity_limits: true
+    max_velocity: 1.5
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+  sahadev_wrist_2_joint:
+    has_velocity_limits: true
+    max_velocity: 1.5
+    has_acceleration_limits: true
+    max_acceleration: 2.5
+  sahadev_wrist_3_joint:
+    has_velocity_limits: true
+    max_velocity: 1.5
+    has_acceleration_limits: true
+    max_acceleration: 2.5

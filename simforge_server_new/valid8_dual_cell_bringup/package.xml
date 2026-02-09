@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>valid8_dual_cell_bringup</name>
+  <version>1.0.0</version>
+  <description>Bringup launch files for Valid8 dual UR5e cell</description>
+  <maintainer email="badal@example.com">Badal</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>valid8_dual_cell_description</exec_depend>
+  <exec_depend>valid8_dual_cell_control</exec_depend>
+  <exec_depend>valid8_dual_cell_moveit_config</exec_depend>
+  <exec_depend>simforge_gateway</exec_depend>
+  <exec_depend>foxglove_bridge</exec_depend>
+  <exec_depend>ur_robot_driver</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

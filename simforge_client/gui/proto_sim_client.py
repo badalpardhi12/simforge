@@ -738,7 +738,7 @@ class ProtoSimClientFrame(wx.Frame):
             )
             
             response = await self._client.call_rpc(
-                "prepare_mode", {"mode": mode}, timeout=30.0
+                "prepare_mode", {"mode": mode}, timeout=120.0
             )
             
             if response.get("ready"):

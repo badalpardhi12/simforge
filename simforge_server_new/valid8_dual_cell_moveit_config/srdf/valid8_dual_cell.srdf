@@ -1,0 +1,285 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SRDF (Semantic Robot Description Format) for Valid8 Dual UR5e Cell
+  
+  Defines planning groups, end effectors, and collision exclusions.
+  Collision matrix derived from the working single-cell valid8_cell.srdf.
+-->
+<robot name="valid8_dual_cell">
+  
+  <!-- ======== PLANNING GROUPS ======== -->
+  
+  <!-- Nakul UR5e arm group — chain extends to tool_tip_link (where the
+       iPhone camera is) so IK can target the actual tool tip, matching
+       the original single-cell SRDF. -->
+  <group name="nakul_arm">
+    <chain base_link="nakul_base_link" tip_link="nakul_tool_tip_link"/>
+  </group>
+  
+  <!-- Sahadev UR5e arm group -->
+  <group name="sahadev_arm">
+    <chain base_link="sahadev_base_link" tip_link="sahadev_tool0"/>
+  </group>
+  
+  <!-- Combined dual arm group -->
+  <group name="dual_arms">
+    <group name="nakul_arm"/>
+    <group name="sahadev_arm"/>
+  </group>
+  
+  <!-- ======== GROUP STATES (Pre-defined poses) ======== -->
+  
+  <!-- Nakul arm states -->
+  <group_state name="home" group="nakul_arm">
+    <joint name="nakul_shoulder_pan_joint" value="0"/>
+    <joint name="nakul_shoulder_lift_joint" value="-1.5708"/>
+    <joint name="nakul_elbow_joint" value="1.5708"/>
+    <joint name="nakul_wrist_1_joint" value="-1.5708"/>
+    <joint name="nakul_wrist_2_joint" value="-1.5708"/>
+    <joint name="nakul_wrist_3_joint" value="0"/>
+  </group_state>
+  
+  <group_state name="up" group="nakul_arm">
+    <joint name="nakul_shoulder_pan_joint" value="0"/>
+    <joint name="nakul_shoulder_lift_joint" value="-1.5708"/>
+    <joint name="nakul_elbow_joint" value="0"/>
+    <joint name="nakul_wrist_1_joint" value="-1.5708"/>
+    <joint name="nakul_wrist_2_joint" value="0"/>
+    <joint name="nakul_wrist_3_joint" value="0"/>
+  </group_state>
+  
+  <!-- Sahadev arm states -->
+  <group_state name="home" group="sahadev_arm">
+    <joint name="sahadev_shoulder_pan_joint" value="0"/>
+    <joint name="sahadev_shoulder_lift_joint" value="-1.5708"/>
+    <joint name="sahadev_elbow_joint" value="1.5708"/>
+    <joint name="sahadev_wrist_1_joint" value="-1.5708"/>
+    <joint name="sahadev_wrist_2_joint" value="-1.5708"/>
+    <joint name="sahadev_wrist_3_joint" value="0"/>
+  </group_state>
+  
+  <group_state name="up" group="sahadev_arm">
+    <joint name="sahadev_shoulder_pan_joint" value="0"/>
+    <joint name="sahadev_shoulder_lift_joint" value="-1.5708"/>
+    <joint name="sahadev_elbow_joint" value="0"/>
+    <joint name="sahadev_wrist_1_joint" value="-1.5708"/>
+    <joint name="sahadev_wrist_2_joint" value="0"/>
+    <joint name="sahadev_wrist_3_joint" value="0"/>
+  </group_state>
+  
+  <!-- Dual arm states -->
+  <group_state name="both_home" group="dual_arms">
+    <joint name="nakul_shoulder_pan_joint" value="0"/>
+    <joint name="nakul_shoulder_lift_joint" value="-1.5708"/>
+    <joint name="nakul_elbow_joint" value="1.5708"/>
+    <joint name="nakul_wrist_1_joint" value="-1.5708"/>
+    <joint name="nakul_wrist_2_joint" value="-1.5708"/>
+    <joint name="nakul_wrist_3_joint" value="0"/>
+    <joint name="sahadev_shoulder_pan_joint" value="0"/>
+    <joint name="sahadev_shoulder_lift_joint" value="-1.5708"/>
+    <joint name="sahadev_elbow_joint" value="1.5708"/>
+    <joint name="sahadev_wrist_1_joint" value="-1.5708"/>
+    <joint name="sahadev_wrist_2_joint" value="-1.5708"/>
+    <joint name="sahadev_wrist_3_joint" value="0"/>
+  </group_state>
+  
+  <!-- ======== END EFFECTORS ======== -->
+  
+  <end_effector name="nakul_tcp" parent_link="nakul_tool0" group="nakul_arm"/>
+  <end_effector name="sahadev_tcp" parent_link="sahadev_tool0" group="sahadev_arm"/>
+  
+  <!-- ================================================================ -->
+  <!-- DISABLE COLLISIONS                                               -->
+  <!-- Comprehensive collision matrix based on single-cell SRDF that    -->
+  <!-- works correctly with MoveIt2 collision checking.                 -->
+  <!-- ================================================================ -->
+  
+  <!-- ── NAKUL: Adjacent pairs ──────────────────────────────────────── -->
+  <disable_collisions link1="nakul_base_link" link2="nakul_base_link_inertia" reason="Adjacent"/>
+  <disable_collisions link1="nakul_base_link_inertia" link2="nakul_shoulder_link" reason="Adjacent"/>
+  <disable_collisions link1="nakul_shoulder_link" link2="nakul_upper_arm_link" reason="Adjacent"/>
+  <disable_collisions link1="nakul_upper_arm_link" link2="nakul_forearm_link" reason="Adjacent"/>
+  <disable_collisions link1="nakul_forearm_link" link2="nakul_wrist_1_link" reason="Adjacent"/>
+  <disable_collisions link1="nakul_wrist_1_link" link2="nakul_wrist_2_link" reason="Adjacent"/>
+  <disable_collisions link1="nakul_wrist_2_link" link2="nakul_wrist_3_link" reason="Adjacent"/>
+  <disable_collisions link1="nakul_wrist_3_link" link2="nakul_tool0" reason="Adjacent"/>
+  <disable_collisions link1="nakul_wrist_3_link" link2="nakul_tool_base_link" reason="Adjacent"/>
+  <disable_collisions link1="nakul_wrist_2_link" link2="nakul_tool_base_link" reason="Adjacent"/>
+  <disable_collisions link1="nakul_wrist_1_link" link2="nakul_tool_base_link" reason="Never"/>
+  <disable_collisions link1="nakul_wrist_2_link" link2="nakul_tool_tip_link" reason="Never"/>
+  <disable_collisions link1="nakul_flange" link2="nakul_tool_base_link" reason="Adjacent"/>
+  <disable_collisions link1="nakul_tool0" link2="nakul_tool_base_link" reason="Adjacent"/>
+  <disable_collisions link1="nakul_forearm_link" link2="nakul_tool_base_link" reason="Never"/>
+  <disable_collisions link1="nakul_forearm_link" link2="nakul_tool_tip_link" reason="Never"/>
+  <disable_collisions link1="nakul_upper_arm_link" link2="nakul_tool_base_link" reason="Never"/>
+  <disable_collisions link1="nakul_upper_arm_link" link2="nakul_tool_tip_link" reason="Never"/>
+  <disable_collisions link1="nakul_ft_frame" link2="nakul_tool_base_link" reason="Never"/>
+  <disable_collisions link1="nakul_ft_frame" link2="nakul_tool_tip_link" reason="Never"/>
+  
+  <!-- ── NAKUL: Environment / mount Adjacent pairs ──────────────────── -->
+  <disable_collisions link1="nakul_base_link" link2="nakul_robot_mount" reason="Adjacent"/>
+  <disable_collisions link1="nakul_base_link" link2="shop_floor" reason="Adjacent"/>
+  <disable_collisions link1="nakul_base_link" link2="table_link" reason="Adjacent"/>
+  <disable_collisions link1="nakul_base_link_inertia" link2="nakul_robot_mount" reason="Adjacent"/>
+  <disable_collisions link1="nakul_base_link_inertia" link2="shop_floor" reason="Adjacent"/>
+  <disable_collisions link1="nakul_base_link_inertia" link2="table_link" reason="Adjacent"/>
+  <disable_collisions link1="nakul_shoulder_link" link2="table_link" reason="Adjacent"/>
+  
+  <!-- ── NAKUL: Never pairs (non-colliding by geometry) ─────────────── -->
+  <disable_collisions link1="nakul_base_link" link2="nakul_upper_arm_link" reason="Never"/>
+  <disable_collisions link1="nakul_base_link" link2="nakul_forearm_link" reason="Never"/>
+  <disable_collisions link1="nakul_base_link" link2="nakul_flange" reason="Never"/>
+  <disable_collisions link1="nakul_base_link" link2="nakul_ft_frame" reason="Never"/>
+  <disable_collisions link1="nakul_base_link" link2="nakul_tool0" reason="Never"/>
+  <disable_collisions link1="nakul_base_link" link2="nakul_tool_base_link" reason="Never"/>
+  <disable_collisions link1="nakul_base_link" link2="nakul_tool_tip_link" reason="Never"/>
+  <disable_collisions link1="nakul_base_link" link2="nakul_shoulder_link" reason="Never"/>
+  <disable_collisions link1="nakul_base_link" link2="nakul_wrist_1_link" reason="Never"/>
+  <disable_collisions link1="nakul_base_link" link2="nakul_wrist_2_link" reason="Never"/>
+  <disable_collisions link1="nakul_base_link" link2="nakul_wrist_3_link" reason="Never"/>
+  <disable_collisions link1="nakul_base_link_inertia" link2="nakul_flange" reason="Never"/>
+  <disable_collisions link1="nakul_base_link_inertia" link2="nakul_ft_frame" reason="Never"/>
+  <disable_collisions link1="nakul_base_link_inertia" link2="nakul_tool0" reason="Never"/>
+  <disable_collisions link1="nakul_base_link_inertia" link2="nakul_tool_tip_link" reason="Never"/>
+  <disable_collisions link1="nakul_shoulder_link" link2="nakul_forearm_link" reason="Never"/>
+  <disable_collisions link1="nakul_shoulder_link" link2="nakul_tool0" reason="Never"/>
+  <disable_collisions link1="nakul_shoulder_link" link2="nakul_tool_tip_link" reason="Never"/>
+  <disable_collisions link1="nakul_forearm_link" link2="nakul_wrist_2_link" reason="Never"/>
+  <disable_collisions link1="nakul_forearm_link" link2="nakul_wrist_3_link" reason="Never"/>
+  <disable_collisions link1="nakul_forearm_link" link2="nakul_ft_frame" reason="Never"/>
+  <disable_collisions link1="nakul_forearm_link" link2="nakul_tool0" reason="Never"/>
+  <disable_collisions link1="nakul_forearm_link" link2="nakul_tool_tip_link" reason="Never"/>
+  <disable_collisions link1="nakul_wrist_1_link" link2="nakul_wrist_3_link" reason="Never"/>
+  <disable_collisions link1="nakul_flange" link2="nakul_forearm_link" reason="Never"/>
+  <disable_collisions link1="nakul_flange" link2="nakul_ft_frame" reason="Never"/>
+  <disable_collisions link1="nakul_flange" link2="nakul_shoulder_link" reason="Never"/>
+  <disable_collisions link1="nakul_flange" link2="nakul_tool0" reason="Never"/>
+  <disable_collisions link1="nakul_flange" link2="nakul_tool_base_link" reason="Never"/>
+  <disable_collisions link1="nakul_flange" link2="nakul_tool_tip_link" reason="Never"/>
+  <disable_collisions link1="nakul_flange" link2="nakul_upper_arm_link" reason="Never"/>
+  <disable_collisions link1="nakul_flange" link2="nakul_wrist_1_link" reason="Never"/>
+  <disable_collisions link1="nakul_flange" link2="nakul_wrist_2_link" reason="Never"/>
+  <disable_collisions link1="nakul_flange" link2="nakul_wrist_3_link" reason="Never"/>
+  <disable_collisions link1="nakul_ft_frame" link2="nakul_shoulder_link" reason="Never"/>
+  <disable_collisions link1="nakul_ft_frame" link2="nakul_tool0" reason="Never"/>
+  <disable_collisions link1="nakul_ft_frame" link2="nakul_tool_base_link" reason="Never"/>
+  <disable_collisions link1="nakul_ft_frame" link2="nakul_tool_tip_link" reason="Never"/>
+  <disable_collisions link1="nakul_ft_frame" link2="nakul_upper_arm_link" reason="Never"/>
+  <disable_collisions link1="nakul_ft_frame" link2="nakul_wrist_1_link" reason="Never"/>
+  <disable_collisions link1="nakul_ft_frame" link2="nakul_wrist_2_link" reason="Never"/>
+  <disable_collisions link1="nakul_ft_frame" link2="nakul_wrist_3_link" reason="Never"/>
+  <disable_collisions link1="nakul_tool0" link2="nakul_tool_base_link" reason="Never"/>
+  <disable_collisions link1="nakul_tool0" link2="nakul_tool_tip_link" reason="Never"/>
+  <disable_collisions link1="nakul_tool0" link2="nakul_upper_arm_link" reason="Never"/>
+  <disable_collisions link1="nakul_tool0" link2="nakul_wrist_1_link" reason="Never"/>
+  <disable_collisions link1="nakul_tool0" link2="nakul_wrist_2_link" reason="Never"/>
+  <disable_collisions link1="nakul_tool0" link2="nakul_wrist_3_link" reason="Never"/>
+  <disable_collisions link1="nakul_tool_base_link" link2="nakul_tool_tip_link" reason="Never"/>
+  <disable_collisions link1="nakul_tool_tip_link" link2="nakul_upper_arm_link" reason="Never"/>
+  <disable_collisions link1="nakul_tool_tip_link" link2="nakul_wrist_1_link" reason="Never"/>
+  <disable_collisions link1="nakul_tool_tip_link" link2="nakul_wrist_2_link" reason="Never"/>
+  <disable_collisions link1="nakul_tool_tip_link" link2="nakul_wrist_3_link" reason="Never"/>
+  
+  <!-- ── NAKUL: Face link disables (face is not near nakul base) ──── -->
+  <disable_collisions link1="face_link" link2="nakul_flange" reason="Never"/>
+  <disable_collisions link1="face_link" link2="nakul_ft_frame" reason="Never"/>
+  <disable_collisions link1="face_link" link2="nakul_tool0" reason="Never"/>
+  <disable_collisions link1="face_link" link2="nakul_tool_base_link" reason="Never"/>
+  <disable_collisions link1="face_link" link2="nakul_tool_tip_link" reason="Never"/>
+  <disable_collisions link1="face_link" link2="nakul_wrist_2_link" reason="Never"/>
+  <disable_collisions link1="face_link" link2="nakul_wrist_3_link" reason="Never"/>
+  
+  <!-- ── SAHADEV: Adjacent pairs ────────────────────────────────────── -->
+  <disable_collisions link1="sahadev_base_link" link2="sahadev_base_link_inertia" reason="Adjacent"/>
+  <disable_collisions link1="sahadev_base_link_inertia" link2="sahadev_shoulder_link" reason="Adjacent"/>
+  <disable_collisions link1="sahadev_shoulder_link" link2="sahadev_upper_arm_link" reason="Adjacent"/>
+  <disable_collisions link1="sahadev_upper_arm_link" link2="sahadev_forearm_link" reason="Adjacent"/>
+  <disable_collisions link1="sahadev_forearm_link" link2="sahadev_wrist_1_link" reason="Adjacent"/>
+  <disable_collisions link1="sahadev_wrist_1_link" link2="sahadev_wrist_2_link" reason="Adjacent"/>
+  <disable_collisions link1="sahadev_wrist_2_link" link2="sahadev_wrist_3_link" reason="Adjacent"/>
+  <disable_collisions link1="sahadev_wrist_3_link" link2="sahadev_tool0" reason="Adjacent"/>
+  
+  <!-- ── SAHADEV: Environment / mount Adjacent pairs ────────────────── -->
+  <disable_collisions link1="sahadev_base_link" link2="sahadev_robot_mount" reason="Adjacent"/>
+  <disable_collisions link1="sahadev_base_link" link2="shop_floor" reason="Adjacent"/>
+  <disable_collisions link1="sahadev_base_link" link2="table_link" reason="Adjacent"/>
+  <disable_collisions link1="sahadev_base_link_inertia" link2="sahadev_robot_mount" reason="Adjacent"/>
+  <disable_collisions link1="sahadev_base_link_inertia" link2="shop_floor" reason="Adjacent"/>
+  <disable_collisions link1="sahadev_base_link_inertia" link2="table_link" reason="Adjacent"/>
+  <disable_collisions link1="sahadev_shoulder_link" link2="table_link" reason="Adjacent"/>
+  
+  <!-- ── SAHADEV: Never pairs (non-colliding by geometry) ───────────── -->
+  <disable_collisions link1="sahadev_base_link" link2="sahadev_upper_arm_link" reason="Never"/>
+  <disable_collisions link1="sahadev_base_link" link2="sahadev_forearm_link" reason="Never"/>
+  <disable_collisions link1="sahadev_base_link" link2="sahadev_flange" reason="Never"/>
+  <disable_collisions link1="sahadev_base_link" link2="sahadev_ft_frame" reason="Never"/>
+  <disable_collisions link1="sahadev_base_link" link2="sahadev_tool0" reason="Never"/>
+  <disable_collisions link1="sahadev_base_link" link2="sahadev_shoulder_link" reason="Never"/>
+  <disable_collisions link1="sahadev_base_link" link2="sahadev_wrist_1_link" reason="Never"/>
+  <disable_collisions link1="sahadev_base_link" link2="sahadev_wrist_2_link" reason="Never"/>
+  <disable_collisions link1="sahadev_base_link" link2="sahadev_wrist_3_link" reason="Never"/>
+  <disable_collisions link1="sahadev_base_link_inertia" link2="sahadev_flange" reason="Never"/>
+  <disable_collisions link1="sahadev_base_link_inertia" link2="sahadev_ft_frame" reason="Never"/>
+  <disable_collisions link1="sahadev_base_link_inertia" link2="sahadev_tool0" reason="Never"/>
+  <disable_collisions link1="sahadev_shoulder_link" link2="sahadev_forearm_link" reason="Never"/>
+  <disable_collisions link1="sahadev_shoulder_link" link2="sahadev_tool0" reason="Never"/>
+  <disable_collisions link1="sahadev_forearm_link" link2="sahadev_wrist_2_link" reason="Never"/>
+  <disable_collisions link1="sahadev_forearm_link" link2="sahadev_wrist_3_link" reason="Never"/>
+  <disable_collisions link1="sahadev_forearm_link" link2="sahadev_ft_frame" reason="Never"/>
+  <disable_collisions link1="sahadev_forearm_link" link2="sahadev_tool0" reason="Never"/>
+  <disable_collisions link1="sahadev_wrist_1_link" link2="sahadev_wrist_3_link" reason="Never"/>
+  <disable_collisions link1="sahadev_flange" link2="sahadev_forearm_link" reason="Never"/>
+  <disable_collisions link1="sahadev_flange" link2="sahadev_ft_frame" reason="Never"/>
+  <disable_collisions link1="sahadev_flange" link2="sahadev_shoulder_link" reason="Never"/>
+  <disable_collisions link1="sahadev_flange" link2="sahadev_tool0" reason="Never"/>
+  <disable_collisions link1="sahadev_flange" link2="sahadev_upper_arm_link" reason="Never"/>
+  <disable_collisions link1="sahadev_flange" link2="sahadev_wrist_1_link" reason="Never"/>
+  <disable_collisions link1="sahadev_flange" link2="sahadev_wrist_2_link" reason="Never"/>
+  <disable_collisions link1="sahadev_flange" link2="sahadev_wrist_3_link" reason="Never"/>
+  <disable_collisions link1="sahadev_ft_frame" link2="sahadev_shoulder_link" reason="Never"/>
+  <disable_collisions link1="sahadev_ft_frame" link2="sahadev_tool0" reason="Never"/>
+  <disable_collisions link1="sahadev_ft_frame" link2="sahadev_upper_arm_link" reason="Never"/>
+  <disable_collisions link1="sahadev_ft_frame" link2="sahadev_wrist_1_link" reason="Never"/>
+  <disable_collisions link1="sahadev_ft_frame" link2="sahadev_wrist_2_link" reason="Never"/>
+  <disable_collisions link1="sahadev_ft_frame" link2="sahadev_wrist_3_link" reason="Never"/>
+  <disable_collisions link1="sahadev_tool0" link2="sahadev_upper_arm_link" reason="Never"/>
+  <disable_collisions link1="sahadev_tool0" link2="sahadev_wrist_1_link" reason="Never"/>
+  <disable_collisions link1="sahadev_tool0" link2="sahadev_wrist_2_link" reason="Never"/>
+  <disable_collisions link1="sahadev_tool0" link2="sahadev_wrist_3_link" reason="Never"/>
+  
+  <!-- ── SAHADEV: Face link disables ────────────────────────────────── -->
+  <disable_collisions link1="face_link" link2="sahadev_flange" reason="Never"/>
+  <disable_collisions link1="face_link" link2="sahadev_ft_frame" reason="Never"/>
+  <disable_collisions link1="face_link" link2="sahadev_tool0" reason="Never"/>
+  <disable_collisions link1="face_link" link2="sahadev_wrist_2_link" reason="Never"/>
+  <disable_collisions link1="face_link" link2="sahadev_wrist_3_link" reason="Never"/>
+  
+  <!-- ── CROSS: Mount/environment static links ──────────────────────── -->
+  <disable_collisions link1="nakul_robot_mount" link2="shop_floor" reason="Never"/>
+  <disable_collisions link1="nakul_robot_mount" link2="table_link" reason="Never"/>
+  <disable_collisions link1="sahadev_robot_mount" link2="shop_floor" reason="Never"/>
+  <disable_collisions link1="sahadev_robot_mount" link2="table_link" reason="Never"/>
+  <disable_collisions link1="nakul_robot_mount" link2="sahadev_robot_mount" reason="Never"/>
+  <disable_collisions link1="shop_floor" link2="table_link" reason="Adjacent"/>
+  <disable_collisions link1="shop_floor" link2="face_link" reason="Never"/>
+  <disable_collisions link1="table_link" link2="face_link" reason="Never"/>
+  <disable_collisions link1="nakul_robot_mount" link2="face_link" reason="Never"/>
+  <disable_collisions link1="sahadev_robot_mount" link2="face_link" reason="Never"/>
+  
+  <!-- ── CROSS: Robot base vs opposite robot mount (far apart) ──────── -->
+  <disable_collisions link1="nakul_base_link" link2="sahadev_robot_mount" reason="Never"/>
+  <disable_collisions link1="nakul_base_link_inertia" link2="sahadev_robot_mount" reason="Never"/>
+  <disable_collisions link1="sahadev_base_link" link2="nakul_robot_mount" reason="Never"/>
+  <disable_collisions link1="sahadev_base_link_inertia" link2="nakul_robot_mount" reason="Never"/>
+  
+  <!-- ── CROSS: Robot base vs opposite robot base (1.35m apart) ─────── -->
+  <disable_collisions link1="nakul_base_link" link2="sahadev_base_link" reason="Never"/>
+  <disable_collisions link1="nakul_base_link" link2="sahadev_base_link_inertia" reason="Never"/>
+  <disable_collisions link1="nakul_base_link_inertia" link2="sahadev_base_link" reason="Never"/>
+  <disable_collisions link1="nakul_base_link_inertia" link2="sahadev_base_link_inertia" reason="Never"/>
+  <disable_collisions link1="nakul_shoulder_link" link2="sahadev_base_link" reason="Never"/>
+  <disable_collisions link1="nakul_shoulder_link" link2="sahadev_base_link_inertia" reason="Never"/>
+  <disable_collisions link1="sahadev_shoulder_link" link2="nakul_base_link" reason="Never"/>
+  <disable_collisions link1="sahadev_shoulder_link" link2="nakul_base_link_inertia" reason="Never"/>
+  
+</robot>

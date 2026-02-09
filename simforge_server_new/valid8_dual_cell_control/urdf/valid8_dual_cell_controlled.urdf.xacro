@@ -1,0 +1,74 @@
+<?xml version="1.0"?>
+<!--
+Valid8 Dual Robot Cell Controlled URDF
+
+This URDF extends the description with ros2_control tags for both robots.
+Each robot has its own hardware interface (real or mock).
+
+Based on Universal Robots ROS2 Dual Robot Tutorial.
+-->
+<robot name="valid8_dual_cell" xmlns:xacro="http://wiki.ros.org/xacro">
+
+  <!-- Include base description -->
+  <xacro:include filename="$(find valid8_dual_cell_description)/urdf/valid8_dual_cell.urdf.xacro"/>
+  
+  <!-- Include UR ros2_control macro (in ur_description since ROS2 Humble) -->
+  <xacro:include filename="$(find ur_description)/urdf/ur.ros2_control.xacro"/>
+
+  <!-- ========== ros2_control Arguments for Nakul ========== -->
+  <xacro:arg name="nakul_robot_ip" default="192.168.1.9"/>
+  <xacro:arg name="nakul_use_fake_hardware" default="false"/>
+  <xacro:arg name="nakul_fake_sensor_commands" default="false"/>
+  <xacro:arg name="nakul_hash_kinematics" default="calib_12788084448423163542"/>
+  
+  <!-- ========== ros2_control Arguments for Sahadev ========== -->
+  <xacro:arg name="sahadev_robot_ip" default="192.168.1.16"/>
+  <xacro:arg name="sahadev_use_fake_hardware" default="false"/>
+  <xacro:arg name="sahadev_fake_sensor_commands" default="false"/>
+  <xacro:arg name="sahadev_hash_kinematics" default="calib_12788084448423163542"/>
+  
+  <!-- ========== Common Arguments ========== -->
+  <xacro:arg name="headless_mode" default="false"/>
+  <xacro:arg name="script_filename" default="$(find ur_robot_driver)/resources/ros_control.urscript"/>
+  <xacro:arg name="output_recipe_filename" default="$(find ur_robot_driver)/resources/rtde_output_recipe.txt"/>
+  <xacro:arg name="input_recipe_filename" default="$(find ur_robot_driver)/resources/rtde_input_recipe.txt"/>
+
+  <!-- ========== Nakul ros2_control Hardware Interface ========== -->
+  <!-- Nakul uses default UR ports: 50001-50004 -->
+  <xacro:ur_ros2_control
+    name="nakul_ur5e"
+    tf_prefix="nakul_"
+    robot_ip="$(arg nakul_robot_ip)"
+    use_fake_hardware="$(arg nakul_use_fake_hardware)"
+    fake_sensor_commands="$(arg nakul_fake_sensor_commands)"
+    hash_kinematics="$(arg nakul_hash_kinematics)"
+    headless_mode="$(arg headless_mode)"
+    script_filename="$(arg script_filename)"
+    output_recipe_filename="$(arg output_recipe_filename)"
+    input_recipe_filename="$(arg input_recipe_filename)"
+    reverse_port="50001"
+    script_sender_port="50002"
+    trajectory_port="50003"
+    script_command_port="50004"
+  />
+
+  <!-- ========== Sahadev ros2_control Hardware Interface ========== -->
+  <!-- Sahadev uses offset ports: 50005-50008 to avoid conflicts with Nakul -->
+  <xacro:ur_ros2_control
+    name="sahadev_ur5e"
+    tf_prefix="sahadev_"
+    robot_ip="$(arg sahadev_robot_ip)"
+    use_fake_hardware="$(arg sahadev_use_fake_hardware)"
+    fake_sensor_commands="$(arg sahadev_fake_sensor_commands)"
+    hash_kinematics="$(arg sahadev_hash_kinematics)"
+    headless_mode="$(arg headless_mode)"
+    script_filename="$(arg script_filename)"
+    output_recipe_filename="$(arg output_recipe_filename)"
+    input_recipe_filename="$(arg input_recipe_filename)"
+    reverse_port="50005"
+    script_sender_port="50006"
+    trajectory_port="50007"
+    script_command_port="50008"
+  />
+
+</robot>
