@@ -175,6 +175,7 @@ class CommandGatewayNode(Node):
         # Proto-sim flags
         self._proto_sim_running = False
         self._proto_sim_stop = False
+        self._exec_fail_count = 0
 
         # Hardware mode tracking
         self._current_mode = self._read_current_mode()
@@ -541,91 +542,160 @@ class CommandGatewayNode(Node):
     async def _execute_trajectory(
         self, robot_name: str, trajectory: RobotTrajectory, timeout: float = 60.0
     ) -> bool:
-        """Send a RobotTrajectory to the FollowJointTrajectory action."""
+        """Send a RobotTrajectory to the FollowJointTrajectory action.
+
+        Includes retry logic: if the trajectory is rejected or aborted due to
+        a transient controller deactivation (e.g. caused by the other robot's
+        connection dropping, which triggers controller_stopper), the method
+        waits for the controller to come back and retries once.
+        """
         client = self._traj_clients.get(robot_name)
         if client is None:
             self.get_logger().error(f"No trajectory client for {robot_name}")
             return False
 
-        # Wait for action server (non-blocking poll)
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            if client.server_is_ready():
-                break
-            await asyncio.sleep(0.2)
-        else:
-            self.get_logger().error(
-                f"Trajectory action server not available for {robot_name}"
-            )
-            return False
+        max_attempts = 2  # original attempt + 1 retry
 
-        # ── Ensure the UR robot program is running ──────────────
-        # Without this, the hardware interface silently drops all
-        # motion commands and the trajectory action times out.
-        ready = await self._ensure_robot_ready(robot_name, timeout=15.0)
-        if not ready:
-            self.get_logger().error(
-                f"Robot program not running on {robot_name} — "
-                f"cannot execute trajectory"
-            )
-            return False
-
-        goal = FollowJointTrajectory.Goal()
-        goal.trajectory = trajectory.joint_trajectory
-
-        # ── Fix: strip duplicate-time leading point ─────────────
-        # MoveIt often produces trajectories whose first point has
-        # time_from_start == 0 (the current state).  The UR
-        # scaled_joint_trajectory_controller requires *strictly
-        # increasing* timestamps, so we drop the first point if it
-        # shares a timestamp with the second.
-        pts = goal.trajectory.points
-        if len(pts) >= 2:
-            t0 = pts[0].time_from_start.sec + pts[0].time_from_start.nanosec * 1e-9
-            t1 = pts[1].time_from_start.sec + pts[1].time_from_start.nanosec * 1e-9
-            if t0 >= t1 or t0 == 0.0:
-                goal.trajectory.points = list(pts[1:])
-
-        n_pts = len(goal.trajectory.points)
-        self.get_logger().info(f"Executing trajectory on {robot_name} ({n_pts} points)")
-
-        try:
-            # Send goal
-            send_future = client.send_goal_async(goal)
-            goal_handle = await await_ros_future(send_future, timeout=10.0)
-
-            if not goal_handle.accepted:
-                self.get_logger().warn(f"Trajectory goal rejected for {robot_name}")
-                return False
-
-            self.get_logger().info(f"Trajectory accepted for {robot_name}, waiting…")
-
-            # Wait for result
-            result_future = goal_handle.get_result_async()
-            result = await await_ros_future(result_future, timeout=timeout)
-
-            error_code = result.result.error_code
-            if error_code == FollowJointTrajectory.Result.SUCCESSFUL:
-                self.get_logger().info(
-                    f"Trajectory executed successfully on {robot_name}"
-                )
-                return True
+        for attempt in range(max_attempts):
+            # Wait for action server (non-blocking poll)
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if client.server_is_ready():
+                    break
+                await asyncio.sleep(0.2)
             else:
-                self.get_logger().warn(
-                    f"Trajectory execution error on {robot_name}: code={error_code}"
+                self.get_logger().error(
+                    f"Trajectory action server not available for {robot_name}"
+                )
+                if attempt < max_attempts - 1:
+                    self.get_logger().info(
+                        f"Waiting for controller recovery before retry "
+                        f"(attempt {attempt+1}/{max_attempts})…"
+                    )
+                    # Log which robots have connection issues
+                    self._log_cross_robot_diagnostics(robot_name)
+                    await asyncio.sleep(5.0)
+                    continue
+                return False
+
+            # ── Ensure the UR robot program is running ──────────────
+            ready = await self._ensure_robot_ready(robot_name, timeout=15.0)
+            if not ready:
+                self.get_logger().error(
+                    f"Robot program not running on {robot_name} — "
+                    f"cannot execute trajectory"
                 )
                 return False
-        except TimeoutError:
-            self.get_logger().error(
-                f"Trajectory execution timed out for {robot_name}"
+
+            goal = FollowJointTrajectory.Goal()
+            goal.trajectory = trajectory.joint_trajectory
+
+            # ── Fix: strip duplicate-time leading point ─────────────
+            pts = goal.trajectory.points
+            if len(pts) >= 2:
+                t0 = pts[0].time_from_start.sec + pts[0].time_from_start.nanosec * 1e-9
+                t1 = pts[1].time_from_start.sec + pts[1].time_from_start.nanosec * 1e-9
+                if t0 >= t1 or t0 == 0.0:
+                    goal.trajectory.points = list(pts[1:])
+
+            n_pts = len(goal.trajectory.points)
+            self.get_logger().info(
+                f"Executing trajectory on {robot_name} ({n_pts} points)"
+                + (f" [retry {attempt}]" if attempt > 0 else "")
             )
-            return False
-        except Exception as exc:
-            self.get_logger().error(
-                f"Trajectory execution failed for {robot_name}: {exc}\n"
-                f"{traceback.format_exc()}"
-            )
-            return False
+
+            try:
+                # Send goal
+                send_future = client.send_goal_async(goal)
+                goal_handle = await await_ros_future(send_future, timeout=10.0)
+
+                if not goal_handle.accepted:
+                    self.get_logger().warn(
+                        f"Trajectory goal rejected for {robot_name}"
+                    )
+                    self._log_cross_robot_diagnostics(robot_name)
+                    if attempt < max_attempts - 1:
+                        self.get_logger().info(
+                            "Controller may have been deactivated by "
+                            "controller_stopper — waiting for recovery…"
+                        )
+                        await asyncio.sleep(5.0)
+                        continue
+                    return False
+
+                self.get_logger().info(
+                    f"Trajectory accepted for {robot_name}, waiting…"
+                )
+
+                # Wait for result
+                result_future = goal_handle.get_result_async()
+                result = await await_ros_future(result_future, timeout=timeout)
+
+                error_code = result.result.error_code
+                if error_code == FollowJointTrajectory.Result.SUCCESSFUL:
+                    self.get_logger().info(
+                        f"Trajectory executed successfully on {robot_name}"
+                    )
+                    return True
+                else:
+                    self.get_logger().warn(
+                        f"Trajectory execution error on {robot_name}: "
+                        f"code={error_code}"
+                    )
+                    self._log_cross_robot_diagnostics(robot_name)
+                    if attempt < max_attempts - 1:
+                        self.get_logger().info(
+                            f"Trajectory aborted (code={error_code}) — "
+                            "may be caused by cross-robot controller_stopper. "
+                            "Waiting for recovery before retry…"
+                        )
+                        await asyncio.sleep(5.0)
+                        continue
+                    return False
+
+            except TimeoutError:
+                self.get_logger().error(
+                    f"Trajectory execution timed out for {robot_name}"
+                )
+                return False
+            except Exception as exc:
+                self.get_logger().error(
+                    f"Trajectory execution failed for {robot_name}: {exc}\n"
+                    f"{traceback.format_exc()}"
+                )
+                return False
+
+        return False  # Should not reach here
+
+    def _log_cross_robot_diagnostics(self, executing_robot: str) -> None:
+        """Log connection status of all robots for diagnostic purposes.
+
+        When a trajectory fails on one robot, it may be because the other
+        robot's connection dropped, causing the shared ros2_control_node
+        and controller_stopper to deactivate controllers.
+        """
+        current_mode = self._read_current_mode()
+        if current_mode not in ("real", "both"):
+            return  # Diagnostics only relevant in real mode
+
+        for rn in ROBOT_CONFIG:
+            prog = self._robot_program_running.get(rn, False)
+            st = self._robot_states.get(rn)
+            has_joints = st and len(st.joint_positions) == 6
+            age = time.time() - st.last_update if st and st.last_update > 0 else -1
+            marker = " ← EXECUTING" if rn == executing_robot else ""
+            if not prog:
+                self.get_logger().warn(
+                    f"  ⚠ {rn}: program_running=False, "
+                    f"joints={'ok' if has_joints else 'MISSING'}, "
+                    f"last_update={age:.1f}s ago{marker}"
+                )
+            else:
+                self.get_logger().info(
+                    f"  ✓ {rn}: program_running=True, "
+                    f"joints={'ok' if has_joints else 'MISSING'}, "
+                    f"last_update={age:.1f}s ago{marker}"
+                )
 
     async def _move_to_pose(
         self,
@@ -691,8 +761,24 @@ class CommandGatewayNode(Node):
         return "plan_failed"
 
     async def _move_to_home(self, robot_name: str) -> bool:
-        """Plan and execute a return-to-home motion."""
+        """Plan and execute a return-to-home motion.
+
+        Includes recovery logic: if the controller was deactivated (e.g.
+        by cross-robot controller_stopper), waits for it to come back.
+        """
         cfg = ROBOT_CONFIG[robot_name]
+
+        # Ensure the robot is ready before planning home
+        # (the controller may have been deactivated by controller_stopper
+        # if the OTHER robot's connection dropped)
+        ready = await self._ensure_robot_ready(robot_name, timeout=15.0)
+        if not ready:
+            self.get_logger().warn(
+                f"Robot program not running for {robot_name} — "
+                f"cannot plan home. Skipping go-home."
+            )
+            return False
+
         trajectory = await self._plan_to_joints(
             robot_name, cfg["home_position"],
             velocity_scaling=0.3, acceleration_scaling=0.3,
@@ -1394,6 +1480,7 @@ class CommandGatewayNode(Node):
 
             if result == "success":
                 completed += 1
+                self._exec_fail_count = 0  # reset consecutive failure counter
                 self.get_logger().info(
                     f"  [{i+1}/{total}] ✓ reached {pose_name}"
                 )
@@ -1408,11 +1495,72 @@ class CommandGatewayNode(Node):
                 self.get_logger().warn(
                     f"  [{i+1}/{total}] ✗ Planning failed for {pose_name}"
                 )
+            elif result == "exec_failed":
+                self._exec_fail_count += 1
+                plan_failed += 1  # count as plan_failed for the summary
+
+                # Log cross-robot diagnostics to help identify cascade failures
+                self._log_cross_robot_diagnostics(robot_name)
+
+                self.get_logger().error(
+                    f"  [{i+1}/{total}] ✗ Execution failed for {pose_name} "
+                    f"(consecutive exec failures: {self._exec_fail_count})"
+                )
+
+                # Build diagnostic hint for the client
+                other_robots_down = [
+                    rn for rn in ROBOT_CONFIG
+                    if rn != robot_name
+                    and not self._robot_program_running.get(rn, False)
+                ]
+                diag_hint = ""
+                if other_robots_down:
+                    diag_hint = (
+                        f" — possible cause: {', '.join(other_robots_down)} "
+                        f"lost connection (shared controller affected)"
+                    )
+
+                # Notify client of the exec failure with diagnostic info
+                await client.websocket.send(json.dumps({
+                    "type": "rpc_feedback",
+                    "request_id": request_id,
+                    "current_pose_index": i,
+                    "total_poses": total,
+                    "current_pose_name": pose_name,
+                    "progress_percent": (i / total) * 100 if total > 0 else 0,
+                    "status": "exec_failed",
+                    "message": f"Execution failed for {pose_name}{diag_hint}",
+                }))
+
+                # If robot program is no longer running, abort remaining poses
+                # — there's no point trying more if the controller is dead
+                if not self._robot_program_running.get(robot_name, False):
+                    current_mode = self._read_current_mode()
+                    if current_mode in ("real", "both"):
+                        self.get_logger().error(
+                            f"Robot program stopped on {robot_name} — "
+                            f"aborting remaining {total - i - 1} poses"
+                        )
+                        await client.websocket.send(json.dumps({
+                            "type": "rpc_feedback",
+                            "request_id": request_id,
+                            "current_pose_index": i,
+                            "total_poses": total,
+                            "status": "hardware_error",
+                            "message": (
+                                f"Robot program stopped on {robot_name}. "
+                                f"Aborting remaining poses.{diag_hint}"
+                            ),
+                        }))
+                        break
             else:
                 plan_failed += 1
                 self.get_logger().warn(
-                    f"  [{i+1}/{total}] ✗ Execution failed for {pose_name}"
+                    f"  [{i+1}/{total}] ✗ Unknown failure '{result}' for {pose_name}"
                 )
+
+        # Reset consecutive exec fail counter
+        self._exec_fail_count = 0
 
         # Return home
         if completed > 0 and not self._proto_sim_stop:
@@ -1421,25 +1569,48 @@ class CommandGatewayNode(Node):
 
         self._proto_sim_running = False
 
+        # Build summary with diagnostic details
+        summary_parts = [
+            f"Completed {completed}/{total} poses",
+        ]
+        if ik_failed:
+            summary_parts.append(f"{ik_failed} IK failed")
+        if plan_failed:
+            summary_parts.append(f"{plan_failed} plan/exec failed")
+
+        # Check if any robot lost connection during the run
+        hardware_issues = []
+        current_mode = self._read_current_mode()
+        if current_mode in ("real", "both"):
+            for rn in ROBOT_CONFIG:
+                if not self._robot_program_running.get(rn, False):
+                    hardware_issues.append(rn)
+
+        if hardware_issues:
+            summary_parts.append(
+                f"⚠ Hardware issue: {', '.join(hardware_issues)} disconnected"
+            )
+
+        summary = " | ".join(summary_parts)
+
         self.get_logger().info(
             f"Proto-sim DONE: {completed}/{total} ok, "
             f"{ik_failed} IK-fail, {plan_failed} plan-fail"
+            + (f" | hw-issues: {hardware_issues}" if hardware_issues else "")
         )
 
         await client.websocket.send(json.dumps({
             "type": "rpc_result",
             "request_id": request_id,
-            "success": True,
-            "message": (
-                f"Completed {completed}/{total} poses "
-                f"({ik_failed} IK failed, {plan_failed} plan failed)"
-            ),
+            "success": completed > 0,
+            "message": summary,
             "completed": completed,
             "collision_rejected": 0,
             "ik_failed": ik_failed,
             "real_failed": plan_failed,
             "total": total,
             "stopped": self._proto_sim_stop,
+            "hardware_issues": hardware_issues,
         }))
 
     async def _rpc_plan_motion(self, params):
