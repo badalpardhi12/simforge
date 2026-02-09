@@ -51,10 +51,10 @@ class ProtoPose:
 
 @dataclass
 class WorldPose:
-    """Pose expressed in robot's base_link frame (world coordinates)."""
+    """Pose expressed in the server's reference frame (from get_environment_info)."""
     name: str
-    position_m: Tuple[float, float, float]  # x, y, z in base_link frame
-    orientation_quat_xyzw: Tuple[float, float, float, float]  # quaternion in base_link frame
+    position_m: Tuple[float, float, float]  # x, y, z in reference frame
+    orientation_quat_xyzw: Tuple[float, float, float, float]  # quaternion in reference frame
     parameters: Dict[str, float]  # Original sampling parameters
 
     def to_dict(self) -> Dict:
@@ -205,20 +205,22 @@ def _look_at_quaternion(
     roll_deg: float = 0.0
 ) -> Tuple[float, float, float, float]:
     """
-    Compute quaternion that points Y-axis from position towards target with optional roll.
+    Compute quaternion that points Z-axis from position towards target with optional roll.
     
-    For tool_tip_link/tool_base_link, the +Y axis is the "outward" direction that
-    should point at the target object. This matches the iPhone tool orientation.
+    For tool_tip_link, the +Z axis is the "outward" direction that
+    should point at the target object. This matches the original
+    SpatialScout / simforge_new convention where the tool's Z-axis
+    is aligned with the look-at direction.
     
     Coordinate frame convention:
-    - Y-axis: Points from position towards target (tool forward direction)
-    - Z-axis: "Up" direction (perpendicular to Y, preferring world Z)
-    - X-axis: Completes right-handed frame (perpendicular to Y and Z)
+    - Z-axis: Points from position towards target (tool forward direction)
+    - X-axis: Perpendicular to Z and up hint (right-hand rule)
+    - Y-axis: Completes right-handed frame (Z × X)
     
     Args:
         position: Source position (x, y, z) - where the tool is located
         target: Target position to look at (x, y, z) - what the tool points at
-        roll_deg: Roll angle around the look-at (Y) axis in degrees
+        roll_deg: Roll angle around the look-at (Z) axis in degrees
         
     Returns:
         Quaternion (x, y, z, w)
@@ -226,37 +228,37 @@ def _look_at_quaternion(
     src = np.asarray(position, dtype=np.float64)
     tgt = np.asarray(target, dtype=np.float64)
     
-    # Y-axis points from position to target (tool forward direction)
-    y_axis = tgt - src
-    norm = np.linalg.norm(y_axis)
+    # Z-axis points from position to target (tool forward direction)
+    z_axis = tgt - src
+    norm = np.linalg.norm(z_axis)
     if norm < 1e-9:
-        y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
     else:
-        y_axis = y_axis / norm
+        z_axis = z_axis / norm
     
-    # Choose up vector for Z-axis (prefer world Z, fall back to world X if looking straight up/down)
+    # Choose up vector (prefer world Z, fall back to world Y if looking straight up/down)
     up_hint = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    if abs(np.dot(up_hint, y_axis)) >= 0.95:
-        up_hint = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    if abs(np.dot(up_hint, z_axis)) >= 0.95:
+        up_hint = np.array([0.0, 1.0, 0.0], dtype=np.float64)
     
-    # X-axis is perpendicular to Y and up_hint
-    x_axis = np.cross(y_axis, up_hint)
+    # X-axis is perpendicular to up_hint and Z
+    x_axis = np.cross(up_hint, z_axis)
     x_norm = np.linalg.norm(x_axis)
     if x_norm < 1e-9:
         x_axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
     else:
         x_axis = x_axis / x_norm
     
-    # Z-axis completes the right-handed frame
-    z_axis = np.cross(x_axis, y_axis)
+    # Y-axis completes the right-handed frame
+    y_axis = np.cross(z_axis, x_axis)
     
     # Build rotation matrix [X|Y|Z] and convert to quaternion
     rot_matrix = np.column_stack((x_axis, y_axis, z_axis))
     quat_xyzw = _quat_from_matrix(rot_matrix.tolist())
     
-    # Apply roll around Y-axis (the look-at axis)
+    # Apply roll around Z-axis (the look-at axis)
     if abs(roll_deg) > 1e-6:
-        roll_quat = _rpy_to_quat_xyzw(0.0, math.radians(roll_deg), 0.0)
+        roll_quat = _rpy_to_quat_xyzw(0.0, 0.0, math.radians(roll_deg))
         quat_xyzw = _quat_multiply(quat_xyzw, roll_quat)
     
     return _normalize_quaternion(quat_xyzw)
@@ -274,7 +276,7 @@ def generate_proto_poses(params: ProtoSimParameters) -> List[ProtoPose]:
     - For each (horiz, vert) combination, define a pivot point in the target frame
     - For each (pitch, yaw, distance, roll), compute camera position and orientation
     - Position is pivot + spherical_offset
-    - Orientation points Z-axis at pivot with specified roll
+    - Orientation points tool +Z axis at pivot with specified roll
     
     Args:
         params: Parameter ranges for sampling
@@ -333,18 +335,19 @@ def transform_pose_to_world(
     target_orientation_quat_xyzw: Tuple[float, float, float, float],
 ) -> WorldPose:
     """
-    Transform a pose from target object frame to the robot's base_link frame.
+    Transform a pose from target object frame to the server's reference frame.
     
     The target_position and target_orientation should come from TF lookup
-    of the target frame relative to base_link.
+    of the target frame relative to the server's reference frame
+    (returned by get_environment_info).
     
     Args:
         pose: Pose in target object's local frame
-        target_position: Target object position relative to base_link (x, y, z) meters
-        target_orientation_quat_xyzw: Target object orientation relative to base_link
+        target_position: Target object position in reference frame (x, y, z) meters
+        target_orientation_quat_xyzw: Target object orientation in reference frame
         
     Returns:
-        WorldPose with position and orientation in base_link frame
+        WorldPose with position and orientation in the server's reference frame
     """
     # Build rotation matrix from target orientation (xyzw quaternion)
     x, y, z, w = target_orientation_quat_xyzw
@@ -384,17 +387,17 @@ def generate_world_poses(
     randomize: bool = False,
 ) -> List[WorldPose]:
     """
-    Generate poses directly in the robot's base_link frame.
+    Generate poses directly in the server's reference frame.
     
     This is the main function for client-side pose generation:
     1. Generate poses in target object frame
-    2. Transform all poses to base_link frame
+    2. Transform all poses to the server's reference frame
     3. Optionally randomize order
     
     Args:
         params: Sampling parameters
-        target_position: Target object position in base_link frame (from TF)
-        target_orientation_quat_xyzw: Target object orientation in base_link frame
+        target_position: Target object position in server's reference frame (from TF)
+        target_orientation_quat_xyzw: Target object orientation in server's reference frame
         randomize: Whether to randomize pose order
         
     Returns:
