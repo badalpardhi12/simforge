@@ -210,6 +210,11 @@ class ProtoSimClientFrame(wx.Frame):
         self._connected = False
         self._running_simulation = False
         
+        # Mode-switch tracking
+        self._server_mode: Optional[str] = None   # last confirmed server mode
+        self._mode_ready: bool = False             # True once prepare_mode succeeded
+        self._mode_switching: bool = False          # True while RPC is in-flight
+        
         # Available robots and objects (fetched from server)
         self._robots: List[str] = []
         self._objects: List[str] = []
@@ -430,6 +435,10 @@ class ProtoSimClientFrame(wx.Frame):
         self.estop_btn.Bind(wx.EVT_BUTTON, lambda e: self._on_estop())
         self.refresh_status_btn.Bind(wx.EVT_BUTTON, lambda e: self._on_refresh_status())
         
+        # Mode radio buttons → trigger mode switch immediately
+        self.sim_mode_radio.Bind(wx.EVT_RADIOBUTTON, lambda e: self._on_mode_changed())
+        self.real_mode_radio.Bind(wx.EVT_RADIOBUTTON, lambda e: self._on_mode_changed())
+        
         # Bind parameter changes to update pose count
         for control in self.parameter_controls.values():
             control.text_ctrl.Bind(wx.EVT_TEXT, lambda e: self._update_pose_count())
@@ -535,6 +544,95 @@ class ProtoSimClientFrame(wx.Frame):
             return
         self._log("Refreshing robot status...")
         self._run_async(self._fetch_robot_status())
+
+    # ─────────────────────────────────────────────────────────────────
+    # Immediate mode switching on radio-button change
+    # ─────────────────────────────────────────────────────────────────
+
+    def _on_mode_changed(self) -> None:
+        """Called when the user clicks the Simulation / Real radio button.
+
+        Immediately triggers a server-side mode switch and freezes the UI
+        with a progress dialog until the switch completes (or fails).
+        """
+        if not self._connected:
+            return  # Can't switch if not connected
+
+        if getattr(self, '_mode_switching', False):
+            return  # Already switching — ignore duplicate clicks
+
+        mode = "simulation" if self.sim_mode_radio.GetValue() else "both"
+
+        # If we're already in the right mode, nothing to do
+        if getattr(self, '_server_mode', None) == mode:
+            return
+
+        self._mode_switching = True
+        self._mode_ready = False
+        self._log(f"Switching server to {mode} mode…")
+        self._run_async(self._switch_mode(mode))
+
+    async def _switch_mode(self, mode: str) -> None:
+        """Perform the mode switch RPC with a blocking progress dialog."""
+        # Show a blocking progress dialog on the GUI thread
+        progress_future: asyncio.Future[None] = asyncio.get_event_loop().create_future()
+        dlg_ref: list = []  # mutable container so the callback can store the dialog
+
+        def _show_progress():
+            dlg = wx.ProgressDialog(
+                f"Switching to {mode.title()} mode",
+                f"Preparing {mode} mode — please wait…\n"
+                "The server is restarting the ROS2 stack.",
+                maximum=100,
+                parent=self,
+                style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE,
+            )
+            dlg.Pulse()  # indeterminate progress
+            dlg_ref.append(dlg)
+
+        wx.CallAfter(_show_progress)
+        # Give wx a moment to display the dialog
+        await asyncio.sleep(0.3)
+
+        try:
+            response = await self._client.call_rpc(
+                "prepare_mode", {"mode": mode}, timeout=120.0
+            )
+
+            if response.get("ready"):
+                self._server_mode = mode
+                self._mode_ready = True
+                self._log(f"✓ {mode} mode ready")
+                msg = response.get("message", "")
+                if msg:
+                    self._log(f"  {msg}")
+                # Refresh robot status indicator after mode change
+                await self._fetch_robot_status()
+            else:
+                self._mode_ready = False
+                err = response.get("message", "Unknown error")
+                self._log(f"✗ Mode switch failed: {err}")
+                # Revert the radio button to match actual server state
+                wx.CallAfter(self._revert_radio_to_server_mode)
+        except Exception as e:
+            self._mode_ready = False
+            self._log(f"✗ Mode switch error: {e}")
+            wx.CallAfter(self._revert_radio_to_server_mode)
+        finally:
+            self._mode_switching = False
+            # Dismiss the progress dialog
+            def _close_dlg():
+                if dlg_ref:
+                    dlg_ref[0].Destroy()
+            wx.CallAfter(_close_dlg)
+
+    def _revert_radio_to_server_mode(self) -> None:
+        """Set the radio buttons back to match the last-known server mode."""
+        current = getattr(self, '_server_mode', 'simulation')
+        if current == 'simulation':
+            self.sim_mode_radio.SetValue(True)
+        else:
+            self.real_mode_radio.SetValue(True)
     
     async def _fetch_environment_info(self) -> None:
         """Fetch available robots, objects, and their transforms from server."""
@@ -664,51 +762,54 @@ class ProtoSimClientFrame(wx.Frame):
             self.object_choice.SetSelection(0)
     
     def _on_start(self) -> None:
-        """Start protocol simulation."""
+        """Start protocol simulation.
+
+        The mode switch has *already* happened when the user clicked the
+        radio button.  Here we just validate that the mode is ready and
+        launch the protocol.
+        """
         if not self._connected:
             self._log("Not connected to server")
             return
-        
+
+        if getattr(self, '_mode_switching', False):
+            self._log("Mode switch in progress — please wait")
+            return
+
         # Gather parameters
         try:
             params = self._collect_parameters()
         except ValueError as e:
             self._log(f"Parameter error: {e}")
             return
-        
+
         robot = self.robot_choice.GetStringSelection()
         target_object = self.object_choice.GetStringSelection()
-        
+
         if not robot:
             self._log("Please select a robot")
             return
         if not target_object:
             self._log("Please select a target object")
             return
-        
-        # Determine execution mode
-        # "Simulation Only" → simulation, "Real Robot" → both (sim + real)
+
+        # Determine execution mode from radio buttons
         if self.sim_mode_radio.GetValue():
             mode = "simulation"
         else:
             mode = "both"
-        
+
         total_poses = (
-            len(params.horiz) * 
-            len(params.vert) * 
-            len(params.distance) * 
-            len(params.roll) * 
-            len(params.pitch) * 
+            len(params.horiz) *
+            len(params.vert) *
+            len(params.distance) *
+            len(params.roll) *
+            len(params.pitch) *
             len(params.yaw)
         )
         self._log(f"Starting protocol: {total_poses} poses, mode={mode}")
-        
-        # ALL modes go through prepare_mode first.
-        # This switches the server's joint-state ownership (deactivates
-        # the UR driver's joint_state_broadcaster in sim mode, activates
-        # it for real/both) and runs pre-flight checks for real/both.
+
         self.start_btn.Enable(False)
-        self._log(f"Switching to {mode} mode…")
         self._run_async(self._prepare_and_run(robot, target_object, params, mode, total_poses))
     
     async def _prepare_and_run(
@@ -719,64 +820,67 @@ class ProtoSimClientFrame(wx.Frame):
         mode: str,
         total_poses: int,
     ) -> None:
-        """Switch server mode and pre-flight check, then run the protocol.
-        
-        Calls the server's ``prepare_mode`` RPC which:
-        * Switches joint-state ownership (deactivates the UR driver's
-          joint_state_broadcaster in sim mode, activates it for real/both).
-        * For real/both modes validates the UR driver, MoveIt, and the
-          robot program.
-        
-        The UI is frozen (Start disabled, progress label updated) until
-        the server confirms readiness.  If the check fails the user gets
-        a dialog with the option to retry, switch to simulation, or cancel.
+        """Ensure the server is in the right mode, then run the protocol.
+
+        If the mode was already switched via the radio-button handler the
+        ``prepare_mode`` RPC is skipped.  Otherwise it is called as a
+        fallback (e.g. first run where the user never toggled the radio).
         """
         try:
-            wx.CallAfter(
-                self.progress_label.SetLabel,
-                f"Switching to {mode} mode…"
+            # Check if we need to call prepare_mode
+            need_prepare = (
+                getattr(self, '_server_mode', None) != mode
+                or not getattr(self, '_mode_ready', False)
             )
-            
-            response = await self._client.call_rpc(
-                "prepare_mode", {"mode": mode}, timeout=120.0
-            )
-            
-            if response.get("ready"):
-                self._log(f"✓ {mode} mode ready")
-                self._log(response.get("message", ""))
-                # Proceed with execution
-                self._running_simulation = True
-                wx.CallAfter(self.stop_btn.Enable, True)
-                await self._run_protocol(robot, target_object, params, mode)
-            else:
-                msg = response.get("message", "Robot not ready")
-                self._log(f"✗ {msg}")
-                
-                can_retry = response.get("can_retry", False)
-                
-                # Show dialog on the GUI thread and wait for user decision
-                user_choice = await self._show_mode_check_dialog(mode, msg, can_retry)
-                
-                if user_choice == "retry":
-                    self._log("Retrying mode switch...")
-                    await self._prepare_and_run(robot, target_object, params, mode, total_poses)
-                    return
-                elif user_choice == "simulation":
-                    self._log("Switching to Simulation Only mode")
-                    wx.CallAfter(self.sim_mode_radio.SetValue, True)
-                    # Re-call prepare_mode for simulation so JSB is deactivated
-                    await self._prepare_and_run(
-                        robot, target_object, params, "simulation", total_poses
-                    )
-                    return
+
+            if need_prepare:
+                wx.CallAfter(
+                    self.progress_label.SetLabel,
+                    f"Switching to {mode} mode…"
+                )
+                self._log(f"Switching to {mode} mode…")
+
+                response = await self._client.call_rpc(
+                    "prepare_mode", {"mode": mode}, timeout=120.0
+                )
+
+                if response.get("ready"):
+                    self._server_mode = mode
+                    self._mode_ready = True
+                    self._log(f"✓ {mode} mode ready")
+                    self._log(response.get("message", ""))
                 else:
-                    self._log("Cancelled by user")
-                    wx.CallAfter(self.start_btn.Enable, True)
-                    wx.CallAfter(self.progress_label.SetLabel, "Ready")
-                    
+                    msg = response.get("message", "Robot not ready")
+                    self._log(f"✗ {msg}")
+                    can_retry = response.get("can_retry", False)
+                    user_choice = await self._show_mode_check_dialog(mode, msg, can_retry)
+                    if user_choice == "retry":
+                        self._log("Retrying mode switch...")
+                        await self._prepare_and_run(robot, target_object, params, mode, total_poses)
+                        return
+                    elif user_choice == "simulation":
+                        self._log("Switching to Simulation Only mode")
+                        wx.CallAfter(self.sim_mode_radio.SetValue, True)
+                        self._server_mode = "simulation"
+                        self._mode_ready = True
+                        await self._prepare_and_run(
+                            robot, target_object, params, "simulation", total_poses
+                        )
+                        return
+                    else:
+                        self._log("Cancelled by user")
+                        wx.CallAfter(self.start_btn.Enable, True)
+                        wx.CallAfter(self.progress_label.SetLabel, "Ready")
+                        return
+
+            # Mode is ready — proceed with protocol execution
+            wx.CallAfter(self.progress_label.SetLabel, "Running protocol…")
+            self._running_simulation = True
+            wx.CallAfter(self.stop_btn.Enable, True)
+            await self._run_protocol(robot, target_object, params, mode)
+
         except Exception as e:
             self._log(f"Mode switch error: {e}")
-            # Offer to fall back to simulation
             user_choice = await self._show_mode_check_dialog(
                 mode,
                 f"Could not reach server for mode switch:\n{e}",
@@ -785,6 +889,8 @@ class ProtoSimClientFrame(wx.Frame):
             if user_choice == "simulation":
                 self._log("Falling back to Simulation Only mode")
                 wx.CallAfter(self.sim_mode_radio.SetValue, True)
+                self._server_mode = "simulation"
+                self._mode_ready = True
                 await self._prepare_and_run(
                     robot, target_object, params, "simulation", total_poses
                 )
