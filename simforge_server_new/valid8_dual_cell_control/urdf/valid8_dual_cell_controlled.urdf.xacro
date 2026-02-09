@@ -35,6 +35,14 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
 
   <!-- ========== Nakul ros2_control Hardware Interface ========== -->
   <!-- Nakul uses default UR ports: 50001-50004 -->
+  <!--
+    keep_alive_count: Number of control-loop cycles without data before
+    the URScript program on the robot exits.  The default of 2 is very
+    aggressive on non-RT systems running dual robots — two missed 2 ms
+    cycles (4 ms) can happen easily under scheduler jitter.  We raise
+    this to 10 (~20 ms grace period at 500 Hz) to prevent spurious
+    reverse-interface drops.
+  -->
   <xacro:ur_ros2_control
     name="nakul_ur5e"
     tf_prefix="nakul_"
@@ -50,6 +58,7 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
     script_sender_port="50002"
     trajectory_port="50003"
     script_command_port="50004"
+    keep_alive_count="10"
   />
 
   <!-- ========== Sahadev ros2_control Hardware Interface ========== -->
@@ -69,6 +78,7 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
     script_sender_port="50006"
     trajectory_port="50007"
     script_command_port="50008"
+    keep_alive_count="10"
   />
 
 </robot>
