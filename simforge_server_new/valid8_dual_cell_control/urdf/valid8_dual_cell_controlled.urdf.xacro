@@ -6,14 +6,20 @@ This URDF extends the description with ros2_control tags for both robots.
 Each robot has its own hardware interface (real or mock).
 
 Based on Universal Robots ROS2 Dual Robot Tutorial.
+
+Uses a patched version of ur.ros2_control.xacro that exposes servoj_gain
+and servoj_lookahead_time as configurable parameters (upstream hardcodes
+them).  Tuned values for non-RT dual-robot system:
+  servoj_gain=750         (default 2000): softer position tracking
+  servoj_lookahead_time=0.1 (default 0.03): more smoothing of trajectory
 -->
 <robot name="valid8_dual_cell" xmlns:xacro="http://wiki.ros.org/xacro">
 
   <!-- Include base description -->
   <xacro:include filename="$(find valid8_dual_cell_description)/urdf/valid8_dual_cell.urdf.xacro"/>
   
-  <!-- Include UR ros2_control macro (in ur_description since ROS2 Humble) -->
-  <xacro:include filename="$(find ur_description)/urdf/ur.ros2_control.xacro"/>
+  <!-- Include PATCHED UR ros2_control macro with configurable servoj params -->
+  <xacro:include filename="$(find valid8_dual_cell_control)/urdf/ur_ros2_control_patched.xacro"/>
 
   <!-- ========== ros2_control Arguments for Nakul ========== -->
   <xacro:arg name="nakul_robot_ip" default="192.168.1.9"/>
@@ -42,8 +48,16 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
     cycles (4 ms) can happen easily under scheduler jitter.  We raise
     this to 10 (~20 ms grace period at 500 Hz) to prevent spurious
     reverse-interface drops.
+
+    servoj_gain: Proportional gain for servoj (range 100-2000).
+    Default 2000 is very stiff. 750 provides smoother tracking on
+    non-RT systems by tolerating small position errors gracefully.
+
+    servoj_lookahead_time: Lookahead window for servoj (range 0.03-0.2).
+    Default 0.03s is too aggressive for non-RT dual-robot systems.
+    0.1s adds trajectory smoothing at the URScript level.
   -->
-  <xacro:ur_ros2_control
+  <xacro:ur_ros2_control_patched
     name="nakul_ur5e"
     tf_prefix="nakul_"
     robot_ip="$(arg nakul_robot_ip)"
@@ -59,11 +73,13 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
     trajectory_port="50003"
     script_command_port="50004"
     keep_alive_count="10"
+    servoj_gain="750"
+    servoj_lookahead_time="0.1"
   />
 
   <!-- ========== Sahadev ros2_control Hardware Interface ========== -->
   <!-- Sahadev uses offset ports: 50005-50008 to avoid conflicts with Nakul -->
-  <xacro:ur_ros2_control
+  <xacro:ur_ros2_control_patched
     name="sahadev_ur5e"
     tf_prefix="sahadev_"
     robot_ip="$(arg sahadev_robot_ip)"
@@ -79,6 +95,8 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
     trajectory_port="50007"
     script_command_port="50008"
     keep_alive_count="10"
+    servoj_gain="750"
+    servoj_lookahead_time="0.1"
   />
 
 </robot>

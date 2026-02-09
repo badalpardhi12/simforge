@@ -4,11 +4,18 @@
 # Velocities are capped well below hardware max to prevent protective stops:
 #   Shoulder/Elbow: 1.0 rad/s (HW max 3.14)
 #   Wrist: 1.5 rad/s (HW max 6.28)
-# Default scaling further reduces these by 10x for safe planning.
+#
+# NOTE: default_velocity/acceleration_scaling_factor COMPOUND with the
+# per-request scaling factors set in _plan_to_joints() (default 0.3).
+# If this file sets 0.1 and the request sets 0.3, the effective cap is
+# 0.1 × 0.3 = 0.03 of the per-joint max — absurdly slow (~1.7°/s for
+# shoulder joints), causing densely-packed waypoints and visible jerkiness
+# on non-RT systems.  Set these to 1.0 so the per-joint limits above are
+# the true ceiling and only the per-request scaling controls speed.
 
 # Global scaling (applied on top of per-joint limits)
-default_velocity_scaling_factor: 0.1
-default_acceleration_scaling_factor: 0.1
+default_velocity_scaling_factor: 1.0
+default_acceleration_scaling_factor: 1.0
 
 joint_limits:
   # Nakul UR5e joints
