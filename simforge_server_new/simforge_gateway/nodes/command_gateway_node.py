@@ -611,20 +611,16 @@ class CommandGatewayNode(Node):
             goal = FollowJointTrajectory.Goal()
             goal.trajectory = trajectory.joint_trajectory
 
-            # ── Fix: detect and repair broken timestamps ────────────
-            # When Ruckig smoothing fails (e.g. missing jerk limits),
-            # MoveIt may produce trajectories where ALL waypoints have
-            # time_from_start = 0.  The controller rejects these with
-            # "Time between points is not strictly increasing".
-            #
-            # Strategy:
-            # 1. Strip a duplicate-time leading point (original fix).
-            # 2. If remaining points still have zero/non-increasing
-            #    timestamps, assign conservative linear spacing so the
-            #    trajectory is at least executable (albeit unsmoothed).
+            # ── Timestamp sanity checks ─────────────────────────────
+            # MoveIt should produce monotonically increasing timestamps
+            # via AddTimeOptimalParameterization.  If timestamps are
+            # zero or non-increasing, the trajectory is broken (e.g.
+            # adapter failure) — refuse to execute rather than risk
+            # the controller doing aggressive spline interpolation.
             pts = goal.trajectory.points
 
-            # Step 1: strip a zero-time leading point
+            # Strip a zero-time leading point (common TOPP artefact
+            # where point 0 duplicates the start state at t=0)
             if len(pts) >= 2:
                 t0 = pts[0].time_from_start.sec + pts[0].time_from_start.nanosec * 1e-9
                 t1 = pts[1].time_from_start.sec + pts[1].time_from_start.nanosec * 1e-9
@@ -632,40 +628,24 @@ class CommandGatewayNode(Node):
                     pts = list(pts[1:])
                     goal.trajectory.points = pts
 
-            # Step 2: detect all-zero / non-increasing timestamps
+            # Reject if remaining timestamps are not strictly increasing
             if len(pts) >= 2:
                 times = [
                     p.time_from_start.sec + p.time_from_start.nanosec * 1e-9
                     for p in pts
                 ]
-                monotonic = all(times[i] < times[i + 1] for i in range(len(times) - 1))
+                monotonic = all(
+                    times[i] < times[i + 1]
+                    for i in range(len(times) - 1)
+                )
                 if not monotonic:
-                    # Compute per-point spacing from max joint displacement
-                    # using a conservative speed (0.15 rad/s).
-                    CONSERVATIVE_SPEED = 0.15  # rad/s fallback
-                    cumulative = 0.0
-                    for idx in range(len(pts)):
-                        if idx == 0:
-                            # First point at a small offset so t > 0
-                            cumulative = 0.1
-                        else:
-                            prev_pos = pts[idx - 1].positions
-                            curr_pos = pts[idx].positions
-                            max_delta = max(
-                                abs(curr_pos[j] - prev_pos[j])
-                                for j in range(min(len(curr_pos), len(prev_pos)))
-                            ) if prev_pos and curr_pos else 0.5
-                            dt = max(max_delta / CONSERVATIVE_SPEED, 0.5)
-                            cumulative += dt
-                        secs = int(cumulative)
-                        nsecs = int((cumulative - secs) * 1e9)
-                        pts[idx].time_from_start.sec = secs
-                        pts[idx].time_from_start.nanosec = nsecs
-                    self.get_logger().warn(
-                        f"Repaired {len(pts)} zero-timestamp waypoints "
-                        f"for {robot_name} (Ruckig likely failed — "
-                        f"total duration {cumulative:.1f}s)"
+                    self.get_logger().error(
+                        f"SAFETY: Rejecting trajectory for {robot_name} — "
+                        f"timestamps are not strictly increasing "
+                        f"(times={[f'{t:.3f}' for t in times]}). "
+                        f"This usually means a MoveIt adapter failed."
                     )
+                    return False
 
             n_pts = len(goal.trajectory.points)
             self.get_logger().info(

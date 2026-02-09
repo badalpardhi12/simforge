@@ -142,8 +142,7 @@ def launch_setup(context, *args, **kwargs):
                                 "default_planner_request_adapters/FixStartStateCollision "
                                 "default_planner_request_adapters/FixStartStatePathConstraints "
                                 "default_planner_request_adapters/ResolveConstraintFrames "
-                                "default_planner_request_adapters/AddTimeOptimalParameterization "
-                                "default_planner_request_adapters/AddRuckigTrajectorySmoothing",
+                                "default_planner_request_adapters/AddTimeOptimalParameterization",
             "start_state_max_bounds_error": 0.1,
         }
     }
@@ -201,8 +200,7 @@ def launch_setup(context, *args, **kwargs):
                 "default_planner_request_adapters/FixStartStateCollision "
                 "default_planner_request_adapters/FixStartStatePathConstraints "
                 "default_planner_request_adapters/ResolveConstraintFrames "
-                "default_planner_request_adapters/AddTimeOptimalParameterization "
-                "default_planner_request_adapters/AddRuckigTrajectorySmoothing",
+                "default_planner_request_adapters/AddTimeOptimalParameterization",
             "start_state_max_bounds_error": 0.1,
         }
     }

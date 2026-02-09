@@ -5,9 +5,12 @@ planning_plugin: ompl_interface/OMPLPlanner
 # In MoveIt2 Humble all adapters live in a single request_adapters chain.
 # FixStartState* adapters run BEFORE the planner.
 # AddTimeOptimalParameterization runs AFTER planning to add timing.
-# AddRuckigTrajectorySmoothing runs LAST to produce jerk-limited
-# (C³-continuous) trajectories, eliminating velocity/acceleration
-# discontinuities that cause jitter on non-RT systems.
+#
+# AddRuckigTrajectorySmoothing was REMOVED: on MoveIt2 Humble it fails
+# silently (error 0 / -100) and returns trajectories with zero timestamps,
+# which the ScaledJointTrajectoryController either rejects or interpolates
+# dangerously.  TOPP alone produces safe, velocity/acceleration-bounded
+# trajectories that respect the joint_limits.yaml settings.
 request_adapters: >-
   default_planner_request_adapters/FixWorkspaceBounds
   default_planner_request_adapters/FixStartStateBounds
@@ -15,7 +18,6 @@ request_adapters: >-
   default_planner_request_adapters/FixStartStatePathConstraints
   default_planner_request_adapters/ResolveConstraintFrames
   default_planner_request_adapters/AddTimeOptimalParameterization
-  default_planner_request_adapters/AddRuckigTrajectorySmoothing
 
 start_state_max_bounds_error: 0.1
 

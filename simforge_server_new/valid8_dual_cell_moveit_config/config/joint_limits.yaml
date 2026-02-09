@@ -13,10 +13,8 @@
 #   Shoulder/Elbow: 3.14 rad/s (180°/s)
 #   Wrist: 6.28 rad/s (360°/s)
 #
-# Jerk limits are REQUIRED for the Ruckig trajectory smoother.
-# Without them Ruckig defaults to 1000 rad/s³ which is incompatible
-# with conservative vel/accel limits and causes -100 InvalidInput.
-# Rule of thumb: max_jerk ≈ max_acceleration / 0.15 s ramp time.
+# Jerk limits are included for completeness (used if Ruckig is ever
+# re-enabled).  Currently only TOPP is active.
 
 # Global scaling (applied on top of per-joint limits).
 # Keep at 1.0 — per-request scaling from the gateway controls speed.
