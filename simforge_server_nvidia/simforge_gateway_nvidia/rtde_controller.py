@@ -50,7 +50,12 @@ class URRTDEController:
                 self.logger.info(
                     f"Connecting RTDE to {self.robot_name} at {self.ip}..."
                 )
-            self._ctrl = rtde_control.RTDEControlInterface(self.ip)
+            # Only create the *receive* interface here.
+            # The *control* interface (RTDEControlInterface) has an
+            # internal C++ auto-reconnect thread that segfaults when
+            # the UR controller drops the connection while the object
+            # is idle.  We create it on demand in _ensure_ctrl() and
+            # tear it down immediately after each move/servoJ.
             self._recv = rtde_receive.RTDEReceiveInterface(self.ip)
             self._connected = True
             self._recv_healthy = True
@@ -165,9 +170,41 @@ class URRTDEController:
     def is_connected(self) -> bool:
         return (
             self._connected
-            and self._ctrl is not None
             and self._recv is not None
         )
+
+    def _ensure_ctrl(self) -> bool:
+        """Create a fresh RTDEControlInterface on demand.
+
+        The control interface is intentionally short-lived: created
+        just before moveJ / servoJ and torn down immediately after,
+        because its internal C++ auto-reconnect thread can segfault
+        when the UR drops the RTDE link while the object is idle.
+        """
+        if self._ctrl is not None and self._ctrl.isConnected():
+            return True
+        # Tear down any dead leftover
+        try:
+            if self._ctrl:
+                self._ctrl.disconnect()
+        except Exception:
+            pass
+        try:
+            self._ctrl = rtde_control.RTDEControlInterface(self.ip)
+            if self.logger:
+                self.logger.info(
+                    f"RTDE control interface created for "
+                    f"{self.robot_name}"
+                )
+            return True
+        except Exception as e:
+            self._ctrl = None
+            if self.logger:
+                self.logger.error(
+                    f"Failed to create RTDE control interface "
+                    f"for {self.robot_name}: {e}"
+                )
+            return False
 
     # ── Joint state reads ────────────────────────────────────────
 
@@ -209,21 +246,13 @@ class URRTDEController:
         if not RTDE_AVAILABLE:
             return False
         try:
-            # Ensure a working control interface.  After servoJ the
-            # old one is often dead and reconnect() alone can't
-            # re-upload the UR control script, so build a fresh one.
-            if not self._ctrl or not self._ctrl.isConnected():
+            if not self._ensure_ctrl():
                 if self.logger:
-                    self.logger.info(
-                        f"RTDE control interface dead for "
-                        f"{self.robot_name} — creating fresh connection"
+                    self.logger.error(
+                        f"Cannot create RTDE control interface "
+                        f"for {self.robot_name} — moveJ aborted"
                     )
-                try:
-                    if self._ctrl:
-                        self._ctrl.disconnect()
-                except Exception:
-                    pass
-                self._ctrl = rtde_control.RTDEControlInterface(self.ip)
+                return False
 
             if self.logger:
                 self.logger.info(
@@ -327,6 +356,14 @@ class URRTDEController:
         if not self.is_connected:
             if logger:
                 logger.error(f"RTDE not connected to {self.robot_name}")
+            return False
+
+        if not self._ensure_ctrl():
+            if logger:
+                logger.error(
+                    f"Cannot create RTDE control interface "
+                    f"for {self.robot_name} — servoJ aborted"
+                )
             return False
 
         n_pts = len(positions)
