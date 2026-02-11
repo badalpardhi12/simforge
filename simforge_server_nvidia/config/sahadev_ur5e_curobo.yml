@@ -1,0 +1,89 @@
+# ──────────────────────────────────────────────────────────────
+# cuRobo Robot Configuration — sahadev_ur5e
+#
+# Dual-cell UR5e with prefix "sahadev_".
+# ee_link: sahadev_tool0
+# ──────────────────────────────────────────────────────────────
+
+robot_cfg:
+  kinematics:
+    use_usd_kinematics: False
+    # URDF will be loaded at runtime from robot_state_publisher /robot_description
+    urdf_path: "URDF_LOADED_AT_RUNTIME"
+    asset_root_path: ""
+    base_link: "sahadev_base_link"
+    ee_link: "sahadev_tool0"
+    link_names: null
+    lock_joints: null
+    extra_links: null
+
+    # Collision spheres for UR5e with sahadev_ prefix
+    collision_spheres:
+      sahadev_shoulder_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.06
+      sahadev_upper_arm_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.06
+        - center: [-0.2125, 0.0, 0.1385]
+          radius: 0.055
+      sahadev_forearm_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.05
+        - center: [-0.1875, 0.0, 0.0155]
+          radius: 0.045
+      sahadev_wrist_1_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.04
+      sahadev_wrist_2_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.04
+      sahadev_wrist_3_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.04
+
+    # Self-collision ignore pairs
+    self_collision_ignore:
+      sahadev_shoulder_link: ["sahadev_upper_arm_link"]
+      sahadev_upper_arm_link: ["sahadev_forearm_link"]
+      sahadev_forearm_link: ["sahadev_wrist_1_link"]
+      sahadev_wrist_1_link: ["sahadev_wrist_2_link"]
+      sahadev_wrist_2_link: ["sahadev_wrist_3_link"]
+
+    collision_sphere_buffer: 0.0
+    extra_collision_spheres: {}
+    self_collision_buffer:
+      sahadev_upper_arm_link: 0
+      sahadev_forearm_link: 0
+      sahadev_wrist_1_link: 0
+      sahadev_wrist_2_link: 0
+      sahadev_wrist_3_link: 0
+
+    # Other robot's joints are NOT in this kinematic chain
+    # (sahadev_base_link -> sahadev_tool0), so no lock_joints needed.
+    lock_joints: null
+
+    collision_link_names:
+      - "sahadev_shoulder_link"
+      - "sahadev_upper_arm_link"
+      - "sahadev_forearm_link"
+      - "sahadev_wrist_1_link"
+      - "sahadev_wrist_2_link"
+      - "sahadev_wrist_3_link"
+
+    use_global_cumul: True
+    mesh_link_names: null
+
+    cspace:
+      joint_names:
+        - "sahadev_shoulder_pan_joint"
+        - "sahadev_shoulder_lift_joint"
+        - "sahadev_elbow_joint"
+        - "sahadev_wrist_1_joint"
+        - "sahadev_wrist_2_joint"
+        - "sahadev_wrist_3_joint"
+      retract_config: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
+      null_space_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      cspace_distance_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      max_jerk: 500.0
+      max_acceleration: 10.0

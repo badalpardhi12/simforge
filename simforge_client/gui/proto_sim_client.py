@@ -72,6 +72,8 @@ class ProtoSimParameters:
     idle_time: float = 2.0
     # Randomize order
     randomize: bool = False
+    # Velocity scaling for real robot (0.0–1.0)
+    move_speed: float = 0.1
 
 
 @dataclass
@@ -343,6 +345,15 @@ class ProtoSimClientFrame(wx.Frame):
         self.idle_time_ctrl = wx.SpinCtrlDouble(panel, min=0.5, max=30.0, initial=2.0, inc=0.5)
         options_sizer.Add(self.idle_time_ctrl, 0, wx.ALL, 5)
         options_sizer.Add(wx.StaticText(panel, label="sec"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+
+        options_sizer.AddSpacer(15)
+
+        options_sizer.Add(wx.StaticText(panel, label="Speed:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        self.speed_ctrl = wx.SpinCtrlDouble(panel, min=0.01, max=0.5, initial=0.1, inc=0.05)
+        self.speed_ctrl.SetDigits(2)
+        options_sizer.Add(self.speed_ctrl, 0, wx.ALL, 5)
+        self.speed_pct_label = wx.StaticText(panel, label="(10 %)")
+        options_sizer.Add(self.speed_pct_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         
         options_sizer.AddStretchSpacer()
         
@@ -439,6 +450,14 @@ class ProtoSimClientFrame(wx.Frame):
         # Mode radio buttons → trigger mode switch immediately
         self.sim_mode_radio.Bind(wx.EVT_RADIOBUTTON, lambda e: self._on_mode_changed())
         self.real_mode_radio.Bind(wx.EVT_RADIOBUTTON, lambda e: self._on_mode_changed())
+
+        # Speed control → update percentage label
+        self.speed_ctrl.Bind(
+            wx.EVT_SPINCTRLDOUBLE,
+            lambda e: self.speed_pct_label.SetLabel(
+                f"({int(self.speed_ctrl.GetValue() * 100)} %)"
+            ),
+        )
         
         # Bind parameter changes to update pose count
         for control in self.parameter_controls.values():
@@ -477,6 +496,7 @@ class ProtoSimClientFrame(wx.Frame):
             yaw=self.parameter_controls["yaw"].get_values(),
             idle_time=self.idle_time_ctrl.GetValue(),
             randomize=self.randomize_check.GetValue(),
+            move_speed=self.speed_ctrl.GetValue(),
         )
     
     def _log(self, message: str) -> None:
@@ -1087,31 +1107,44 @@ class ProtoSimClientFrame(wx.Frame):
             # Convert WorldPose objects to dicts for JSON serialization
             poses_data = [pose.to_dict() for pose in world_poses]
             
-            # Calculate timeout
-            timeout_per_pose = params.idle_time + 3.0
+            # Calculate timeout — scale movement time by inverse of speed
+            move_speed = getattr(params, 'move_speed', 0.1)
+            move_time_per_pose = 3.0 / max(move_speed, 0.01)  # slower → longer
+            timeout_per_pose = params.idle_time + move_time_per_pose
             timeout = max(120.0, total_poses * timeout_per_pose + 60.0)
             
-            self._log(f"Sending poses to server (timeout: {timeout:.0f}s)")
+            self._log(f"Sending poses to server (speed={move_speed}, timeout: {timeout:.0f}s)")
             
             # Send pre-computed poses to server
             response = await self._client.call_rpc("run_proto_sim", {
                 "robot_name": robot,
-                "poses": poses_data,  # NEW: Pre-computed poses in base_link frame
+                "poses": poses_data,  # Pre-computed poses in base_link frame
                 "idle_time": params.idle_time,
                 "mode": mode,
+                "move_speed": move_speed,
             }, timeout=timeout)
             
             if response.get("success"):
                 completed = response.get('completed', 0)
                 collision_rejected = response.get('collision_rejected', 0)
                 ik_failed = response.get('ik_failed', 0)
+                real_failed = response.get('real_failed', 0)
                 self._log(f"Protocol completed: {completed}/{total_poses} poses")
                 if collision_rejected > 0:
                     self._log(f"  Collision rejected: {collision_rejected}")
                 if ik_failed > 0:
                     self._log(f"  IK failed: {ik_failed}")
+                if real_failed > 0:
+                    self._log(f"  Execution failed: {real_failed}")
             else:
-                self._log(f"Protocol failed: {response.get('error', 'Unknown error')}")
+                self._log(f"Protocol failed: {response.get('error', response.get('message', 'Unknown error'))}")
+
+            # Surface any hardware issues reported by the server
+            hw_issues = response.get("hardware_issues", [])
+            if hw_issues:
+                self._log(f"  ⚠ Hardware issues: {', '.join(hw_issues)} disconnected")
+            if response.get("stopped"):
+                self._log("  Protocol was stopped by user")
                 
         except Exception as e:
             self._log(f"Protocol error: {e}")

@@ -1,0 +1,116 @@
+# ──────────────────────────────────────────────────────────────
+# cuRobo Robot Configuration: Nakul UR5e
+#
+# This config tells cuRobo how to model the nakul_ur5e robot arm
+# for GPU-accelerated IK solving, motion planning, and collision
+# checking.
+#
+# Key differences from a standalone ur5e config:
+#   - tf_prefix "nakul_" on all joint/link names
+#   - ee_link is nakul_tool_tip_link (where the iPhone camera is)
+#   - base_link is nakul_base_link
+#   - Collision spheres include the iPhone tool
+#   - Joint velocity/acceleration limits match the existing
+#     joint_limits.yaml used by the old MoveIt server
+#
+# cuRobo uses collision spheres (not meshes) for fast GPU collision
+# checking.  Sphere coverage is derived from the UR5e link geometry.
+# ──────────────────────────────────────────────────────────────
+robot_cfg:
+  kinematics:
+    use_usd_kinematics: False
+    urdf_path: "URDF_LOADED_AT_RUNTIME"
+    asset_root_path: ""
+    base_link: "nakul_base_link"
+    ee_link: "nakul_tool_tip_link"
+    link_names: null
+    lock_joints: null
+    extra_links: null
+
+    collision_link_names:
+      - "nakul_shoulder_link"
+      - "nakul_upper_arm_link"
+      - "nakul_forearm_link"
+      - "nakul_wrist_1_link"
+      - "nakul_wrist_2_link"
+      - "nakul_wrist_3_link"
+      - "nakul_tool_base_link"
+
+    collision_spheres:
+      nakul_shoulder_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.06
+        - center: [0.0, 0.0, -0.04]
+          radius: 0.06
+      nakul_upper_arm_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.06
+        - center: [-0.12, 0.0, 0.14]
+          radius: 0.055
+        - center: [-0.24, 0.0, 0.14]
+          radius: 0.05
+        - center: [0.0, 0.0, 0.14]
+          radius: 0.06
+      nakul_forearm_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.05
+        - center: [-0.1, 0.0, 0.01]
+          radius: 0.045
+        - center: [-0.2, 0.0, 0.01]
+          radius: 0.04
+      nakul_wrist_1_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.045
+        - center: [0.0, 0.027, 0.0]
+          radius: 0.045
+      nakul_wrist_2_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.045
+        - center: [0.0, -0.027, 0.0]
+          radius: 0.045
+      nakul_wrist_3_link:
+        - center: [0.0, 0.0, -0.03]
+          radius: 0.04
+      nakul_tool_base_link:
+        - center: [-0.065, 0.0, 0.02]
+          radius: 0.07
+        - center: [-0.12, 0.0, 0.02]
+          radius: 0.05
+
+    collision_sphere_buffer: 0.005
+    extra_collision_spheres: {}
+
+    self_collision_ignore:
+      nakul_upper_arm_link: ["nakul_forearm_link", "nakul_shoulder_link"]
+      nakul_forearm_link: ["nakul_wrist_1_link", "nakul_wrist_2_link", "nakul_wrist_3_link"]
+      nakul_wrist_1_link: ["nakul_wrist_2_link", "nakul_wrist_3_link"]
+      nakul_wrist_2_link: ["nakul_wrist_3_link"]
+      nakul_wrist_3_link: ["nakul_tool_base_link"]
+
+    self_collision_buffer:
+      nakul_upper_arm_link: 0
+      nakul_forearm_link: 0
+      nakul_wrist_1_link: 0
+      nakul_wrist_2_link: 0
+      nakul_wrist_3_link: 0
+      nakul_tool_base_link: 0
+
+    use_global_cumul: True
+    mesh_link_names: null
+
+    cspace:
+      joint_names:
+        - "nakul_shoulder_pan_joint"
+        - "nakul_shoulder_lift_joint"
+        - "nakul_elbow_joint"
+        - "nakul_wrist_1_joint"
+        - "nakul_wrist_2_joint"
+        - "nakul_wrist_3_joint"
+      retract_config: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
+      null_space_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      cspace_distance_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      # Joint velocity/acceleration limits must match
+      # joint_limits.yaml: 1.0 rad/s, 1.5 rad/s²
+      # cuRobo applies its own scaling — we set the absolute maximums
+      max_jerk: 500.0
+      max_acceleration: 10.0

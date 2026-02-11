@@ -1,0 +1,52 @@
+# ──────────────────────────────────────────────────────────────
+# cuRobo World Configuration: Valid8 Dual Cell
+#
+# Defines the collision objects in the workcell that cuRobo must
+# avoid when planning motions.  All objects are defined as cuboids
+# (axis-aligned boxes) which cuRobo checks on the GPU using signed
+# distance fields.
+#
+# Coordinate frame: world (matching the URDF root frame)
+#
+# Object positions derived from the cell URDF:
+#   - Shop floor:  world origin, surface at z=0
+#   - Table:       centered at (0, 0, 1.0), surface at z=1.0
+#   - Face:        at (0.1742, 0, 1.6) with 90° yaw
+#
+# Since cuRobo operates per-robot with the robot's base_link as
+# the reference, the gateway node transforms these world-frame
+# poses into the active robot's base_link frame at runtime.
+#
+# Pose format: [x, y, z, qw, qx, qy, qz]
+# ──────────────────────────────────────────────────────────────
+cuboid:
+  # Optical table — main workspace surface
+  # URDF collision: box 2.1 x 1.1 x 1.04 centered at (0, 0, 0.5)
+  # in table_link frame, table_link at (0, 0, 1.0) in shop_floor
+  table:
+    dims: [2.1, 1.1, 1.04]
+    pose: [0.0, 0.0, 0.48, 1, 0, 0, 0]
+
+  # Shop floor — ground plane
+  # Large flat box below z=0
+  shop_floor:
+    dims: [5.0, 5.0, 0.1]
+    pose: [0.0, 0.0, -0.05, 1, 0, 0, 0]
+
+  # Face fixture — test subject head (approximated as box)
+  # URDF collision: sphere r=0.1 at face_link
+  # face_link at (0.1742, 0, 1.6) in shop_floor with 90° yaw
+  face:
+    dims: [0.25, 0.25, 0.25]
+    pose: [0.1742, 0.0, 1.6, 0.7071, 0, 0, 0.7071]
+
+  # Robot mount blocks (small collision geometry for safety)
+  # Nakul mount at (-0.6758, 0, 1.03) with -90° yaw
+  nakul_mount:
+    dims: [0.2, 0.2, 0.06]
+    pose: [-0.6758, 0.0, 1.0, 1, 0, 0, 0]
+
+  # Sahadev mount at (0.6758, 0, 1.03) with +90° yaw
+  sahadev_mount:
+    dims: [0.2, 0.2, 0.06]
+    pose: [0.6758, 0.0, 1.0, 1, 0, 0, 0]

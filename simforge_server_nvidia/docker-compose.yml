@@ -1,0 +1,107 @@
+# ──────────────────────────────────────────────────────────────
+# SimForge Server — NVIDIA cuRobo Backend  (self-contained)
+#
+# GPU-accelerated motion planning with NVIDIA cuRobo.
+# Replaces MoveIt2 entirely.
+#
+# Build context: .   (this directory — simforge_server_nvidia/)
+#
+# Ports (exposed on host via host networking):
+#   9090  — Foxglove Bridge WebSocket (Foxglove Studio)
+#   8766  — cuRobo Command Gateway WebSocket (simforge_client)
+#
+# Usage:
+#   Simulation:  docker compose --profile sim up
+#   Production:  docker compose --profile prod up
+#
+# GPU requirements:
+#   - NVIDIA driver 535+ with CUDA 12.2 support
+#   - NVIDIA Container Toolkit (nvidia-container-toolkit)
+#   - RTX Pro 6000, RTX 4090, or Jetson Thor
+# ──────────────────────────────────────────────────────────────
+
+services:
+  # ── Simulation Mode ────────────────────────────────────────
+  simforge-server-nvidia-sim:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: simforge-server-nvidia-sim
+    hostname: simforge-server-nvidia-sim
+    environment:
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - NAKUL_ROBOT_IP=${NAKUL_ROBOT_IP:-192.168.1.9}
+      - SAHADEV_ROBOT_IP=${SAHADEV_ROBOT_IP:-192.168.1.16}
+      - MAX_VELOCITY_SCALING=${MAX_VELOCITY_SCALING:-0.25}
+      - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-0.25}
+      - INTERPOLATION_DT=${INTERPOLATION_DT:-0.02}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    network_mode: host
+    # ── NVIDIA GPU access ──
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # ── Real-time scheduling ──
+    cap_add:
+      - SYS_NICE
+    ulimits:
+      rtprio:
+        soft: 99
+        hard: 99
+      memlock:
+        soft: 102400
+        hard: 102400
+    stdin_open: true
+    tty: true
+    command: /start_server.sh --sim
+    profiles:
+      - sim
+
+  # ── Real Robot Mode ────────────────────────────────────────
+  simforge-server-nvidia:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: simforge-server-nvidia
+    hostname: simforge-server-nvidia
+    environment:
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - NAKUL_ROBOT_IP=${NAKUL_ROBOT_IP:-192.168.1.9}
+      - SAHADEV_ROBOT_IP=${SAHADEV_ROBOT_IP:-192.168.1.16}
+      - MAX_VELOCITY_SCALING=${MAX_VELOCITY_SCALING:-0.25}
+      - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-0.25}
+      - INTERPOLATION_DT=${INTERPOLATION_DT:-0.02}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    network_mode: host
+    privileged: true
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    cap_add:
+      - SYS_NICE
+    ulimits:
+      rtprio:
+        soft: 99
+        hard: 99
+      memlock:
+        soft: 102400
+        hard: 102400
+    stdin_open: true
+    tty: true
+    command: /start_server.sh --real
+    profiles:
+      - prod

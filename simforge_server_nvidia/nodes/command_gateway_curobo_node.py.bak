@@ -1,0 +1,2691 @@
+#!/usr/bin/env python3
+"""
+Command Gateway Node for Valid8 Dual UR5e Cell — NVIDIA cuRobo Backend
+
+Replaces MoveIt2 with NVIDIA cuRobo for GPU-accelerated:
+  - Inverse kinematics  (IKSolver on CUDA)
+  - Motion planning     (MotionGen — trajectory optimization on CUDA)
+  - Collision checking  (signed distance fields on CUDA)
+
+cuRobo produces inherently smooth, minimum-jerk, time-optimal
+trajectories.  No additional retiming or velocity-profile shaping
+is needed (the old MoveIt gateway required 200+ lines of cosine-
+blended retiming to avoid jerkiness).
+
+WebSocket protocol is 100% compatible with simforge_client.
+"""
+
+import asyncio
+import json
+import os
+import subprocess
+import time
+import math
+import traceback
+from typing import Dict, Optional, Any, List
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+
+from std_msgs.msg import Bool, String
+from std_srvs.srv import Trigger
+from geometry_msgs.msg import Pose, PoseStamped, Point, Quaternion
+from sensor_msgs.msg import JointState
+
+from control_msgs.action import FollowJointTrajectory
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from builtin_interfaces.msg import Duration
+
+import tf2_ros
+from tf2_ros import Buffer, TransformListener
+
+try:
+    import websockets
+    from websockets.server import serve
+except ImportError:
+    raise ImportError("websockets package required: pip install websockets>=12.0")
+
+# ── ur_rtde imports (direct robot control, bypasses ROS2 control stack) ──
+try:
+    import rtde_control
+    import rtde_receive
+    RTDE_AVAILABLE = True
+except ImportError:
+    RTDE_AVAILABLE = False
+
+# ── cuRobo imports ───────────────────────────────────────────────
+try:
+    import torch
+    from curobo.types.math import Pose as CuPose
+    from curobo.types.robot import JointState as CuJointState
+    from curobo.types.robot import RobotConfig
+    from curobo.types.base import TensorDeviceType
+    from curobo.geom.types import WorldConfig
+    from curobo.wrap.reacher.motion_gen import (
+        MotionGen,
+        MotionGenConfig,
+        MotionGenPlanConfig,
+        MotionGenResult,
+    )
+    from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
+    from curobo.util.trajectory import InterpolateType
+    from curobo.util_file import load_yaml, join_path, get_robot_configs_path
+
+    CUROBO_AVAILABLE = True
+except ImportError as e:
+    CUROBO_AVAILABLE = False
+    CUROBO_IMPORT_ERROR = str(e)
+
+
+# ── Robot configuration ──────────────────────────────────────────
+ROBOT_CONFIG = {
+    "nakul_ur5e": {
+        "prefix": "nakul_",
+        "ip": "192.168.1.9",
+        "joints": [
+            "nakul_shoulder_pan_joint",
+            "nakul_shoulder_lift_joint",
+            "nakul_elbow_joint",
+            "nakul_wrist_1_joint",
+            "nakul_wrist_2_joint",
+            "nakul_wrist_3_joint",
+        ],
+        "controller": "nakul_scaled_joint_trajectory_controller",
+        "passthrough_controller": "nakul_passthrough_trajectory_controller",
+        "planning_group": "nakul_arm",
+        "ee_link": "nakul_tool0",
+        "ik_tip_link": "nakul_tool_tip_link",
+        "base_link": "nakul_base_link",
+        "home_position": [0.0, -math.pi / 2, 0.0,
+                          -math.pi / 2, 0.0, 0.0],
+        "curobo_config": "nakul_ur5e_curobo.yml",
+    },
+    "sahadev_ur5e": {
+        "prefix": "sahadev_",
+        "ip": "192.168.1.16",
+        "joints": [
+            "sahadev_shoulder_pan_joint",
+            "sahadev_shoulder_lift_joint",
+            "sahadev_elbow_joint",
+            "sahadev_wrist_1_joint",
+            "sahadev_wrist_2_joint",
+            "sahadev_wrist_3_joint",
+        ],
+        "controller": "sahadev_scaled_joint_trajectory_controller",
+        "passthrough_controller": "sahadev_passthrough_trajectory_controller",
+        "planning_group": "sahadev_arm",
+        "ee_link": "sahadev_tool0",
+        "ik_tip_link": "sahadev_tool0",
+        "base_link": "sahadev_base_link",
+        "home_position": [0.0, -math.pi / 2, 0.0,
+                          -math.pi / 2, 0.0, 0.0],
+        "curobo_config": "sahadev_ur5e_curobo.yml",
+    },
+}
+
+KNOWN_OBJECTS = ["face_link", "table_link", "shop_floor"]
+
+
+# ── Direct RTDE Robot Controller ─────────────────────────────
+# Bypasses the entire ROS2 control stack (UR driver, ros2_control,
+# scaled_joint_trajectory_controller) and communicates directly with
+# the UR controller via RTDE protocol.
+#
+# Approach: stream cuRobo waypoints using servoJ() at ~500Hz for
+# smooth, glitch-free trajectory execution on real hardware.
+
+class URRTDEController:
+    """Direct RTDE connection to a UR robot for real-time trajectory streaming.
+
+    Uses ur_rtde library:
+      - RTDEControlInterface: send servoJ/moveJ commands
+      - RTDEReceiveInterface: read actual joint positions/velocities
+
+    The servoJ approach streams individual joint targets at 500Hz,
+    giving us complete control over the trajectory and avoiding all
+    the timing/interpolation issues of the ROS2 control stack.
+    """
+
+    def __init__(self, robot_name: str, ip: str, logger=None):
+        self.robot_name = robot_name
+        self.ip = ip
+        self.logger = logger
+        self._ctrl: Optional[Any] = None
+        self._recv: Optional[Any] = None
+        self._connected = False
+        self._frequency = 500.0  # Hz — UR e-series native RTDE rate
+        self._dt = 1.0 / self._frequency
+
+    def connect(self) -> bool:
+        """Establish RTDE control and receive connections."""
+        if self.is_connected:
+            if self.logger:
+                self.logger.info(f"RTDE already connected to {self.robot_name}")
+            return True
+        if not RTDE_AVAILABLE:
+            if self.logger:
+                self.logger.error(f"ur_rtde not installed — cannot connect to {self.robot_name}")
+            return False
+        try:
+            if self.logger:
+                self.logger.info(f"Connecting RTDE to {self.robot_name} at {self.ip}...")
+
+            self._recv = rtde_receive.RTDEReceiveInterface(self.ip)
+            self._ctrl = rtde_control.RTDEControlInterface(self.ip)
+
+            self._connected = True
+            if self.logger:
+                self.logger.info(f"RTDE connected to {self.robot_name} at {self.ip} ✓")
+            return True
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"RTDE connection failed for {self.robot_name} at {self.ip}: {e}")
+            self._connected = False
+            return False
+
+    def disconnect(self):
+        """Cleanly disconnect RTDE interfaces."""
+        try:
+            if self._ctrl:
+                self._ctrl.servoStop()
+                self._ctrl.stopScript()
+                self._ctrl.disconnect()
+        except Exception:
+            pass
+        try:
+            if self._recv:
+                self._recv.disconnect()
+        except Exception:
+            pass
+        self._connected = False
+        self._ctrl = None
+        self._recv = None
+        if self.logger:
+            self.logger.info(f"RTDE disconnected from {self.robot_name}")
+
+    @property
+    def is_connected(self) -> bool:
+        """Check if RTDE interfaces are active.
+
+        Uses the internal _connected flag — the ur_rtde isConnected()
+        can return False transiently during async operations or after
+        servoStop, even though the connection is still usable.
+        """
+        return self._connected and self._ctrl is not None and self._recv is not None
+
+    def get_actual_q(self) -> Optional[List[float]]:
+        """Read actual joint positions from the robot."""
+        if not self.is_connected:
+            return None
+        try:
+            return list(self._recv.getActualQ())
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"RTDE getActualQ failed: {e}")
+            return None
+
+    def get_actual_qd(self) -> Optional[List[float]]:
+        """Read actual joint velocities from the robot."""
+        if not self.is_connected:
+            return None
+        try:
+            return list(self._recv.getActualQd())
+        except Exception:
+            return None
+
+    def move_j(self, target_q: List[float], speed: float = 1.05,
+               acceleration: float = 1.4, timeout: float = 30.0) -> bool:
+        """Move to joint position using moveJ (blocking with timeout).
+
+        Good for large motions like going home.  The UR controller
+        handles the interpolation internally — very reliable.
+        Timeout prevents indefinite blocking if the controller hangs.
+        """
+        if not self.is_connected:
+            return False
+        try:
+            # Reconnect control interface if needed (e.g. after servoStop)
+            if not self._ctrl.isConnected():
+                if self.logger:
+                    self.logger.info(f"RTDE ctrl reconnecting for moveJ on {self.robot_name}")
+                import threading
+                rc_thread = threading.Thread(
+                    target=lambda: self._ctrl.reconnect(), daemon=True
+                )
+                rc_thread.start()
+                rc_thread.join(timeout=5.0)
+                if rc_thread.is_alive():
+                    if self.logger:
+                        self.logger.warn(f"RTDE reconnect timed out for moveJ on {self.robot_name}")
+                    return False
+
+            if self.logger:
+                self.logger.info(
+                    f"RTDE moveJ {self.robot_name}: "
+                    f"speed={speed:.2f}, accel={acceleration:.2f}"
+                )
+
+            # Run moveJ in a thread with timeout to prevent indefinite blocking
+            import threading
+            result_holder = [False]
+            exc_holder = [None]
+
+            def _do_move():
+                try:
+                    self._ctrl.moveJ(target_q, speed, acceleration)
+                    result_holder[0] = True
+                except Exception as e:
+                    exc_holder[0] = e
+
+            t = threading.Thread(target=_do_move, daemon=True)
+            t.start()
+            t.join(timeout=timeout)
+
+            if t.is_alive():
+                if self.logger:
+                    self.logger.warn(
+                        f"RTDE moveJ timed out after {timeout}s on {self.robot_name}"
+                    )
+                try:
+                    self._ctrl.stopJ(2.0)
+                except Exception:
+                    pass
+                return False
+
+            if exc_holder[0]:
+                raise exc_holder[0]
+
+            return result_holder[0]
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"RTDE moveJ failed: {e}")
+            return False
+
+    def execute_trajectory_servoj(
+        self,
+        positions: list,
+        velocities: Optional[list] = None,
+        dt: float = 0.002,
+        timestamps: Optional[list] = None,
+        lookahead_time: float = 0.1,
+        gain: int = 300,
+        stop_check_fn=None,
+        logger=None,
+    ) -> bool:
+        """Stream a trajectory using servoJ at the robot's native RTDE rate.
+
+        The trajectory is upsampled via linear interpolation to the RTDE
+        servo rate (500Hz) to ensure smooth motion.  When *timestamps* is
+        provided the interpolation respects per-waypoint timing (including
+        dwell pauses); otherwise a uniform *dt* is assumed.
+
+        Parameters
+        ----------
+        positions : list of list of float
+            Joint position waypoints (n_pts × 6).
+        velocities : optional, not used by servoJ but kept for interface compat.
+        dt : float
+            Uniform time step between waypoints (used only when *timestamps*
+            is None).
+        timestamps : list of float, optional
+            Per-waypoint time-from-start in seconds.  When given, *dt* is
+            ignored and the timestamps are used directly, which correctly
+            preserves dwell pauses embedded in the trajectory.
+        lookahead_time : float
+            servoJ lookahead [0.03..0.2].  Higher = smoother but more lag.
+        gain : int
+            servoJ proportional gain [100..2000].  Higher = stiffer tracking.
+        stop_check_fn : callable, optional
+            Returns True if we should abort (e.g. proto_sim_stop).
+        logger : optional
+            ROS2 logger for status messages.
+        """
+        if not self.is_connected:
+            if logger:
+                logger.error(f"RTDE not connected to {self.robot_name}")
+            return False
+
+        n_pts = len(positions)
+        if n_pts < 2:
+            if logger:
+                logger.warn(f"Trajectory too short ({n_pts} points)")
+            return True
+
+        # Build per-waypoint timestamp array
+        if timestamps is not None:
+            wp_times = list(timestamps)
+        else:
+            wp_times = [i * dt for i in range(n_pts)]
+
+        # Upsample trajectory to 500Hz (servo_dt = 0.002s)
+        servo_dt = self._dt
+        total_time = wp_times[-1]
+        n_servo = int(total_time / servo_dt) + 1
+
+        if logger:
+            logger.info(
+                f"RTDE servoJ streaming {self.robot_name}: "
+                f"{n_pts} waypoints → "
+                f"{n_servo} servo commands @ {self._frequency:.0f}Hz, "
+                f"duration={total_time:.2f}s"
+            )
+
+        try:
+            # Pre-compute a segment-index cursor so lookup is O(1) amortised
+            seg_idx = 0
+
+            for si in range(n_servo):
+                if stop_check_fn and stop_check_fn():
+                    if logger:
+                        logger.info(f"RTDE servoJ aborted by stop request")
+                    self._ctrl.servoStop()
+                    return False
+
+                t = si * servo_dt
+
+                # Advance segment cursor to the right interval
+                while (seg_idx < n_pts - 2 and
+                       wp_times[seg_idx + 1] <= t):
+                    seg_idx += 1
+
+                idx0 = seg_idx
+                idx1 = min(idx0 + 1, n_pts - 1)
+
+                seg_dur = wp_times[idx1] - wp_times[idx0]
+                if seg_dur > 0:
+                    alpha = (t - wp_times[idx0]) / seg_dur
+                    alpha = max(0.0, min(1.0, alpha))
+                else:
+                    alpha = 1.0
+
+                # Linear interpolation between waypoints
+                q_target = [
+                    positions[idx0][j] * (1.0 - alpha) + positions[idx1][j] * alpha
+                    for j in range(6)
+                ]
+
+                # Send servoJ command
+                t_start = self._ctrl.initPeriod()
+                self._ctrl.servoJ(
+                    q_target,
+                    0.0,   # speed (not used)
+                    0.0,   # acceleration (not used)
+                    servo_dt,
+                    lookahead_time,
+                    gain,
+                )
+                self._ctrl.waitPeriod(t_start)
+
+            # Stop servo mode cleanly
+            self._ctrl.servoStop()
+            import time as _time
+            _time.sleep(0.5)  # Let controller settle after servo stop
+
+            # After servoStop, the control interface may need reconnection
+            # for subsequent moveJ calls.  Try reconnect with a timeout
+            # so we never block indefinitely.
+            import threading
+            def _try_reconnect():
+                try:
+                    if not self._ctrl.isConnected():
+                        self._ctrl.reconnect()
+                except Exception:
+                    pass
+
+            rc_thread = threading.Thread(target=_try_reconnect, daemon=True)
+            rc_thread.start()
+            rc_thread.join(timeout=5.0)  # Max 5s to reconnect
+            if rc_thread.is_alive():
+                if logger:
+                    logger.warn(f"RTDE reconnect timed out for {self.robot_name} — will reconnect later")
+
+            if logger:
+                logger.info(f"RTDE servoJ complete for {self.robot_name} ✓")
+            return True
+
+        except Exception as e:
+            if logger:
+                logger.error(f"RTDE servoJ error on {self.robot_name}: {e}")
+            try:
+                self._ctrl.servoStop()
+            except Exception:
+                pass
+            return False
+
+    def is_at_position(self, target_q: List[float], tolerance: float = 0.05) -> bool:
+        """Check if robot is at the given joint position."""
+        actual = self.get_actual_q()
+        if actual is None:
+            return False
+        return all(abs(actual[i] - target_q[i]) < tolerance for i in range(6))
+
+
+# ── Mode-switch signal files (shared with start_server.sh) ───
+MODE_SWITCH_FILE = "/tmp/simforge_mode_switch"
+CURRENT_MODE_FILE = "/tmp/simforge_current_mode"
+STACK_READY_FILE = "/tmp/simforge_stack_ready"
+
+# ── Config directory ─────────────────────────────────────────
+CONFIG_DIR = Path(__file__).parent.parent / "config"
+if not CONFIG_DIR.exists():
+    # Fallback for installed location
+    CONFIG_DIR = Path("/ros2_ws/install/simforge_gateway_nvidia/share/simforge_gateway_nvidia/config")
+
+
+# ── Helper dataclasses ───────────────────────────────────────────
+
+
+@dataclass
+class ConnectedClient:
+    client_id: str
+    websocket: Any
+    connected_at: float
+    last_activity: float
+    heartbeat_count: int = 0
+
+
+@dataclass
+class RobotStateInfo:
+    joint_positions: List[float] = field(default_factory=list)
+    joint_velocities: List[float] = field(default_factory=list)
+    last_update: float = 0.0
+
+
+# ── Async ROS2 future helper ────────────────────────────────────
+
+
+async def await_ros_future(future, timeout: float = 10.0):
+    """Poll an rclpy Future from an asyncio coroutine."""
+    deadline = time.monotonic() + timeout
+    while not future.done():
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"ROS future timed out after {timeout}s")
+        await asyncio.sleep(0.05)
+    return future.result()
+
+
+# ── Main node ────────────────────────────────────────────────────
+
+
+class CommandGatewayNode(Node):
+    """WebSocket ↔ ROS2 bridge with NVIDIA cuRobo GPU motion planning."""
+
+    def __init__(self):
+        super().__init__("command_gateway")
+
+        self.declare_parameter("websocket_port", 8766)
+        self.declare_parameter("websocket_host", "0.0.0.0")
+        self.declare_parameter("max_clients", 5)
+        self.declare_parameter("max_velocity_scaling", 0.5)
+        self.declare_parameter("max_acceleration_scaling", 0.5)
+        self.declare_parameter("config_dir", str(CONFIG_DIR))
+        # cuRobo trajectory interpolation timestep (seconds)
+        # Controls density of output waypoints.  0.02 = 50 Hz.
+        self.declare_parameter("interpolation_dt", 0.02)
+
+        self.ws_port = self.get_parameter("websocket_port").value
+        self.ws_host = self.get_parameter("websocket_host").value
+        self.max_clients = self.get_parameter("max_clients").value
+        self.max_velocity_scaling = self.get_parameter("max_velocity_scaling").value
+        self.max_acceleration_scaling = self.get_parameter("max_acceleration_scaling").value
+        self.config_dir = Path(self.get_parameter("config_dir").value)
+        self.interpolation_dt = self.get_parameter("interpolation_dt").value
+
+        self.cb_group = ReentrantCallbackGroup()
+
+        # Connected websocket clients
+        self._ws_clients: Dict[str, ConnectedClient] = {}
+
+        # Robot joint-state cache
+        self._robot_states: Dict[str, RobotStateInfo] = {
+            n: RobotStateInfo() for n in ROBOT_CONFIG
+        }
+
+        # Proto-sim flags
+        self._proto_sim_running = False
+        self._proto_sim_stop = False
+        self._exec_fail_count = 0
+
+        # Hardware mode tracking (internal — no filesystem dependency)
+        self._current_mode = "simulation"
+
+        # ── Publishers ───────────────────────────────────────────────
+        self.heartbeat_pub = self.create_publisher(String, "/safety/heartbeat", 10)
+        self.estop_pub = self.create_publisher(String, "/safety/emergency_stop", 10)
+
+        # ── Subscribers ──────────────────────────────────────────────
+        self.create_subscription(
+            JointState, "/joint_states", self._on_joint_states, 10
+        )
+
+        # ── Action clients (FollowJointTrajectory) ───────────────────
+        self._traj_clients: Dict[str, ActionClient] = {}
+        self._rebuild_traj_clients()
+
+        # ── Robot-program-running state (real hardware only) ─────────
+        self._robot_program_running: Dict[str, bool] = {
+            n: False for n in ROBOT_CONFIG
+        }
+        self._resend_program_clients: Dict[str, Any] = {}
+        for robot_name, cfg in ROBOT_CONFIG.items():
+            prefix = cfg["prefix"]
+            topic = f"/{prefix}io_and_status_controller/robot_program_running"
+            self.create_subscription(
+                Bool, topic,
+                lambda msg, rn=robot_name: self._on_robot_program_running(rn, msg),
+                10,
+            )
+            srv_name = f"/{prefix}io_and_status_controller/resend_robot_program"
+            self._resend_program_clients[robot_name] = self.create_client(
+                Trigger, srv_name, callback_group=self.cb_group
+            )
+
+        # ── Direct RTDE controllers for real robot ───────────────────
+        # These bypass the ROS2 control stack entirely, using ur_rtde
+        # to send servoJ commands directly to the UR controller.
+        self._rtde_controllers: Dict[str, URRTDEController] = {}
+        if RTDE_AVAILABLE:
+            for robot_name, cfg in ROBOT_CONFIG.items():
+                self._rtde_controllers[robot_name] = URRTDEController(
+                    robot_name=robot_name,
+                    ip=cfg["ip"],
+                    logger=self.get_logger(),
+                )
+            self.get_logger().info("ur_rtde available — direct RTDE control enabled")
+        else:
+            self.get_logger().warn(
+                "ur_rtde NOT available — real robot control will use "
+                "ROS2 FollowJointTrajectory (may be glitchy)"
+            )
+
+        # ── TF2 ──────────────────────────────────────────────────────
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        # ── cuRobo motion planners (one per robot) ───────────────────
+        self._motion_gens: Dict[str, MotionGen] = {}
+        self._curobo_ready = False
+        self._init_curobo()
+
+        self.ws_server = None
+
+        self.get_logger().info(
+            f"Command Gateway (cuRobo) initialised – WS on {self.ws_host}:{self.ws_port}"
+        )
+        self.get_logger().info(f"Robots: {list(ROBOT_CONFIG.keys())}")
+        self.get_logger().info(
+            f"Motion scaling: vel={self.max_velocity_scaling}, "
+            f"accel={self.max_acceleration_scaling}"
+        )
+        self.get_logger().info(f"cuRobo available: {CUROBO_AVAILABLE}")
+
+    # ─────────────────────────────────────────────────────────────────
+    # cuRobo initialisation
+    # ─────────────────────────────────────────────────────────────────
+
+    def _get_urdf_from_topic(self, timeout_sec: float = 30.0) -> Optional[str]:
+        """Subscribe to /robot_description and get the URDF string.
+
+        Blocks until the URDF is received or timeout expires.
+        Uses TRANSIENT_LOCAL QoS to get the latched robot_description.
+        """
+        from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+
+        urdf_data = {"value": None}
+
+        def _cb(msg):
+            urdf_data["value"] = msg.data
+
+        qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        sub = self.create_subscription(String, "/robot_description", _cb, qos)
+        self.get_logger().info("Waiting for URDF from /robot_description (TRANSIENT_LOCAL)...")
+
+        start = time.time()
+        while urdf_data["value"] is None and (time.time() - start) < timeout_sec:
+            rclpy.spin_once(self, timeout_sec=0.5)
+
+        self.destroy_subscription(sub)
+
+        if urdf_data["value"] is not None:
+            self.get_logger().info(
+                f"Got URDF from /robot_description "
+                f"({len(urdf_data['value'])} bytes)"
+            )
+        else:
+            self.get_logger().error(
+                f"Timed out ({timeout_sec}s) waiting for /robot_description"
+            )
+        return urdf_data["value"]
+
+    def _init_curobo(self):
+        """Initialise cuRobo MotionGen for each robot that has a config."""
+        if not CUROBO_AVAILABLE:
+            self.get_logger().error(
+                f"cuRobo not available: {CUROBO_IMPORT_ERROR}. "
+                f"Motion planning will be DISABLED."
+            )
+            return
+
+        # ── Obtain URDF from /robot_description topic ──
+        urdf_string = self._get_urdf_from_topic()
+        if urdf_string is None:
+            self.get_logger().error(
+                "Could not get URDF from /robot_description topic. "
+                "cuRobo will be DISABLED."
+            )
+            return
+
+        # Write URDF to a temp file so cuRobo can load it
+        import tempfile
+        self._urdf_temp_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".urdf", delete=False, prefix="curobo_"
+        )
+        self._urdf_temp_file.write(urdf_string)
+        self._urdf_temp_file.flush()
+        urdf_file_path = self._urdf_temp_file.name
+        self.get_logger().info(f"URDF written to temp file: {urdf_file_path}")
+
+        tensor_args = TensorDeviceType()
+
+        # Load world collision config
+        world_config_path = self.config_dir / "world_collision.yml"
+        if world_config_path.exists():
+            world_cfg_dict = load_yaml(str(world_config_path))
+            self.get_logger().info(
+                f"Loaded world collision config: {world_config_path}"
+            )
+        else:
+            world_cfg_dict = {"cuboid": {}}
+            self.get_logger().warn(
+                f"World collision config not found at {world_config_path}, "
+                f"using empty world"
+            )
+
+        for robot_name, cfg in ROBOT_CONFIG.items():
+            curobo_config_name = cfg.get("curobo_config")
+            if curobo_config_name is None:
+                self.get_logger().info(
+                    f"No cuRobo config for {robot_name}, skipping"
+                )
+                continue
+
+            config_path = self.config_dir / curobo_config_name
+            if not config_path.exists():
+                self.get_logger().error(
+                    f"cuRobo config not found: {config_path}"
+                )
+                continue
+
+            try:
+                self.get_logger().info(
+                    f"Initialising cuRobo MotionGen for {robot_name}..."
+                )
+
+                # Load the cuRobo config as a dict and inject the real URDF path
+                robot_cfg_dict = load_yaml(str(config_path))
+                if "robot_cfg" in robot_cfg_dict:
+                    robot_cfg_dict["robot_cfg"]["kinematics"]["urdf_path"] = urdf_file_path
+                else:
+                    robot_cfg_dict["kinematics"]["urdf_path"] = urdf_file_path
+
+                # Transform world objects from world frame to robot's base_link
+                # frame.  cuRobo operates in the robot's base_link frame.
+                robot_world_cfg = self._transform_world_to_robot_frame(
+                    world_cfg_dict, robot_name
+                )
+
+                motion_gen_config = MotionGenConfig.load_from_robot_config(
+                    robot_cfg_dict,
+                    robot_world_cfg,
+                    tensor_args=tensor_args,
+                    interpolation_dt=self.interpolation_dt,
+                    # Trajectory optimisation parameters
+                    trajopt_tsteps=32,
+                    collision_checker_type="PRIMITIVE",
+                    use_cuda_graph=True,
+                    num_trajopt_seeds=4,
+                    num_graph_seeds=4,
+                    num_ik_seeds=30,
+                    # Velocity/acceleration scaling
+                    maximum_trajectory_dt=None,
+                    # Enable smooth cubic-interpolated trajectories
+                    interpolation_type=InterpolateType.CUBIC,
+                )
+
+                motion_gen = MotionGen(motion_gen_config)
+                self.get_logger().info(
+                    f"Warming up cuRobo for {robot_name} (first CUDA compile)..."
+                )
+                motion_gen.warmup(
+                    enable_graph=True,
+                    warmup_js_trajopt=True,
+                    parallel_finetune=True,
+                )
+
+                self._motion_gens[robot_name] = motion_gen
+                self.get_logger().info(
+                    f"cuRobo MotionGen ready for {robot_name} ✓"
+                )
+
+            except Exception as e:
+                self.get_logger().error(
+                    f"Failed to initialise cuRobo for {robot_name}: {e}\n"
+                    f"{traceback.format_exc()}"
+                )
+
+        self._curobo_ready = len(self._motion_gens) > 0
+        self.get_logger().info(
+            f"cuRobo initialisation complete: "
+            f"{len(self._motion_gens)} robot(s) ready"
+        )
+
+    def _transform_world_to_robot_frame(
+        self, world_cfg_dict: dict, robot_name: str
+    ) -> dict:
+        """Transform world collision objects from world frame to robot base_link.
+
+        cuRobo operates in the robot's base_link frame, but our world
+        collision objects are defined in the world frame.  This computes
+        the transform and adjusts poses accordingly.
+
+        For the initial static transform (before TF is available), we
+        use the known mount positions from the URDF:
+          - nakul:   base_link at (-0.6758, 0, 1.03) with -90° yaw in world
+          - sahadev: base_link at (0.6758, 0, 1.03) with +90° yaw in world
+        """
+        import numpy as np
+
+        cfg = ROBOT_CONFIG[robot_name]
+
+        # Known transforms from URDF (world → robot_mount → base_link)
+        if robot_name == "nakul_ur5e":
+            # Mount at (-0.6758, 0, 1.03), yaw=-90° in shop_floor
+            mount_pos = np.array([-0.6758, 0.0, 1.03])
+            mount_yaw = -math.pi / 2
+        elif robot_name == "sahadev_ur5e":
+            mount_pos = np.array([0.6758, 0.0, 1.03])
+            mount_yaw = math.pi / 2
+        else:
+            # No transform — assume base_link = world
+            return world_cfg_dict
+
+        # 2D rotation matrix for yaw (around Z axis)
+        cos_y = math.cos(mount_yaw)
+        sin_y = math.sin(mount_yaw)
+
+        def world_to_base(pos_world):
+            """Transform a world-frame position to base_link frame."""
+            rel = np.array(pos_world) - mount_pos
+            x = cos_y * rel[0] + sin_y * rel[1]
+            y = -sin_y * rel[0] + cos_y * rel[1]
+            z = rel[2]
+            return [float(x), float(y), float(z)]
+
+        def rotate_quat(qw, qx, qy, qz):
+            """Apply inverse yaw rotation to a quaternion."""
+            # Inverse of mount yaw rotation
+            inv_qw = math.cos(-mount_yaw / 2)
+            inv_qz = math.sin(-mount_yaw / 2)
+            # Quaternion multiplication: inv * q
+            rw = inv_qw * qw - inv_qz * qz
+            rx = inv_qw * qx - inv_qz * qy
+            ry = inv_qw * qy + inv_qz * qx
+            rz = inv_qw * qz + inv_qz * qw
+            return [rw, rx, ry, rz]
+
+        result = {}
+        for obj_type in ("cuboid", "mesh"):
+            if obj_type not in world_cfg_dict:
+                continue
+            result[obj_type] = {}
+            for name, obj in world_cfg_dict[obj_type].items():
+                new_obj = dict(obj)
+                if "pose" in obj:
+                    p = obj["pose"]  # [x, y, z, qw, qx, qy, qz]
+                    new_pos = world_to_base(p[:3])
+                    new_quat = rotate_quat(p[3], p[4], p[5], p[6])
+                    new_obj["pose"] = new_pos + new_quat
+                result[obj_type][name] = new_obj
+
+        return result
+
+    # ─────────────────────────────────────────────────────────────────
+    # Joint state callback
+    # ─────────────────────────────────────────────────────────────────
+
+    def _on_joint_states(self, msg: JointState):
+        for robot_name, cfg in ROBOT_CONFIG.items():
+            positions, velocities = [], []
+            for jn in cfg["joints"]:
+                if jn in msg.name:
+                    idx = msg.name.index(jn)
+                    positions.append(msg.position[idx])
+                    velocities.append(
+                        msg.velocity[idx] if idx < len(msg.velocity) else 0.0
+                    )
+            if len(positions) == 6:
+                st = self._robot_states[robot_name]
+                st.joint_positions = positions
+                st.joint_velocities = velocities
+                st.last_update = time.time()
+
+    # ─────────────────────────────────────────────────────────────────
+    # Robot-program-running state (real hardware)
+    # ─────────────────────────────────────────────────────────────────
+
+    def _on_robot_program_running(self, robot_name: str, msg: Bool):
+        prev = self._robot_program_running.get(robot_name, False)
+        self._robot_program_running[robot_name] = msg.data
+        if msg.data != prev:
+            self.get_logger().info(
+                f"Robot program running [{robot_name}]: {msg.data}"
+            )
+
+    async def _ensure_robot_ready(
+        self, robot_name: str, timeout: float = 15.0
+    ) -> bool:
+        """Ensure the robot is ready for trajectory execution.
+
+        For RTDE real mode: check RTDE connection (no ROS2 robot program needed).
+        For ROS2 sim mode: ensure the UR robot program is running.
+        """
+        current_mode = self._read_current_mode()
+        if current_mode == "simulation":
+            return True
+
+        # Real mode with RTDE: just verify RTDE connection
+        if RTDE_AVAILABLE and robot_name in self._rtde_controllers:
+            rtde = self._rtde_controllers[robot_name]
+            if rtde.is_connected:
+                return True
+            # Try to connect
+            self.get_logger().info(f"RTDE not connected — connecting to {robot_name}...")
+            ok = rtde.connect()
+            if ok:
+                return True
+            self.get_logger().error(f"Cannot connect RTDE to {robot_name}")
+            return False
+
+        # Fallback: ROS2 robot program check
+        if self._robot_program_running.get(robot_name, False):
+            return True
+
+        self.get_logger().warn(
+            f"Robot program NOT running on {robot_name} — "
+            f"attempting resend_robot_program…"
+        )
+
+        resend_client = self._resend_program_clients.get(robot_name)
+        if resend_client and resend_client.service_is_ready():
+            try:
+                future = resend_client.call_async(Trigger.Request())
+                result = await await_ros_future(future, timeout=5.0)
+                if result.success:
+                    self.get_logger().info(
+                        f"resend_robot_program succeeded for {robot_name}"
+                    )
+                else:
+                    self.get_logger().warn(
+                        f"resend_robot_program returned non-success "
+                        f"for {robot_name}: {result.message}"
+                    )
+            except Exception as e:
+                self.get_logger().error(
+                    f"resend_robot_program failed for {robot_name}: {e}"
+                )
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._robot_program_running.get(robot_name, False):
+                self.get_logger().info(
+                    f"Robot program now running on {robot_name}"
+                )
+                await asyncio.sleep(1.0)
+                return True
+            await asyncio.sleep(0.5)
+
+        self.get_logger().error(
+            f"Timeout waiting for robot_program_running on {robot_name}"
+        )
+        return False
+
+    # ─────────────────────────────────────────────────────────────────
+    # cuRobo motion planning helpers
+    # ─────────────────────────────────────────────────────────────────
+
+    async def _curobo_plan_to_pose(
+        self,
+        robot_name: str,
+        target_position: List[float],
+        target_orientation: List[float],
+        velocity_scaling: Optional[float] = None,
+    ) -> Optional[Any]:
+        """Plan a collision-free trajectory to a Cartesian pose using cuRobo.
+
+        cuRobo produces minimum-jerk, time-optimal trajectories on the GPU.
+        No additional retiming is needed.
+
+        Parameters
+        ----------
+        target_position : [x, y, z] in robot's base_link frame
+        target_orientation : [qx, qy, qz, qw] in robot's base_link frame
+            NOTE: Client sends [qx, qy, qz, qw] but cuRobo uses [qw, qx, qy, qz]
+
+        Returns
+        -------
+        MotionGenResult or None
+        """
+        motion_gen = self._motion_gens.get(robot_name)
+        if motion_gen is None:
+            self.get_logger().error(
+                f"No cuRobo MotionGen for {robot_name}"
+            )
+            return None
+
+        cfg = ROBOT_CONFIG[robot_name]
+
+        # Get current joint state
+        current = self._robot_states[robot_name].joint_positions
+        if not current or len(current) != 6:
+            current = list(cfg["home_position"])
+
+        try:
+            # Build start state
+            start_state = CuJointState.from_position(
+                torch.tensor([current], dtype=torch.float32).cuda(),
+                joint_names=cfg["joints"],
+            )
+
+            # Build goal pose
+            # cuRobo Pose.from_list expects [x, y, z, qw, qx, qy, qz]
+            # Client sends orientation as [qx, qy, qz, qw]
+            qx, qy, qz, qw = target_orientation
+            goal_pose = CuPose.from_list(
+                [target_position[0], target_position[1], target_position[2],
+                 qw, qx, qy, qz]
+            )
+
+            # Configure planning
+            plan_config = MotionGenPlanConfig(
+                max_attempts=10,
+                enable_graph=True,
+                enable_opt=True,
+                enable_finetune_trajopt=True,
+                partial_ik_opt=False,
+                parallel_finetune=True,
+                # time_dilation_factor < 1.0 slows the trajectory
+                # e.g. 0.2 means the trajectory takes 5x longer (20% of max speed)
+                time_dilation_factor=min(velocity_scaling or self.max_velocity_scaling, 0.99),
+            )
+
+            # Run planning on GPU (this is the fast part!)
+            result = motion_gen.plan_single(
+                start_state, goal_pose, plan_config
+            )
+
+            if result.success.item():
+                traj = result.get_interpolated_plan()
+                n_pts = traj.position.shape[1]
+                dt = result.interpolation_dt
+                total_dur = n_pts * dt
+                self.get_logger().info(
+                    f"cuRobo plan OK for {robot_name}: {n_pts} waypoints, "
+                    f"duration={total_dur:.2f}s, dt={dt:.4f}s"
+                )
+                return result
+            else:
+                status = result.status if hasattr(result, 'status') else 'unknown'
+                self.get_logger().warn(
+                    f"cuRobo planning failed for {robot_name}: {status}"
+                )
+                return None
+
+        except Exception as e:
+            self.get_logger().error(
+                f"cuRobo planning error for {robot_name}: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            return None
+
+    async def _curobo_plan_to_joints(
+        self,
+        robot_name: str,
+        target_joints: List[float],
+        velocity_scaling: Optional[float] = None,
+    ) -> Optional[Any]:
+        """Plan a collision-free trajectory to target joint positions using cuRobo."""
+        motion_gen = self._motion_gens.get(robot_name)
+        if motion_gen is None:
+            self.get_logger().error(f"No cuRobo MotionGen for {robot_name}")
+            return None
+
+        cfg = ROBOT_CONFIG[robot_name]
+        current = self._robot_states[robot_name].joint_positions
+        if not current or len(current) != 6:
+            current = list(cfg["home_position"])
+
+        try:
+            start_state = CuJointState.from_position(
+                torch.tensor([current], dtype=torch.float32).cuda(),
+                joint_names=cfg["joints"],
+            )
+
+            goal_state = CuJointState.from_position(
+                torch.tensor([target_joints], dtype=torch.float32).cuda(),
+                joint_names=cfg["joints"],
+            )
+
+            plan_config = MotionGenPlanConfig(
+                max_attempts=10,
+                enable_graph=True,
+                enable_opt=True,
+                enable_finetune_trajopt=True,
+                time_dilation_factor=min(velocity_scaling or self.max_velocity_scaling, 0.99),
+            )
+
+            result = motion_gen.plan_single_js(
+                start_state, goal_state, plan_config
+            )
+
+            if result.success.item():
+                traj = result.get_interpolated_plan()
+                n_pts = traj.position.shape[1]
+                self.get_logger().info(
+                    f"cuRobo joint plan OK for {robot_name}: {n_pts} waypoints"
+                )
+                return result
+            else:
+                status = result.status if hasattr(result, 'status') else 'unknown'
+                self.get_logger().warn(
+                    f"cuRobo joint planning failed for {robot_name}: {status}"
+                )
+                return None
+
+        except Exception as e:
+            self.get_logger().error(
+                f"cuRobo joint planning error: {e}\n{traceback.format_exc()}"
+            )
+            return None
+
+    def _curobo_result_to_ros_trajectory(
+        self,
+        result: Any,
+        robot_name: str,
+        velocity_scaling: Optional[float] = None,
+    ) -> Optional[Any]:
+        """Convert a cuRobo MotionGenResult to a simple trajectory wrapper.
+
+        cuRobo returns torch tensors with positions, velocities, and
+        accelerations at uniform dt intervals.  We convert these to
+        ROS2 JointTrajectoryPoint messages.
+
+        The velocity_scaling factor stretches the trajectory in time,
+        making the robot move slower (larger dt between points).
+
+        Returns an object with a .joint_trajectory attribute (JointTrajectory msg)
+        so it can be passed directly to _execute_trajectory().
+        """
+        cfg = ROBOT_CONFIG[robot_name]
+        traj = result.get_interpolated_plan()
+
+        # traj.position shape: (n_steps, n_joints) or (batch, n_steps, n_joints)
+        traj_pos = traj.position.cpu().numpy()
+        traj_vel = traj.velocity.cpu().numpy() if traj.velocity is not None else None
+        traj_acc = traj.acceleration.cpu().numpy() if traj.acceleration is not None else None
+
+        if traj_pos.ndim == 3:
+            positions = traj_pos[0]
+            velocities = traj_vel[0] if traj_vel is not None else None
+            accelerations = traj_acc[0] if traj_acc is not None else None
+        else:
+            positions = traj_pos
+            velocities = traj_vel
+            accelerations = traj_acc
+
+        dt = result.interpolation_dt
+        # cuRobo already applies time_dilation_factor during planning,
+        # so the interpolation_dt already reflects the desired speed.
+        # No additional scaling needed here.
+        effective_dt = dt
+        vel_scale = velocity_scaling or self.max_velocity_scaling
+
+        # Simple wrapper that mimics RobotTrajectory without moveit_msgs dep
+        class _TrajectoryWrapper:
+            def __init__(self):
+                self.joint_trajectory = JointTrajectory()
+
+        ros_traj = _TrajectoryWrapper()
+        ros_traj.joint_trajectory.joint_names = list(cfg["joints"])
+
+        n_pts = positions.shape[0]
+        for i in range(n_pts):
+            pt = JointTrajectoryPoint()
+            pt.positions = [float(v) for v in positions[i]]
+
+            if velocities is not None:
+                # cuRobo velocities are already time-dilated — use as-is
+                pt.velocities = [float(v) for v in velocities[i]]
+            else:
+                pt.velocities = [0.0] * 6
+
+            if accelerations is not None:
+                pt.accelerations = [float(v) for v in accelerations[i]]
+            else:
+                pt.accelerations = [0.0] * 6
+
+            t = i * effective_dt
+            sec = int(t)
+            nsec = int((t - sec) * 1e9)
+            pt.time_from_start = Duration(sec=sec, nanosec=nsec)
+
+            ros_traj.joint_trajectory.points.append(pt)
+
+        # Ensure first and last points have zero velocity/acceleration
+        if ros_traj.joint_trajectory.points:
+            ros_traj.joint_trajectory.points[0].velocities = [0.0] * 6
+            ros_traj.joint_trajectory.points[0].accelerations = [0.0] * 6
+            ros_traj.joint_trajectory.points[-1].velocities = [0.0] * 6
+            ros_traj.joint_trajectory.points[-1].accelerations = [0.0] * 6
+
+        total_dur = n_pts * effective_dt
+        self.get_logger().info(
+            f"cuRobo→ROS trajectory: {n_pts} pts, duration={total_dur:.2f}s, "
+            f"effective_dt={effective_dt:.4f}s, vel_scale={vel_scale:.2f}"
+        )
+
+        return ros_traj
+
+    # ─────────────────────────────────────────────────────────────────
+    # Trajectory execution
+    # ─────────────────────────────────────────────────────────────────
+
+    async def _execute_trajectory(
+        self, robot_name: str, trajectory, timeout: float = 60.0
+    ) -> bool:
+        """Execute a trajectory — dispatches to RTDE (real) or ROS2 action (sim).
+
+        For REAL mode: uses ur_rtde servoJ() to stream waypoints at 500Hz
+                       directly to the UR controller.  Bypasses the entire
+                       ROS2 control stack for glitch-free motion.
+
+        For SIM mode:  uses FollowJointTrajectory ROS2 action (fake hardware).
+        """
+        current_mode = self._read_current_mode()
+        is_real = current_mode in ("real", "both")
+
+        if is_real and RTDE_AVAILABLE and robot_name in self._rtde_controllers:
+            return await self._execute_trajectory_rtde(robot_name, trajectory, timeout)
+        else:
+            return await self._execute_trajectory_ros2(robot_name, trajectory, timeout)
+
+    async def _execute_trajectory_rtde(
+        self, robot_name: str, trajectory, timeout: float = 60.0
+    ) -> bool:
+        """Execute trajectory via direct RTDE servoJ streaming.
+
+        Extracts the joint positions *and* per-waypoint timestamps from the
+        ROS JointTrajectory message and streams them to the robot at 500Hz
+        using servoJ.  Timestamps are passed through so that dwell pauses
+        between poses are correctly preserved.
+
+        The same trajectory is also sent to the sim stack's
+        FollowJointTrajectory action so the simulated robot mirrors the
+        real robot in Foxglove / RViz.
+        """
+        rtde = self._rtde_controllers.get(robot_name)
+        if rtde is None:
+            self.get_logger().error(f"No RTDE controller for {robot_name}")
+            return False
+
+        # Connect if not already connected
+        if not rtde.is_connected:
+            ok = rtde.connect()
+            if not ok:
+                self.get_logger().error(f"RTDE connection failed for {robot_name}")
+                return False
+
+        pts = trajectory.joint_trajectory.points
+        if not pts:
+            self.get_logger().warn(f"Empty trajectory for {robot_name}")
+            return True
+
+        # Extract positions and per-waypoint timestamps
+        positions = [list(pt.positions) for pt in pts]
+        timestamps = [
+            pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9
+            for pt in pts
+        ]
+
+        total_dur = timestamps[-1] if timestamps else 0.0
+        self.get_logger().info(
+            f"Executing via RTDE servoJ on {robot_name}: "
+            f"{len(positions)} waypoints, duration={total_dur:.2f}s "
+            f"(timestamps used for dwell support)"
+        )
+
+        # ── Also send the trajectory to the sim stack so Foxglove/RViz
+        #    shows the sim robot moving in sync with the real robot.
+        sim_task = None
+        try:
+            sim_client = self._traj_clients.get(robot_name)
+            if sim_client is not None and sim_client.server_is_ready():
+                self.get_logger().info(
+                    f"Sending trajectory to sim (FollowJointTrajectory) "
+                    f"for {robot_name} in parallel"
+                )
+                sim_task = asyncio.ensure_future(
+                    self._execute_trajectory_ros2(
+                        robot_name, trajectory, timeout=max(total_dur * 2, 60.0)
+                    )
+                )
+            else:
+                self.get_logger().info(
+                    "Sim trajectory action not available — "
+                    "sim robot will not mirror real movement"
+                )
+        except Exception as e:
+            self.get_logger().warn(f"Could not start sim trajectory: {e}")
+
+        # ── Run the blocking servoJ loop in an executor thread
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: rtde.execute_trajectory_servoj(
+                positions=positions,
+                timestamps=timestamps,
+                lookahead_time=0.1,
+                gain=300,
+                stop_check_fn=lambda: self._proto_sim_stop,
+                logger=self.get_logger(),
+            )
+        )
+
+        # Wait for sim trajectory to finish (don't block on failure)
+        if sim_task is not None:
+            try:
+                await asyncio.wait_for(sim_task, timeout=10.0)
+            except (asyncio.TimeoutError, Exception) as e:
+                self.get_logger().warn(f"Sim trajectory did not finish cleanly: {e}")
+
+        return result
+
+    async def _execute_trajectory_ros2(
+        self, robot_name: str, trajectory, timeout: float = 60.0
+    ) -> bool:
+        """Send a RobotTrajectory to the FollowJointTrajectory action (simulation only)."""
+        client = self._traj_clients.get(robot_name)
+        if client is None:
+            self.get_logger().error(f"No trajectory client for {robot_name}")
+            return False
+
+        max_attempts = 2
+
+        for attempt in range(max_attempts):
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if client.server_is_ready():
+                    break
+                await asyncio.sleep(0.2)
+            else:
+                self.get_logger().error(
+                    f"Trajectory action server not available for {robot_name}"
+                )
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(5.0)
+                    continue
+                return False
+
+            ready = await self._ensure_robot_ready(robot_name, timeout=15.0)
+            if not ready:
+                self.get_logger().error(
+                    f"Robot program not running on {robot_name}"
+                )
+                return False
+
+            goal = FollowJointTrajectory.Goal()
+            goal.trajectory = trajectory.joint_trajectory
+            goal.goal_time_tolerance.sec = 30
+
+            pts = goal.trajectory.points
+
+            # Strip zero-time leading point
+            if len(pts) >= 2:
+                t0 = pts[0].time_from_start.sec + pts[0].time_from_start.nanosec * 1e-9
+                t1 = pts[1].time_from_start.sec + pts[1].time_from_start.nanosec * 1e-9
+                if t0 >= t1 or t0 == 0.0:
+                    pts = list(pts[1:])
+                    goal.trajectory.points = pts
+
+            # Verify monotonic timestamps
+            if len(pts) >= 2:
+                times = [
+                    p.time_from_start.sec + p.time_from_start.nanosec * 1e-9
+                    for p in pts
+                ]
+                # Find first non-monotonic pair for debugging
+                for ii in range(len(times) - 1):
+                    if times[ii] >= times[ii + 1]:
+                        self.get_logger().error(
+                            f"Non-monotonic at index {ii}: "
+                            f"t[{ii}]={times[ii]:.6f} >= t[{ii+1}]={times[ii+1]:.6f}"
+                        )
+                        break
+                if not all(times[i] < times[i + 1] for i in range(len(times) - 1)):
+                    self.get_logger().error(
+                        f"SAFETY: Rejecting trajectory — timestamps not monotonic "
+                        f"(first 5 times: {times[:5]}, last 5: {times[-5:]})"
+                    )
+                    return False
+
+            n_pts = len(goal.trajectory.points)
+            self.get_logger().info(
+                f"Executing trajectory on {robot_name} ({n_pts} points)"
+                + (f" [retry {attempt}]" if attempt > 0 else "")
+            )
+
+            try:
+                send_future = client.send_goal_async(goal)
+                goal_handle = await await_ros_future(send_future, timeout=10.0)
+
+                if not goal_handle.accepted:
+                    self.get_logger().warn(
+                        f"Trajectory goal rejected for {robot_name}"
+                    )
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(5.0)
+                        continue
+                    return False
+
+                self.get_logger().info(
+                    f"Trajectory accepted for {robot_name}, waiting…"
+                )
+
+                result_future = goal_handle.get_result_async()
+                result = await await_ros_future(result_future, timeout=timeout)
+
+                error_code = result.result.error_code
+                if error_code == FollowJointTrajectory.Result.SUCCESSFUL:
+                    self.get_logger().info(
+                        f"Trajectory executed successfully on {robot_name}"
+                    )
+                    return True
+                else:
+                    self.get_logger().warn(
+                        f"Trajectory execution error on {robot_name}: "
+                        f"code={error_code}"
+                    )
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(5.0)
+                        continue
+                    return False
+
+            except TimeoutError:
+                self.get_logger().error(
+                    f"Trajectory execution timed out for {robot_name}"
+                )
+                return False
+            except Exception as exc:
+                self.get_logger().error(
+                    f"Trajectory execution failed: {exc}\n{traceback.format_exc()}"
+                )
+                return False
+
+        return False
+
+    # ─────────────────────────────────────────────────────────────────
+    # High-level motion commands
+    # ─────────────────────────────────────────────────────────────────
+
+    async def _move_to_pose(
+        self,
+        robot_name: str,
+        position: List[float],
+        orientation: List[float],
+        velocity_scaling: Optional[float] = None,
+    ) -> str:
+        """Full pipeline: cuRobo Plan → Execute.
+
+        Returns: "success", "plan_failed", or "exec_failed".
+        """
+        vel_scale = velocity_scaling or self.max_velocity_scaling
+
+        # Plan with cuRobo
+        result = await self._curobo_plan_to_pose(
+            robot_name, position, orientation, velocity_scaling=vel_scale
+        )
+        if result is None:
+            return "plan_failed"
+
+        # Convert to ROS trajectory
+        ros_traj = self._curobo_result_to_ros_trajectory(
+            result, robot_name, velocity_scaling=vel_scale
+        )
+        if ros_traj is None:
+            return "plan_failed"
+
+        # Execute
+        ok = await self._execute_trajectory(robot_name, ros_traj)
+        return "success" if ok else "exec_failed"
+
+    async def _move_to_home(self, robot_name: str) -> bool:
+        """Plan and execute a return-to-home motion.
+
+        For real mode with RTDE: uses moveJ directly (simplest, most reliable).
+        For sim mode: plans with cuRobo and executes via FollowJointTrajectory.
+        """
+        cfg = ROBOT_CONFIG[robot_name]
+        current_mode = self._read_current_mode()
+        is_real = current_mode in ("real", "both")
+
+        # Real mode: use RTDE moveJ for reliable home movement
+        if is_real and RTDE_AVAILABLE and robot_name in self._rtde_controllers:
+            rtde = self._rtde_controllers[robot_name]
+            if not rtde.is_connected:
+                rtde.connect()
+            if rtde.is_connected:
+                self.get_logger().info(f"Moving {robot_name} home via RTDE moveJ")
+                loop = asyncio.get_event_loop()
+                ok = await loop.run_in_executor(
+                    None,
+                    lambda: rtde.move_j(
+                        cfg["home_position"],
+                        speed=0.5,
+                        acceleration=0.5,
+                    )
+                )
+                return ok
+            else:
+                self.get_logger().warn(
+                    f"RTDE not connected for {robot_name} — falling back to cuRobo"
+                )
+
+        # Sim mode or RTDE unavailable: plan with cuRobo + execute via ROS2
+        ready = await self._ensure_robot_ready(robot_name, timeout=15.0)
+        if not ready:
+            self.get_logger().warn(
+                f"Robot program not running for {robot_name} — cannot go home"
+            )
+            return False
+
+        result = await self._curobo_plan_to_joints(
+            robot_name, cfg["home_position"]
+        )
+        if result is None:
+            self.get_logger().warn(f"Cannot plan home for {robot_name}")
+            return False
+
+        ros_traj = self._curobo_result_to_ros_trajectory(
+            result, robot_name
+        )
+        if ros_traj is None:
+            return False
+
+        return await self._execute_trajectory(robot_name, ros_traj)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Multi-waypoint planning (cuRobo batch)
+    # ─────────────────────────────────────────────────────────────────
+
+    async def _plan_multi_waypoint_trajectory(
+        self,
+        robot_name: str,
+        poses: list,
+        velocity_scaling: Optional[float] = None,
+        idle_time: float = 0.0,
+    ) -> Optional[tuple]:
+        """Plan trajectories through multiple poses using cuRobo.
+
+        Unlike the MoveIt version which had to concatenate segments and
+        apply complex retiming, cuRobo plans each segment independently
+        with inherently smooth trajectories.  We concatenate the results
+        with optional dwell periods.
+        """
+        cfg = ROBOT_CONFIG[robot_name]
+        vel_scale = velocity_scaling or self.max_velocity_scaling
+
+        current = self._robot_states[robot_name].joint_positions
+        if not current or len(current) != 6:
+            current = list(cfg["home_position"])
+
+        # Store original state
+        original_current = list(current)
+
+        all_points: List[JointTrajectoryPoint] = []
+        pose_times: List[tuple] = []
+        valid_indices: List[int] = []
+        failed_names: List[str] = []
+        cumulative_time = 0.0
+
+        for i, pose_data in enumerate(poses):
+            pose_name = pose_data.get("name", f"pose_{i}")
+            position = pose_data.get("position", [0, 0, 0])
+            orientation = pose_data.get("orientation", [0, 0, 0, 1])
+
+            self.get_logger().info(
+                f"Planning segment {len(valid_indices)+1} to pose {i} ({pose_name})"
+            )
+
+            # Temporarily update current state for planning
+            self._robot_states[robot_name].joint_positions = list(current)
+
+            result = await self._curobo_plan_to_pose(
+                robot_name, position, orientation, velocity_scaling=vel_scale
+            )
+
+            if result is None:
+                failed_names.append(pose_name)
+                self.get_logger().warn(
+                    f"cuRobo planning failed for {pose_name} — skipping"
+                )
+                continue
+
+            traj = result.get_interpolated_plan()
+            self.get_logger().info(
+                f"Trajectory shapes: position={traj.position.shape}, "
+                f"velocity={traj.velocity.shape if traj.velocity is not None else None}"
+            )
+            # traj.position shape: (n_steps, n_joints) from get_interpolated_plan()
+            traj_pos = traj.position.cpu().numpy()
+            traj_vel = traj.velocity.cpu().numpy() if traj.velocity is not None else None
+            traj_acc = traj.acceleration.cpu().numpy() if traj.acceleration is not None else None
+
+            # Handle both 2D (n_steps, n_joints) and 3D (batch, n_steps, n_joints)
+            if traj_pos.ndim == 3:
+                positions = traj_pos[0]
+                velocities = traj_vel[0] if traj_vel is not None else None
+                accelerations = traj_acc[0] if traj_acc is not None else None
+            else:
+                positions = traj_pos
+                velocities = traj_vel
+                accelerations = traj_acc
+
+            dt = result.interpolation_dt
+            # cuRobo already applies time_dilation_factor during planning,
+            # so interpolation_dt already reflects desired speed — no extra scaling.
+            effective_dt = dt
+            n_pts = positions.shape[0]
+
+            # Skip first point of subsequent segments (duplicates end of prev)
+            start_idx = 1 if all_points and n_pts > 1 else 0
+
+            for k in range(start_idx, n_pts):
+                pt = JointTrajectoryPoint()
+                pt.positions = [float(v) for v in positions[k]]
+
+                if velocities is not None:
+                    # cuRobo velocities are already time-dilated — use as-is
+                    pt.velocities = [float(v) for v in velocities[k]]
+                else:
+                    pt.velocities = [0.0] * 6
+
+                if accelerations is not None:
+                    pt.accelerations = [float(v) for v in accelerations[k]]
+                else:
+                    pt.accelerations = [0.0] * 6
+
+                # Use (k - start_idx + 1) so first point is at cumulative_time + dt
+                # (avoiding collision with dwell point from previous segment)
+                t = cumulative_time + (k - start_idx + 1) * effective_dt
+                sec = int(t)
+                nsec = int((t - sec) * 1e9)
+                pt.time_from_start = Duration(sec=sec, nanosec=nsec)
+                all_points.append(pt)
+
+            seg_duration = (n_pts - start_idx + 1) * effective_dt
+            cumulative_time += seg_duration
+
+            # Record pose arrival time
+            pose_times.append((i, cumulative_time))
+            valid_indices.append(i)
+
+            # Add dwell if needed
+            if idle_time > 0 and i < len(poses) - 1:
+                dwell_pt = JointTrajectoryPoint()
+                dwell_pt.positions = [float(v) for v in positions[-1]]
+                dwell_pt.velocities = [0.0] * 6
+                dwell_pt.accelerations = [0.0] * 6
+                cumulative_time += idle_time
+                t = cumulative_time
+                sec = int(t)
+                nsec = int((t - sec) * 1e9)
+                dwell_pt.time_from_start = Duration(sec=sec, nanosec=nsec)
+                all_points.append(dwell_pt)
+
+            # Update "current" for next segment
+            current = [float(v) for v in positions[-1]]
+
+            self.get_logger().info(
+                f"Segment to {pose_name}: {n_pts} pts, "
+                f"seg_dur={seg_duration:.2f}s"
+            )
+
+        # Restore actual joint state
+        self._robot_states[robot_name].joint_positions = original_current
+
+        if not all_points:
+            self.get_logger().error("All pose plans failed")
+            return None
+
+        if failed_names:
+            self.get_logger().warn(
+                f"Planning failed for {len(failed_names)} poses: {failed_names[:5]}"
+            )
+
+        # Ensure endpoint velocities are zero
+        all_points[0].velocities = [0.0] * 6
+        all_points[0].accelerations = [0.0] * 6
+        all_points[-1].velocities = [0.0] * 6
+        all_points[-1].accelerations = [0.0] * 6
+
+        # Build trajectory wrapper (no moveit_msgs dependency)
+        class _TrajectoryWrapper:
+            def __init__(self):
+                self.joint_trajectory = JointTrajectory()
+
+        trajectory = _TrajectoryWrapper()
+        trajectory.joint_trajectory.joint_names = list(cfg["joints"])
+        trajectory.joint_trajectory.points = all_points
+
+        total_dur = cumulative_time
+        self.get_logger().info(
+            f"Multi-waypoint trajectory: {len(all_points)} points, "
+            f"duration={total_dur:.2f}s, segments={len(valid_indices)}, "
+            f"dwells={'yes' if idle_time > 0 else 'no'}"
+        )
+
+        return trajectory, pose_times, valid_indices
+
+    # ─────────────────────────────────────────────────────────────────
+    # WebSocket server
+    # ─────────────────────────────────────────────────────────────────
+
+    async def start_websocket_server(self):
+        self.get_logger().info(
+            f"Starting WebSocket server on {self.ws_host}:{self.ws_port}"
+        )
+        self.ws_server = await serve(
+            self._handle_client, self.ws_host, self.ws_port,
+            ping_interval=30, ping_timeout=300,
+        )
+        self.get_logger().info("WebSocket server started")
+
+    async def _handle_client(self, websocket, path: str = None):
+        cid = f"client_{id(websocket)}"
+        if len(self._ws_clients) >= self.max_clients:
+            self.get_logger().warning(f"Max clients – rejecting {cid}")
+            await websocket.close(1013, "Max clients reached")
+            return
+
+        client = ConnectedClient(
+            client_id=cid, websocket=websocket,
+            connected_at=time.time(), last_activity=time.time(),
+        )
+        self._ws_clients[cid] = client
+        self.get_logger().info(f"Client connected: {cid}")
+
+        try:
+            async for message in websocket:
+                await self._process_message(client, message)
+        except websockets.ConnectionClosed as e:
+            self.get_logger().info(f"Client disconnected: {cid} – {e}")
+        except Exception as e:
+            self.get_logger().error(f"Client error: {cid} – {e}")
+        finally:
+            self._ws_clients.pop(cid, None)
+            # Stop any running proto_sim when the controlling client disconnects
+            if self._proto_sim_running:
+                self.get_logger().info(
+                    f"Client {cid} disconnected while proto_sim running — stopping"
+                )
+                self._proto_sim_stop = True
+                self._proto_sim_running = False
+
+    async def _process_message(self, client: ConnectedClient, raw: str):
+        try:
+            msg = json.loads(raw)
+            client.last_activity = time.time()
+            t = msg.get("type", "")
+
+            if t == "heartbeat":
+                await self._on_heartbeat(client, msg)
+            elif t == "ping":
+                await self._on_ping(client, msg)
+            elif t == "rpc":
+                await self._on_rpc(client, msg)
+            elif t == "move_robot":
+                await self._on_move_robot(client, msg)
+            elif t == "emergency_stop":
+                await self._on_estop(client, msg)
+            elif t == "soft_stop":
+                self._proto_sim_stop = True
+                await self._reply(client, msg.get("request_id"),
+                                  success=True, message="Soft stop requested")
+            elif t == "get_robot_state":
+                await self._on_get_state(client, msg)
+            else:
+                await self._send_error(client, msg.get("request_id"),
+                                       f"Unknown message type: {t}")
+        except json.JSONDecodeError as e:
+            self.get_logger().error(f"Bad JSON from {client.client_id}: {e}")
+        except Exception as e:
+            self.get_logger().error(
+                f"Error processing msg: {e}\n{traceback.format_exc()}"
+            )
+            await self._send_error(client, None, str(e))
+
+    # ─────────────────────────────────────────────────────────────────
+    # Simple message handlers
+    # ─────────────────────────────────────────────────────────────────
+
+    async def _on_heartbeat(self, client, msg):
+        client.heartbeat_count += 1
+        hb = String()
+        hb.data = (
+            f"{client.client_id}:{msg.get('sequence', 0)}:"
+            f"{msg.get('latency_ms', 0)}"
+        )
+        self.heartbeat_pub.publish(hb)
+        await client.websocket.send(json.dumps({
+            "type": "heartbeat_ack",
+            "request_id": msg.get("request_id"),
+            "sequence": msg.get("sequence", 0),
+            "server_time_ns": time.time_ns(),
+        }))
+
+    async def _on_ping(self, client, msg):
+        await client.websocket.send(json.dumps({
+            "type": "pong",
+            "request_id": msg.get("request_id"),
+            "timestamp_ns": time.time_ns(),
+        }))
+
+    async def _on_estop(self, client, msg):
+        rname = msg.get("robot")
+        self.get_logger().warning(f"EMERGENCY STOP: {rname or 'ALL'}")
+        m = String()
+        m.data = rname or "all"
+        self.estop_pub.publish(m)
+        self._proto_sim_stop = True
+        await client.websocket.send(json.dumps({
+            "type": "emergency_stop_active",
+            "request_id": msg.get("request_id"),
+            "robots_stopped": (
+                [rname] if rname else list(ROBOT_CONFIG.keys())
+            ),
+        }))
+
+    async def _on_get_state(self, client, msg):
+        rn = msg.get("robot", list(ROBOT_CONFIG.keys())[0])
+        cfg = ROBOT_CONFIG.get(rn)
+        if not cfg:
+            await self._send_error(
+                client, msg.get("request_id"), f"Unknown robot: {rn}"
+            )
+            return
+        st = self._robot_states[rn]
+        await client.websocket.send(json.dumps({
+            "type": "robot_state",
+            "request_id": msg.get("request_id"),
+            "robot": rn,
+            "joint_names": cfg["joints"],
+            "joint_positions": st.joint_positions,
+            "joint_velocities": st.joint_velocities,
+            "last_update": st.last_update,
+        }))
+
+    async def _on_move_robot(self, client, msg):
+        rid = msg.get("request_id")
+        rn = msg.get("robot_name", list(ROBOT_CONFIG.keys())[0])
+        target = msg.get("target_joints")
+        if rn not in ROBOT_CONFIG:
+            await self._send_error(client, rid, f"Unknown robot: {rn}")
+            return
+        if not target or len(target) != 6:
+            await self._send_error(
+                client, rid, "target_joints with 6 values required"
+            )
+            return
+
+        result = await self._curobo_plan_to_joints(rn, target)
+        if result is None:
+            await self._send_error(client, rid, "Planning failed")
+            return
+
+        ros_traj = self._curobo_result_to_ros_trajectory(result, rn)
+        if ros_traj is None:
+            await self._send_error(client, rid, "Trajectory conversion failed")
+            return
+
+        ok = await self._execute_trajectory(rn, ros_traj)
+        await self._reply(client, rid, success=ok)
+
+    # ─────────────────────────────────────────────────────────────────
+    # RPC dispatch
+    # ─────────────────────────────────────────────────────────────────
+
+    async def _on_rpc(self, client, msg):
+        rid = msg.get("request_id")
+        method = msg.get("method", "")
+        params = msg.get("params", {})
+        self.get_logger().info(f"RPC from {client.client_id}: {method}")
+
+        try:
+            if method == "get_environment_info":
+                result = await self._rpc_env_info(params)
+            elif method == "get_robot_status":
+                result = await self._rpc_robot_status(params)
+            elif method == "prepare_mode":
+                result = await self._rpc_prepare_mode(params)
+            elif method == "run_proto_sim":
+                asyncio.ensure_future(
+                    self._rpc_run_proto_sim(client, rid, params)
+                )
+                return
+            elif method == "stop_proto_sim":
+                self._proto_sim_stop = True
+                result = {"success": True, "message": "Stop requested"}
+            elif method == "move_home":
+                result = await self._rpc_move_home(params)
+            elif method == "check_collision":
+                result = {"success": True, "in_collision": False}
+            elif method == "plan_motion":
+                result = await self._rpc_plan_motion(params)
+            else:
+                result = {
+                    "success": False,
+                    "error": f"Unknown RPC method: {method}",
+                }
+
+            await client.websocket.send(json.dumps({
+                "type": "rpc_result", "request_id": rid, **result,
+            }))
+        except Exception as e:
+            self.get_logger().error(
+                f"RPC error ({method}): {e}\n{traceback.format_exc()}"
+            )
+            await self._send_error(client, rid, str(e))
+
+    # ─────────────────────────────────────────────────────────────────
+    # RPC implementations
+    # ─────────────────────────────────────────────────────────────────
+
+    async def _rpc_env_info(self, params):
+        default_robot = list(ROBOT_CONFIG.keys())[0]
+        ref = ROBOT_CONFIG[default_robot]["base_link"]
+        obj_tf = {}
+        for obj in KNOWN_OBJECTS:
+            try:
+                t = self.tf_buffer.lookup_transform(
+                    ref, obj, rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=2.0),
+                )
+                obj_tf[obj] = {
+                    "position": [
+                        t.transform.translation.x,
+                        t.transform.translation.y,
+                        t.transform.translation.z,
+                    ],
+                    "orientation": [
+                        t.transform.rotation.x,
+                        t.transform.rotation.y,
+                        t.transform.rotation.z,
+                        t.transform.rotation.w,
+                    ],
+                }
+            except Exception as e:
+                self.get_logger().warn(f"TF for {obj}: {e}")
+                obj_tf[obj] = None
+        return {
+            "success": True,
+            "robots": list(ROBOT_CONFIG.keys()),
+            "objects": KNOWN_OBJECTS,
+            "object_transforms": obj_tf,
+            "reference_frame": ref,
+        }
+
+    async def _rpc_robot_status(self, params):
+        rn = params.get("robot_name") or list(ROBOT_CONFIG.keys())[0]
+        cfg = ROBOT_CONFIG.get(rn)
+        if not cfg:
+            return {"success": False, "error": f"Unknown robot: {rn}"}
+        st = self._robot_states.get(rn, RobotStateInfo())
+        has_joints = len(st.joint_positions) == 6
+
+        traj_ok = rn in self._traj_clients and self._traj_clients[rn].server_is_ready()
+        curobo_ok = rn in self._motion_gens
+
+        # RTDE status for real mode
+        rtde_ok = False
+        if RTDE_AVAILABLE and rn in self._rtde_controllers:
+            rtde_ok = self._rtde_controllers[rn].is_connected
+
+        current_mode = self._read_current_mode()
+        is_real = current_mode in ("real", "both")
+        prog_running = self._robot_program_running.get(rn, False)
+
+        return {
+            "success": True,
+            "real_robot_available": is_real and (rtde_ok or traj_ok) and has_joints,
+            "simulation_available": True,
+            "available_modes": ["simulation", "real"],
+            "current_mode": current_mode,
+            "connection_details": {
+                "follow_trajectory_action": (
+                    "available" if traj_ok else "not_available"
+                ),
+                "curobo": "available" if curobo_ok else "not_available",
+                "rtde": "connected" if rtde_ok else ("available" if RTDE_AVAILABLE else "not_installed"),
+                "robot_program_running": prog_running,
+            },
+            "current_joint_positions": (
+                st.joint_positions if has_joints else list(cfg["home_position"])
+            ),
+            "position_source": "real_robot" if (is_real and has_joints) else "default",
+        }
+
+    # ── Trajectory action-client management ─────────────────────────
+
+    def _rebuild_traj_clients(self) -> None:
+        """(Re)create FollowJointTrajectory action clients."""
+        for old_client in self._traj_clients.values():
+            old_client.destroy()
+        self._traj_clients.clear()
+
+        for robot_name, cfg in ROBOT_CONFIG.items():
+            ctrl = cfg["controller"]
+            action_ns = f"/{ctrl}/follow_joint_trajectory"
+            self._traj_clients[robot_name] = ActionClient(
+                self, FollowJointTrajectory, action_ns,
+                callback_group=self.cb_group,
+            )
+            self.get_logger().info(
+                f"Trajectory action client for {robot_name}: {action_ns}"
+            )
+
+    async def _rpc_move_home(self, params):
+        """RPC: Move a robot to its home position."""
+        robot_name = params.get("robot_name", list(ROBOT_CONFIG.keys())[0])
+        if robot_name not in ROBOT_CONFIG:
+            return {"success": False, "message": f"Unknown robot: {robot_name}"}
+
+        self.get_logger().info(f"RPC move_home for {robot_name}")
+        try:
+            ok = await self._move_to_home(robot_name)
+            if ok:
+                return {"success": True, "message": f"{robot_name} at home position"}
+            else:
+                return {"success": False, "message": f"Failed to move {robot_name} home"}
+        except Exception as e:
+            self.get_logger().error(f"move_home error: {e}")
+            return {"success": False, "message": str(e)}
+
+    # ── RTDE → ROS joint-state publisher ──────────────────────────────
+    # In real mode, read actual joint positions from RTDE and publish
+    # them on /joint_states so Foxglove can visualize the real robot.
+    # The sim stack's fake hardware publisher is overridden by these
+    # higher-frequency real readings.
+
+    def _start_rtde_joint_state_publisher(self):
+        """Start a timer that reads RTDE joint states and publishes to ROS."""
+        if hasattr(self, '_rtde_js_timer') and self._rtde_js_timer is not None:
+            return  # Already running
+
+        self._rtde_js_pub = self.create_publisher(
+            JointState, "/joint_states", 10
+        )
+        # Publish at 50Hz — sufficient for visualization
+        self._rtde_js_timer = self.create_timer(
+            0.02, self._rtde_js_publish_callback
+        )
+        self.get_logger().info("RTDE → /joint_states publisher started (50Hz)")
+
+    def _stop_rtde_joint_state_publisher(self):
+        """Stop the RTDE joint state publisher."""
+        if hasattr(self, '_rtde_js_timer') and self._rtde_js_timer is not None:
+            self._rtde_js_timer.cancel()
+            self._rtde_js_timer = None
+        if hasattr(self, '_rtde_js_pub') and self._rtde_js_pub is not None:
+            self.destroy_publisher(self._rtde_js_pub)
+            self._rtde_js_pub = None
+        self.get_logger().info("RTDE → /joint_states publisher stopped")
+
+    def _set_sim_joint_state_broadcaster(self, active: bool) -> None:
+        """Activate or deactivate the sim stack's joint_state_broadcaster.
+
+        In real mode the sim's fake-hardware joint_state_broadcaster floods
+        /joint_states at ~625 Hz with stale values, drowning out the RTDE
+        publisher's real readings.  Deactivating the broadcaster lets the
+        RTDE publisher own /joint_states so Foxglove reflects the real robot.
+
+        When returning to sim mode we re-activate it.
+        """
+        if not hasattr(self, '_jsb_deactivated'):
+            self._jsb_deactivated = False
+
+        if active and not self._jsb_deactivated:
+            return  # already active
+        if not active and self._jsb_deactivated:
+            return  # already deactivated
+
+        action = "activate" if active else "deactivate"
+        target = "active" if active else "inactive"
+
+        try:
+            # Use ros2 CLI to switch controller state
+            if active:
+                cmd = [
+                    "ros2", "control", "switch_controllers",
+                    "--activate", "joint_state_broadcaster",
+                ]
+            else:
+                cmd = [
+                    "ros2", "control", "switch_controllers",
+                    "--deactivate", "joint_state_broadcaster",
+                ]
+
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=5.0
+            )
+
+            if result.returncode == 0:
+                self._jsb_deactivated = not active
+                self.get_logger().info(
+                    f"Sim joint_state_broadcaster {action}d — "
+                    f"RTDE now {'secondary' if active else 'primary'} on /joint_states"
+                )
+            else:
+                self.get_logger().warn(
+                    f"Failed to {action} joint_state_broadcaster: "
+                    f"{result.stderr.strip()}"
+                )
+        except subprocess.TimeoutExpired:
+            self.get_logger().warn(
+                f"Timeout trying to {action} joint_state_broadcaster"
+            )
+        except Exception as e:
+            self.get_logger().warn(
+                f"Error switching joint_state_broadcaster: {e}"
+            )
+
+    def _rtde_js_publish_callback(self):
+        """Timer callback: read joints from RTDE and publish to ROS."""
+        for robot_name, rtde in self._rtde_controllers.items():
+            if not rtde.is_connected:
+                continue
+            actual_q = rtde.get_actual_q()
+            actual_qd = rtde.get_actual_qd()
+            if actual_q is None:
+                continue
+
+            cfg = ROBOT_CONFIG[robot_name]
+            msg = JointState()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.name = list(cfg["joints"])
+            msg.position = [float(v) for v in actual_q]
+            if actual_qd is not None:
+                msg.velocity = [float(v) for v in actual_qd]
+            self._rtde_js_pub.publish(msg)
+
+            # Also update internal robot state cache
+            st = self._robot_states.get(robot_name)
+            if st:
+                st.joint_positions = list(actual_q)
+                if actual_qd:
+                    st.joint_velocities = list(actual_qd)
+                st.last_update = time.time()
+
+    # ── Mode switching helpers ───────────────────────────────────────
+
+    def _read_current_mode(self) -> str:
+        """Return the current operating mode (internal state, no filesystem)."""
+        return getattr(self, '_current_mode', 'simulation')
+
+    def _request_mode_switch(self, mode: str) -> None:
+        with open(MODE_SWITCH_FILE, "w") as f:
+            f.write(mode)
+
+    async def _wait_for_ros_stack(
+        self, target_mode: str, timeout: float = 120.0, progress_cb=None,
+    ) -> dict:
+        """Wait for the ROS2 stack to come back up after a mode switch."""
+        switch_start = time.monotonic()
+        overall_deadline = switch_start + timeout
+
+        async def _report(phase: str, detail: str):
+            msg = f"[{phase}] {detail}"
+            self.get_logger().info(msg)
+            if progress_cb:
+                try:
+                    await progress_cb(phase, detail)
+                except Exception:
+                    pass
+
+        # Phase 1: wait for supervisor to pick up signal
+        await _report("Phase 1/5", "Waiting for supervisor…")
+        phase1_deadline = min(switch_start + 30.0, overall_deadline)
+        while time.monotonic() < phase1_deadline:
+            if not os.path.exists(MODE_SWITCH_FILE) and not os.path.exists(STACK_READY_FILE):
+                break
+            await asyncio.sleep(0.5)
+
+        # Phase 2: wait for STACK_READY_FILE
+        await _report("Phase 2/5", "Waiting for ROS2 stack…")
+        phase2_deadline = min(time.monotonic() + 90.0, overall_deadline)
+        stack_ready = False
+        while time.monotonic() < phase2_deadline:
+            if os.path.exists(STACK_READY_FILE):
+                stack_ready = True
+                break
+            await asyncio.sleep(1.0)
+        if not stack_ready:
+            return {"ok": False, "phase": "Phase 2/5",
+                    "message": "Timed out waiting for ROS2 stack"}
+
+        # Phase 3: verify mode
+        await _report("Phase 3/5", "Verifying mode…")
+        file_mode = self._read_current_mode()
+        target_is_real = target_mode in ("real", "both")
+        file_is_real = file_mode in ("real", "both")
+        if target_is_real != file_is_real:
+            return {"ok": False, "phase": "Phase 3/5",
+                    "message": f"Mode mismatch: wanted '{target_mode}', got '{file_mode}'"}
+
+        # Phase 4: wait for fresh joint states
+        await _report("Phase 4/5", "Waiting for fresh joint states…")
+        phase4_deadline = min(time.monotonic() + 20.0, overall_deadline)
+        while time.monotonic() < phase4_deadline:
+            all_fresh = all(
+                self._robot_states.get(rn) and
+                self._robot_states[rn].last_update > switch_start and
+                len(self._robot_states[rn].joint_positions) == 6
+                for rn in ROBOT_CONFIG
+            )
+            if all_fresh:
+                break
+            await asyncio.sleep(0.5)
+
+        # Phase 5: wait for trajectory action servers
+        await _report("Phase 5/5", "Waiting for trajectory servers…")
+        phase5_deadline = min(time.monotonic() + 15.0, overall_deadline)
+        while time.monotonic() < phase5_deadline:
+            all_traj_ok = all(
+                tc.server_is_ready() for tc in self._traj_clients.values()
+            )
+            if all_traj_ok:
+                break
+            await asyncio.sleep(1.0)
+        else:
+            not_ready = [rn for rn, tc in self._traj_clients.items()
+                         if not tc.server_is_ready()]
+            return {"ok": False, "phase": "Phase 5/5",
+                    "message": f"Trajectory servers not ready: {not_ready}"}
+
+        # (Real mode) wait for robot programs
+        current_mode = self._read_current_mode()
+        if current_mode in ("real", "both"):
+            await _report("Phase 5/5", "Waiting for robot programs…")
+            phase6_deadline = min(time.monotonic() + 30.0, overall_deadline)
+            while time.monotonic() < phase6_deadline:
+                if all(self._robot_program_running.get(rn, False) for rn in ROBOT_CONFIG):
+                    break
+                await asyncio.sleep(0.5)
+
+        elapsed = time.monotonic() - switch_start
+        return {"ok": True, "phase": "Complete",
+                "message": f"ROS2 stack ready in {elapsed:.1f}s"}
+
+    async def _rpc_prepare_mode(self, params):
+        """Handle mode switching between simulation and real robot.
+
+        KEY DESIGN: The ROS2 sim stack is NEVER restarted.
+        It runs continuously for Foxglove visualization.
+
+        For 'real' mode we simply connect ur_rtde controllers as a
+        parallel control channel.  cuRobo plans the trajectory, and
+        RTDE streams it to the real robot at 500 Hz via servoJ.
+
+        For 'simulation' mode we disconnect RTDE and use the
+        FollowJointTrajectory action (fake hardware controllers).
+        """
+        mode = params.get("mode", "simulation")
+        self.get_logger().info(f"Preparing mode: {mode}")
+
+        if self._proto_sim_running:
+            return {
+                "success": False, "ready": False,
+                "message": "Cannot switch mode while a protocol is running",
+                "can_retry": True,
+            }
+
+        if mode in ("real", "both"):
+            if not RTDE_AVAILABLE:
+                return {
+                    "success": False, "ready": False,
+                    "message": "ur_rtde not installed — cannot use real mode",
+                    "can_retry": False,
+                }
+
+            # Connect RTDE controllers
+            connected = []
+            failed = []
+            for rn, rtde in self._rtde_controllers.items():
+                if rtde.is_connected:
+                    connected.append(rn)
+                    continue
+                self.get_logger().info(f"Connecting RTDE to {rn}...")
+                if rtde.connect():
+                    connected.append(rn)
+                else:
+                    failed.append(rn)
+
+            if failed:
+                return {
+                    "success": True, "ready": False,
+                    "message": (
+                        f"RTDE connected: {connected}, "
+                        f"failed: {failed}"
+                    ),
+                    "can_retry": True,
+                }
+
+            # Start publishing RTDE joint states to ROS for Foxglove
+            self._start_rtde_joint_state_publisher()
+
+            # Deactivate sim's joint_state_broadcaster so RTDE owns /joint_states
+            # (sim broadcasts at ~625Hz, drowning out RTDE's real readings)
+            self._set_sim_joint_state_broadcaster(active=False)
+
+            self._current_mode = mode
+            self.get_logger().info(
+                f"Real mode ready — RTDE connected to {connected}"
+            )
+            return {
+                "success": True, "ready": True,
+                "message": (
+                    f"Real mode ready — RTDE direct control on "
+                    f"{connected} (ROS2 sim stack kept for Foxglove)"
+                ),
+                "can_retry": False,
+            }
+
+        else:
+            # Simulation mode — disconnect any RTDE controllers
+            for rn, rtde in self._rtde_controllers.items():
+                if rtde.is_connected:
+                    rtde.disconnect()
+            self._stop_rtde_joint_state_publisher()
+
+            # Re-activate sim's joint_state_broadcaster for Foxglove viz
+            self._set_sim_joint_state_broadcaster(active=True)
+
+            self._current_mode = "simulation"
+            return {
+                "success": True, "ready": True,
+                "message": "Simulation mode ready (cuRobo backend)",
+                "can_retry": False,
+            }
+
+    async def _rpc_run_proto_sim(self, client, request_id, params):
+        """Multi-waypoint trajectory execution using cuRobo planning."""
+        robot_name = params.get("robot_name", list(ROBOT_CONFIG.keys())[0])
+        poses = params.get("poses", [])
+        idle_time = params.get("idle_time", 2.0)
+        mode = params.get("mode", "simulation")
+        requested_speed = params.get("move_speed", self.max_velocity_scaling)
+        move_speed = min(self.max_velocity_scaling, requested_speed)
+
+        if robot_name not in ROBOT_CONFIG:
+            await self._send_error(client, request_id, f"Unknown robot: {robot_name}")
+            return
+
+        if robot_name not in self._motion_gens:
+            await self._send_error(
+                client, request_id,
+                f"cuRobo not initialised for {robot_name}"
+            )
+            return
+
+        self._proto_sim_running = True
+        self._proto_sim_stop = False
+
+        cfg = ROBOT_CONFIG[robot_name]
+        total = len(poses)
+        go_home_before = params.get("go_home_before", False)
+        go_home_after = params.get("go_home_after", False)
+
+        try:
+            await self._run_proto_sim_inner(
+                client, request_id, robot_name, poses, idle_time,
+                mode, move_speed, cfg, total,
+                go_home_before=go_home_before,
+                go_home_after=go_home_after,
+            )
+        except websockets.ConnectionClosed:
+            self.get_logger().warn(
+                f"Client disconnected during proto_sim — aborting"
+            )
+            self._proto_sim_stop = True
+        except Exception as e:
+            self.get_logger().error(f"Proto-sim error: {e}")
+            traceback.print_exc()
+        finally:
+            self._proto_sim_running = False
+
+    async def _run_proto_sim_inner(
+        self, client, request_id, robot_name, poses, idle_time,
+        mode, move_speed, cfg, total,
+        go_home_before: bool = False, go_home_after: bool = False,
+    ):
+        """Inner implementation of proto_sim (separated for try/finally cleanup)."""
+        self.get_logger().info(
+            f"Proto-sim START (cuRobo): {total} poses on {robot_name} "
+            f"(mode={mode}, speed={move_speed}, idle={idle_time}s, "
+            f"home_before={go_home_before}, home_after={go_home_after})"
+        )
+
+        # Optionally move to home before poses
+        if go_home_before:
+            home = cfg["home_position"]
+            current = self._robot_states[robot_name].joint_positions
+            at_home = (current and len(current) == 6 and
+                       all(abs(current[i] - home[i]) < 0.05 for i in range(6)))
+
+            if mode in ("real", "both") and RTDE_AVAILABLE and robot_name in self._rtde_controllers:
+                rtde = self._rtde_controllers[robot_name]
+                if not rtde.is_connected:
+                    rtde.connect()
+                if rtde.is_connected:
+                    actual_q = rtde.get_actual_q()
+                    if actual_q:
+                        at_home = all(abs(actual_q[i] - home[i]) < 0.05 for i in range(6))
+
+            if not at_home:
+                self.get_logger().info(f"Moving {robot_name} to HOME…")
+                home_ok = await self._move_to_home(robot_name)
+                if not home_ok:
+                    self.get_logger().warn("Could not reach home")
+
+        # Plan multi-waypoint
+        await client.websocket.send(json.dumps({
+            "type": "rpc_feedback",
+            "request_id": request_id,
+            "current_pose_index": 0,
+            "total_poses": total,
+            "progress_percent": 0,
+            "status": "planning",
+            "message": f"Planning trajectory through {total} poses (cuRobo GPU)…",
+        }))
+
+        plan_result = await self._plan_multi_waypoint_trajectory(
+            robot_name, poses, velocity_scaling=move_speed, idle_time=idle_time,
+        )
+
+        if plan_result is None:
+            # Fall back to pose-by-pose
+            self.get_logger().warn("Multi-waypoint planning failed — fallback")
+            await self._rpc_run_proto_sim_legacy(
+                client, request_id, robot_name, poses,
+                idle_time, mode, move_speed, cfg, total,
+            )
+            return
+
+        trajectory, pose_times, valid_indices = plan_result
+        ik_failed = total - len(valid_indices)
+
+        pts = trajectory.joint_trajectory.points
+        total_dur = (
+            pts[-1].time_from_start.sec +
+            pts[-1].time_from_start.nanosec * 1e-9
+        ) if pts else 0.0
+
+        self.get_logger().info(
+            f"Executing unified trajectory: {len(pts)} points, "
+            f"duration={total_dur:.2f}s"
+        )
+
+        ready = await self._ensure_robot_ready(robot_name, timeout=15.0)
+        if not ready:
+            current_mode = self._read_current_mode()
+            if current_mode in ("real", "both"):
+                await self._send_error(
+                    client, request_id,
+                    f"Robot program not running on {robot_name}"
+                )
+                return
+
+        exec_timeout = max(total_dur * 2.0, 60.0)
+        exec_task = asyncio.ensure_future(
+            self._execute_trajectory(robot_name, trajectory, timeout=exec_timeout)
+        )
+
+        exec_start = time.monotonic()
+        pose_time_idx = 0
+        last_reported = -1
+
+        while not exec_task.done():
+            elapsed = time.monotonic() - exec_start
+            progress = min(elapsed / total_dur, 1.0) if total_dur > 0 else 1.0
+
+            while (pose_time_idx < len(pose_times) and
+                   elapsed >= pose_times[pose_time_idx][1]):
+                pi = pose_times[pose_time_idx][0]
+                if pi != last_reported:
+                    pose_name = poses[pi].get("name", f"pose_{pi}")
+                    await client.websocket.send(json.dumps({
+                        "type": "rpc_feedback",
+                        "request_id": request_id,
+                        "current_pose_index": pi,
+                        "total_poses": total,
+                        "current_pose_name": pose_name,
+                        "progress_percent": progress * 100,
+                        "status": "reached",
+                    }))
+                    self.get_logger().info(
+                        f"  [{pi+1}/{total}] ✓ passed {pose_name}"
+                    )
+                    last_reported = pi
+                pose_time_idx += 1
+
+            if self._proto_sim_stop:
+                self.get_logger().info("Proto-sim stop requested")
+                break
+
+            await asyncio.sleep(0.5)
+
+        try:
+            exec_ok = await asyncio.wait_for(
+                asyncio.shield(exec_task), timeout=10.0
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            exec_ok = False
+
+        completed = len(valid_indices) if exec_ok else 0
+        plan_failed = 0 if exec_ok else 1
+
+        # Optionally return home
+        if go_home_after and completed > 0 and not self._proto_sim_stop:
+            self.get_logger().info(f"Returning {robot_name} to home…")
+            await self._move_to_home(robot_name)
+
+        self._proto_sim_running = False
+
+        summary_parts = [f"Completed {completed}/{total} poses (cuRobo)"]
+        if ik_failed:
+            summary_parts.append(f"{ik_failed} IK failed")
+        if plan_failed:
+            summary_parts.append(f"trajectory execution failed")
+
+        hardware_issues = []
+        current_mode = self._read_current_mode()
+        if current_mode in ("real", "both"):
+            for rn in ROBOT_CONFIG:
+                if not self._robot_program_running.get(rn, False):
+                    hardware_issues.append(rn)
+        if hardware_issues:
+            summary_parts.append(
+                f"⚠ Hardware: {', '.join(hardware_issues)} disconnected"
+            )
+
+        summary = " | ".join(summary_parts)
+        self.get_logger().info(f"Proto-sim DONE: {summary}")
+
+        await client.websocket.send(json.dumps({
+            "type": "rpc_result",
+            "request_id": request_id,
+            "success": completed > 0,
+            "message": summary,
+            "completed": completed,
+            "collision_rejected": 0,
+            "ik_failed": ik_failed,
+            "real_failed": plan_failed,
+            "total": total,
+            "stopped": self._proto_sim_stop,
+            "hardware_issues": hardware_issues,
+        }))
+
+    async def _rpc_run_proto_sim_legacy(
+        self, client, request_id, robot_name, poses,
+        idle_time, mode, move_speed, cfg, total,
+    ):
+        """Legacy pose-by-pose execution fallback (using cuRobo per-pose)."""
+        completed = 0
+        ik_failed = 0
+        plan_failed = 0
+
+        self.get_logger().info("Running pose-by-pose execution (cuRobo fallback)")
+
+        for i, pose_data in enumerate(poses):
+            if self._proto_sim_stop:
+                break
+
+            pose_name = pose_data.get("name", f"pose_{i}")
+            position = pose_data.get("position", [0, 0, 0])
+            orientation = pose_data.get("orientation", [0, 0, 0, 1])
+
+            await client.websocket.send(json.dumps({
+                "type": "rpc_feedback",
+                "request_id": request_id,
+                "current_pose_index": i,
+                "total_poses": total,
+                "current_pose_name": pose_name,
+                "progress_percent": (i / total) * 100 if total > 0 else 0,
+                "status": "moving",
+            }))
+
+            result = await self._move_to_pose(
+                robot_name, position, orientation,
+                velocity_scaling=move_speed,
+            )
+
+            if result == "success":
+                completed += 1
+                self.get_logger().info(f"  [{i+1}/{total}] ✓ {pose_name}")
+                await asyncio.sleep(idle_time)
+            elif result == "plan_failed":
+                plan_failed += 1
+                self.get_logger().warn(f"  [{i+1}/{total}] ✗ plan failed {pose_name}")
+            elif result == "exec_failed":
+                plan_failed += 1
+                self.get_logger().error(f"  [{i+1}/{total}] ✗ exec failed {pose_name}")
+                if not self._robot_program_running.get(robot_name, False):
+                    current_mode = self._read_current_mode()
+                    if current_mode in ("real", "both"):
+                        break
+
+        if completed > 0 and not self._proto_sim_stop:
+            await self._move_to_home(robot_name)
+
+        self._proto_sim_running = False
+
+        summary = f"Completed {completed}/{total} poses (cuRobo legacy)"
+        hardware_issues = []
+        current_mode = self._read_current_mode()
+        if current_mode in ("real", "both"):
+            for rn in ROBOT_CONFIG:
+                if not self._robot_program_running.get(rn, False):
+                    hardware_issues.append(rn)
+
+        await client.websocket.send(json.dumps({
+            "type": "rpc_result",
+            "request_id": request_id,
+            "success": completed > 0,
+            "message": summary,
+            "completed": completed,
+            "collision_rejected": 0,
+            "ik_failed": ik_failed,
+            "real_failed": plan_failed,
+            "total": total,
+            "stopped": self._proto_sim_stop,
+            "hardware_issues": hardware_issues,
+        }))
+
+    async def _rpc_plan_motion(self, params):
+        rn = params.get("robot_name", list(ROBOT_CONFIG.keys())[0])
+        target = params.get("target_joints")
+        if not target or len(target) != 6:
+            return {"success": False, "error": "target_joints with 6 values required"}
+
+        result = await self._curobo_plan_to_joints(rn, target)
+        if result is None:
+            return {"success": False, "error": "Planning failed"}
+
+        traj = result.get_interpolated_plan()
+        return {
+            "success": True,
+            "waypoints": traj.position.shape[1],
+        }
+
+    # ─────────────────────────────────────────────────────────────────
+    # Utilities
+    # ─────────────────────────────────────────────────────────────────
+
+    async def _reply(self, client, rid, **kwargs):
+        await client.websocket.send(json.dumps({
+            "type": "response", "request_id": rid, **kwargs,
+        }))
+
+    async def _send_error(self, client, rid, error):
+        try:
+            await client.websocket.send(json.dumps({
+                "type": "error", "request_id": rid, "error": error,
+            }))
+        except Exception as e:
+            self.get_logger().error(f"Failed to send error: {e}")
+
+
+# ── Entry point ──────────────────────────────────────────────────
+
+
+async def main():
+    rclpy.init()
+
+    node = CommandGatewayNode()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+
+    await node.start_websocket_server()
+
+    loop = asyncio.get_event_loop()
+    ros_task = loop.run_in_executor(None, executor.spin)
+
+    try:
+        await asyncio.Future()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

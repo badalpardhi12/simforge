@@ -1,0 +1,32 @@
+# ── Docker build context exclusions ──────────────────────────
+# Keep the context small and fast.
+# Build context = simforge_server_nvidia/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Docker files (not needed inside image)
+docker-compose.yml
+.dockerignore
+
+# Backups & temp files
+*.bak
+*.orig
+*.tmp
+
+# README (not needed in image)
+README.md
