@@ -1122,6 +1122,8 @@ class ProtoSimClientFrame(wx.Frame):
                 "idle_time": params.idle_time,
                 "mode": mode,
                 "move_speed": move_speed,
+                "go_home_before": True,
+                "go_home_after": True,
             }, timeout=timeout)
             
             if response.get("success"):

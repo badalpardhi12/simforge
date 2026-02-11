@@ -36,6 +36,7 @@ class URRTDEController:
         self._recv = None
         self._connected = False
         self._recv_healthy = False  # tracks receive interface health
+        self.last_error: str = ""  # last error for callers to inspect
 
     # ── Connection ───────────────────────────────────────────────
 
@@ -205,6 +206,38 @@ class URRTDEController:
                     f"for {self.robot_name}: {e}"
                 )
             return False
+
+    # ── Safety state ─────────────────────────────────────────────
+
+    def is_protective_stopped(self) -> bool:
+        """Check if the robot is in a protective stop state."""
+        try:
+            if self._recv is not None and self._recv_healthy:
+                return self._recv.isProtectiveStopped()
+        except Exception:
+            pass
+        return False
+
+    def is_emergency_stopped(self) -> bool:
+        """Check if the robot is in an emergency stop state."""
+        try:
+            if self._recv is not None and self._recv_healthy:
+                return self._recv.isEmergencyStopped()
+        except Exception:
+            pass
+        return False
+
+    def get_robot_mode(self) -> int:
+        """Return the UR robot mode integer (-1 if unavailable).
+
+        7 = RUNNING (normal), 3 = POWER_OFF, 5 = IDLE, etc.
+        """
+        try:
+            if self._recv is not None and self._recv_healthy:
+                return self._recv.getRobotMode()
+        except Exception:
+            pass
+        return -1
 
     # ── Joint state reads ────────────────────────────────────────
 
@@ -430,16 +463,60 @@ class URRTDEController:
                     for j in range(6)
                 ]
 
-                # Guard against RTDE control interface dropping mid-stream.
-                # ur_rtde's internal auto-reconnect can race and segfault
-                # if we keep calling servoJ after the link is lost.
+                # ── Safety checks ──────────────────────────────────
+                # 1. Check for protective stop / e-stop via the receive
+                #    interface.  The control interface stays "connected"
+                #    during a protective stop — isConnected() returns
+                #    True — but the UR control script is dead, so every
+                #    servoJ call becomes a no-op that prints
+                #    "RTDE control script is not running!" in a tight
+                #    loop while the sim happily keeps advancing.
+                if si % cb_interval == 0:  # check at ~50 Hz, not 500 Hz
+                    try:
+                        if (self._recv is not None
+                                and self._recv.isProtectiveStopped()):
+                            msg = (
+                                f"PROTECTIVE STOP on {self.robot_name} "
+                                f"at cmd {si}/{n_servo} — aborting servoJ"
+                            )
+                            self.last_error = msg
+                            if logger:
+                                logger.error(msg)
+                            if position_callback:
+                                try:
+                                    position_callback(
+                                        self.robot_name, q_target)
+                                except Exception:
+                                    pass
+                            return False
+                        if (self._recv is not None
+                                and self._recv.isEmergencyStopped()):
+                            msg = (
+                                f"EMERGENCY STOP on {self.robot_name} "
+                                f"at cmd {si}/{n_servo} — aborting servoJ"
+                            )
+                            self.last_error = msg
+                            if logger:
+                                logger.error(msg)
+                            if position_callback:
+                                try:
+                                    position_callback(
+                                        self.robot_name, q_target)
+                                except Exception:
+                                    pass
+                            return False
+                    except Exception:
+                        pass  # recv died — fall through to isConnected
+
+                # 2. TCP-level disconnect check (link fully lost).
                 if not self._ctrl.isConnected():
+                    msg = (
+                        f"RTDE control interface lost during servoJ "
+                        f"on {self.robot_name} at cmd {si}/{n_servo}"
+                    )
+                    self.last_error = msg
                     if logger:
-                        logger.warn(
-                            f"RTDE control interface lost during servoJ "
-                            f"on {self.robot_name} at cmd {si}/{n_servo}"
-                        )
-                    # Publish the last target so the sim holds position
+                        logger.warn(msg)
                     if position_callback:
                         try:
                             position_callback(self.robot_name, q_target)
@@ -455,12 +532,14 @@ class URRTDEController:
                     )
                     self._ctrl.waitPeriod(t_start)
                 except Exception as servo_exc:
+                    msg = (
+                        f"RTDE servoJ exception on "
+                        f"{self.robot_name} at cmd {si}/{n_servo}: "
+                        f"{servo_exc}"
+                    )
+                    self.last_error = msg
                     if logger:
-                        logger.error(
-                            f"RTDE servoJ exception on "
-                            f"{self.robot_name} at cmd {si}/{n_servo}: "
-                            f"{servo_exc}"
-                        )
+                        logger.error(msg)
                     if position_callback:
                         try:
                             position_callback(self.robot_name, q_target)
@@ -510,6 +589,7 @@ class URRTDEController:
             # Reconnect receive interface (it dies during servoJ)
             self.reconnect_receive()
 
+            self.last_error = ""
             if logger:
                 logger.info(
                     f"RTDE servoJ complete for {self.robot_name} ✓"

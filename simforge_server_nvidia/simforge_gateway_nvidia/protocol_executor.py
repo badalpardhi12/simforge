@@ -341,6 +341,14 @@ class ProtocolExecutor:
             for rn in ROBOT_CONFIG:
                 if not prog.get(rn, False):
                     issues.append(rn)
+            # Also check RTDE controllers for protective / e-stop
+            for rn, rtde in self._executor._rtde.items():
+                if rtde.is_protective_stopped():
+                    issues.append(f"{rn}:PROTECTIVE_STOP")
+                elif rtde.is_emergency_stopped():
+                    issues.append(f"{rn}:EMERGENCY_STOP")
+                elif rtde.last_error:
+                    issues.append(f"{rn}:{rtde.last_error[:60]}")
         return issues
 
     async def _send_feedback(
