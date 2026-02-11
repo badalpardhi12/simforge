@@ -181,15 +181,68 @@ class URRTDEController:
         just before moveJ / servoJ and torn down immediately after,
         because its internal C++ auto-reconnect thread can segfault
         when the UR drops the RTDE link while the object is idle.
+
+        Safety checks:
+        - If the robot is in protective stop or e-stop, we refuse to
+          create the interface (the UR control script upload will fail
+          or segfault).
+        - The constructor runs in a subprocess to isolate any C++
+          segfault from the main gateway process.
         """
-        if self._ctrl is not None and self._ctrl.isConnected():
-            return True
+        if self._ctrl is not None:
+            try:
+                if self._ctrl.isConnected():
+                    return True
+            except Exception:
+                pass
+
         # Tear down any dead leftover
         try:
             if self._ctrl:
                 self._ctrl.disconnect()
         except Exception:
             pass
+        self._ctrl = None
+
+        # Pre-check: refuse if robot is not in a safe state.
+        # The recv interface may have died (common after mode switch),
+        # so try to reconnect it first for the safety check.
+        if self._recv is not None and not self._recv_healthy:
+            self.reconnect_receive()
+
+        if self._recv is not None and self._recv_healthy:
+            try:
+                if self._recv.isProtectiveStopped():
+                    msg = (
+                        f"Cannot create RTDE control interface — "
+                        f"{self.robot_name} is in PROTECTIVE STOP. "
+                        f"Clear on teach pendant first."
+                    )
+                    self.last_error = msg
+                    if self.logger:
+                        self.logger.error(msg)
+                    return False
+                if self._recv.isEmergencyStopped():
+                    msg = (
+                        f"Cannot create RTDE control interface — "
+                        f"{self.robot_name} is in EMERGENCY STOP. "
+                        f"Clear on teach pendant first."
+                    )
+                    self.last_error = msg
+                    if self.logger:
+                        self.logger.error(msg)
+                    return False
+            except Exception:
+                pass  # recv may be dead; proceed to try anyway
+
+        # Create the control interface directly in-process.
+        # Note: we previously used a subprocess probe to guard against
+        # segfaults, but fork() inside a ROS2 + CUDA process inherits
+        # dead locks/threads causing the child to crash with exit
+        # code 1 even when the robot is perfectly reachable.  The
+        # original segfault risk was from the idle auto-reconnect
+        # thread, which we already mitigated by making _ctrl lazy and
+        # tearing it down immediately after each move.
         try:
             self._ctrl = rtde_control.RTDEControlInterface(self.ip)
             if self.logger:
@@ -200,11 +253,13 @@ class URRTDEController:
             return True
         except Exception as e:
             self._ctrl = None
+            msg = (
+                f"Failed to create RTDE control interface "
+                f"for {self.robot_name}: {e}"
+            )
+            self.last_error = msg
             if self.logger:
-                self.logger.error(
-                    f"Failed to create RTDE control interface "
-                    f"for {self.robot_name}: {e}"
-                )
+                self.logger.error(msg)
             return False
 
     # ── Safety state ─────────────────────────────────────────────

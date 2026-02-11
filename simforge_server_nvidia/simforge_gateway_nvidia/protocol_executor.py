@@ -337,11 +337,9 @@ class ProtocolExecutor:
         issues = []
         mode = getattr(self._node, '_current_mode', 'simulation')
         if mode in ("real", "both"):
-            prog = getattr(self._node, '_robot_program_running', {})
-            for rn in ROBOT_CONFIG:
-                if not prog.get(rn, False):
-                    issues.append(rn)
-            # Also check RTDE controllers for protective / e-stop
+            # In RTDE mode we bypass the ROS2 UR driver, so
+            # _robot_program_running is irrelevant.  Check RTDE
+            # controllers directly for safety faults.
             for rn, rtde in self._executor._rtde.items():
                 if rtde.is_protective_stopped():
                     issues.append(f"{rn}:PROTECTIVE_STOP")
