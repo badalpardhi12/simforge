@@ -72,10 +72,25 @@ robot_cfg:
         - center: [0.0, 0.0, -0.03]
           radius: 0.04
       nakul_tool_base_link:
-        - center: [-0.065, 0.0, 0.02]
-          radius: 0.07
-        - center: [-0.12, 0.0, 0.02]
-          radius: 0.05
+        # iPhone tool collision box: 0.3 x 0.13 x 0.055 at
+        # origin (-0.065, 0, 0.02) rotated 90° around X.
+        # After rotation the effective extent in tool_base_link is:
+        #   X: [-0.215 … +0.085]  (0.30 m, along the tool length)
+        #   Y: [-0.028 … +0.028]  (0.055 m, thin side)
+        #   Z: [-0.045 … +0.085]  (0.13 m, wide side now vertical)
+        # Cover with 6 overlapping spheres along X, radius 0.065
+        - center: [0.085, 0.0, 0.02]
+          radius: 0.065
+        - center: [0.025, 0.0, 0.02]
+          radius: 0.065
+        - center: [-0.035, 0.0, 0.02]
+          radius: 0.065
+        - center: [-0.095, 0.0, 0.02]
+          radius: 0.065
+        - center: [-0.155, 0.0, 0.02]
+          radius: 0.065
+        - center: [-0.215, 0.0, 0.02]
+          radius: 0.065
 
     collision_sphere_buffer: 0.005
     extra_collision_spheres: {}
@@ -84,7 +99,7 @@ robot_cfg:
       nakul_upper_arm_link: ["nakul_forearm_link", "nakul_shoulder_link"]
       nakul_forearm_link: ["nakul_wrist_1_link", "nakul_wrist_2_link", "nakul_wrist_3_link"]
       nakul_wrist_1_link: ["nakul_wrist_2_link", "nakul_wrist_3_link"]
-      nakul_wrist_2_link: ["nakul_wrist_3_link"]
+      nakul_wrist_2_link: ["nakul_wrist_3_link", "nakul_tool_base_link"]
       nakul_wrist_3_link: ["nakul_tool_base_link"]
 
     self_collision_buffer:
