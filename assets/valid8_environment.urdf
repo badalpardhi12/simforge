@@ -72,7 +72,7 @@ Positions:
   <!-- Visual origin matches non_pii_face_valid8.urdf: xyz="0 -0.09 0" rpy="0 0 -1.57" -->
   <link name="face_link">
     <visual>
-      <origin xyz="0 -0.09 0" rpy="0 0 -3.14"/>
+      <origin xyz="0 -0.09 0" rpy="1.5708 0 -3.14"/>
       <geometry>
         <mesh filename="package://simforge_server/assets/non_pii_face/generix_human_head.stl" scale="0.001 0.001 0.001"/>
       </geometry>
@@ -328,7 +328,7 @@ Positions:
   <!-- Matches ur5e_with_iphone_tool.urdf: attach_pose=[-0.08, 0, 0, 0, 0, 0] from valid8_setup.yaml -->
   <link name="tool_base_link">
     <visual>
-      <origin xyz="0 0 0" rpy="0 0 3.14"/>
+      <origin xyz="0 0 0" rpy="1.5708 0 3.14"/>
       <geometry>
         <mesh filename="package://simforge_server/assets/tools/iphone.stl" scale="0.04 0.04 0.04"/>
       </geometry>
@@ -339,7 +339,7 @@ Positions:
     <collision>
       <origin xyz="-0.065 0 0.02" rpy="1.57 0 0"/>
       <geometry>
-        <box size="0.3 0.13 0.055"/>
+        <box size="0.3 0.13 0.08"/>
       </geometry>
     </collision>
     <inertial>

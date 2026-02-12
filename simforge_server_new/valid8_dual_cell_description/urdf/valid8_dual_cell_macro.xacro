@@ -80,7 +80,7 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
     <!-- ================================================================ -->
     <link name="face_link">
       <visual>
-        <origin xyz="0 -0.09 0" rpy="0 0 -3.14"/>
+        <origin xyz="0 -0.09 0" rpy="1.5708 0 -3.14"/>
         <geometry>
           <mesh filename="package://valid8_dual_cell_description/meshes/generix_human_head.stl" scale="0.001 0.001 0.001"/>
         </geometry>
@@ -168,7 +168,7 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
     <!-- ================================================================ -->
     <link name="nakul_tool_base_link">
       <visual>
-        <origin xyz="0 0 0" rpy="0 0 3.14"/>
+        <origin xyz="0 0 0" rpy="1.5708 0 3.14"/>
         <geometry>
           <mesh filename="package://valid8_dual_cell_description/meshes/iphone.stl" scale="0.04 0.04 0.04"/>
         </geometry>
@@ -179,7 +179,7 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
       <collision>
         <origin xyz="-0.065 0 0.02" rpy="1.5708 0 0"/>
         <geometry>
-          <box size="0.3 0.13 0.055"/>
+          <box size="0.3 0.13 0.08"/>
         </geometry>
       </collision>
       <inertial>
