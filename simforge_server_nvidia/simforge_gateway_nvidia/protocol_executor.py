@@ -94,6 +94,26 @@ class ProtocolExecutor:
         if go_home_before:
             await self._home_if_needed(robot_name, cfg, mode)
 
+        # ── Pre-flight: check robot is controllable ──────────────
+        # In real/both mode, verify the RTDE controller can actually
+        # create a control interface *before* spending time planning.
+        # If the robot program isn't running (mode != 7), moveJ and
+        # servoJ will both fail, so abort early with a clear message.
+        if mode in ("real", "both") and RTDE_AVAILABLE:
+            rtde = self._executor._rtde.get(robot_name)
+            if rtde is not None and rtde.last_error:
+                err = rtde.last_error
+                self._log.error(
+                    f"RTDE pre-flight failed for {robot_name}: {err}"
+                )
+                await self._send_error(
+                    client, request_id,
+                    f"Robot {robot_name} is not controllable: {err}. "
+                    f"Ensure the robot program is running on the "
+                    f"teach pendant."
+                )
+                return
+
         # ── Plan ─────────────────────────────────────────────────
         await self._send_feedback(client, request_id, 0, total, 0,
                                   "planning",
@@ -373,7 +393,8 @@ class ProtocolExecutor:
                 elif rtde.is_emergency_stopped():
                     issues.append(f"{rn}:EMERGENCY_STOP")
                 elif rtde.last_error:
-                    issues.append(f"{rn}:{rtde.last_error[:60]}")
+                    # Truncate the error to fit in the JSON result
+                    issues.append(f"{rn}:{rtde.last_error[:80]}")
         return issues
 
     async def _send_feedback(

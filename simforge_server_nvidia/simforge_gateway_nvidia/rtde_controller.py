@@ -174,6 +174,29 @@ class URRTDEController:
             and self._recv is not None
         )
 
+    def _teardown_ctrl(self) -> None:
+        """Forcibly tear down the RTDE control interface.
+
+        Calls stopScript() then disconnect() to kill the UR control
+        script *and* ur_rtde's internal C++ auto-reconnect thread.
+        Without stopScript(), disconnect() alone leaves the C++
+        reconnect thread alive — it will loop, reconnect, and hold
+        the RTDE input registers, causing the next
+        RTDEControlInterface constructor to fail with:
+          'One of the RTDE input registers are already in use!'
+        """
+        if self._ctrl is None:
+            return
+        try:
+            self._ctrl.stopScript()
+        except Exception:
+            pass
+        try:
+            self._ctrl.disconnect()
+        except Exception:
+            pass
+        self._ctrl = None
+
     def _ensure_ctrl(self) -> bool:
         """Create a fresh RTDEControlInterface on demand.
 
@@ -186,8 +209,8 @@ class URRTDEController:
         - If the robot is in protective stop or e-stop, we refuse to
           create the interface (the UR control script upload will fail
           or segfault).
-        - The constructor runs in a subprocess to isolate any C++
-          segfault from the main gateway process.
+        - If the robot mode is not RUNNING (7), we refuse — the UR
+          control script cannot execute without an active program.
         """
         if self._ctrl is not None:
             try:
@@ -196,13 +219,8 @@ class URRTDEController:
             except Exception:
                 pass
 
-        # Tear down any dead leftover
-        try:
-            if self._ctrl:
-                self._ctrl.disconnect()
-        except Exception:
-            pass
-        self._ctrl = None
+        # Tear down any dead leftover (stopScript + disconnect)
+        self._teardown_ctrl()
 
         # Pre-check: refuse if robot is not in a safe state.
         # The recv interface may have died (common after mode switch),
@@ -227,6 +245,28 @@ class URRTDEController:
                         f"Cannot create RTDE control interface — "
                         f"{self.robot_name} is in EMERGENCY STOP. "
                         f"Clear on teach pendant first."
+                    )
+                    self.last_error = msg
+                    if self.logger:
+                        self.logger.error(msg)
+                    return False
+            except Exception:
+                pass  # recv may be dead; proceed to try anyway
+
+            # Check robot mode: 7 = RUNNING (program active).
+            # Without a running program, the RTDEControlInterface
+            # constructor will upload a control script that immediately
+            # dies, triggering a reconnect storm that holds the RTDE
+            # input registers and blocks all future connections.
+            try:
+                robot_mode = self._recv.getRobotMode()
+                if robot_mode != 7:
+                    msg = (
+                        f"Cannot create RTDE control interface — "
+                        f"{self.robot_name} robot mode is "
+                        f"{robot_mode} (need 7/RUNNING). "
+                        f"Start the robot program on the teach "
+                        f"pendant first."
                     )
                     self.last_error = msg
                     if self.logger:
@@ -372,33 +412,28 @@ class URRTDEController:
                     self._ctrl.stopJ(2.0)
                 except Exception:
                     pass
+                self._teardown_ctrl()
                 return False
 
             if exc_holder[0]:
+                # moveJ threw — tear down before re-raising so the
+                # auto-reconnect thread doesn't linger and hold the
+                # RTDE input registers.
+                self._teardown_ctrl()
                 raise exc_holder[0]
 
-            # moveJ finished — disconnect the control interface to
+            # moveJ finished — tear down the control interface to
             # prevent ur_rtde's internal auto-reconnect from looping
             # (and eventually segfaulting) while the UR control script
             # is stopped.  A fresh interface will be created on demand.
-            try:
-                self._ctrl.disconnect()
-            except Exception:
-                pass
-            self._ctrl = None
+            self._teardown_ctrl()
 
             return result_holder[0]
 
         except Exception as e:
             if self.logger:
                 self.logger.error(f"RTDE moveJ failed: {e}")
-            # Also tear down the control interface on error
-            try:
-                if self._ctrl:
-                    self._ctrl.disconnect()
-            except Exception:
-                pass
-            self._ctrl = None
+            self._teardown_ctrl()
             return False
 
     # ── Trajectory streaming ─────────────────────────────────────
@@ -623,23 +658,8 @@ class URRTDEController:
                 pass
             _time.sleep(0.5)
 
-            # Stop the UR control script explicitly before disconnecting.
-            # This prevents ur_rtde's internal auto-reconnect from
-            # trying to re-upload the script and racing into a segfault.
-            try:
-                self._ctrl.stopScript()
-            except Exception:
-                pass
-
-            # Tear down the control interface — after servoStop the UR
-            # control script is no longer running, and ur_rtde's
-            # internal auto-reconnect will loop and can segfault.
-            # A fresh interface will be created on demand by move_j().
-            try:
-                self._ctrl.disconnect()
-            except Exception:
-                pass
-            self._ctrl = None
+            # Tear down the control interface (stopScript + disconnect)
+            self._teardown_ctrl()
 
             # Reconnect receive interface (it dies during servoJ)
             self.reconnect_receive()
@@ -660,17 +680,7 @@ class URRTDEController:
                 self._ctrl.servoStop()
             except Exception:
                 pass
-            try:
-                self._ctrl.stopScript()
-            except Exception:
-                pass
-            # Tear down control interface to prevent auto-reconnect loop
-            try:
-                if self._ctrl:
-                    self._ctrl.disconnect()
-            except Exception:
-                pass
-            self._ctrl = None
+            self._teardown_ctrl()
             # Still try to restore receive interface
             self.reconnect_receive()
             return False
