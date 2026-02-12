@@ -1170,7 +1170,8 @@ class ProtoSimClientFrame(wx.Frame):
                 self._log("  Protocol was stopped by user")
                 
         except Exception as e:
-            self._log(f"Protocol error: {e}")
+            error_str = str(e) if str(e) else repr(e)
+            self._log(f"Protocol error: {error_str}")
             import traceback
             self.logger.error(traceback.format_exc())
         finally:

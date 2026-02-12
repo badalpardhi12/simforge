@@ -450,14 +450,20 @@ class SimforgeClient:
     def _handle_error(self, msg: Dict[str, Any]):
         """Handle error message."""
         request_id = msg.get("request_id")
-        error_msg = msg.get("message", "Unknown error")
+        error_msg = msg.get("error", msg.get("message", "Unknown error"))
         
         logger.error(f"Server error: {error_msg}")
+        logger.debug(f"Raw error payload: {msg}")
         
         if request_id and request_id in self._pending_requests:
             future = self._pending_requests.pop(request_id)
             if not future.done():
                 future.set_exception(RuntimeError(error_msg))
+        elif request_id:
+            logger.warning(
+                f"Error for unknown request_id {request_id} "
+                f"(pending: {list(self._pending_requests.keys())})"
+            )
 
     def _notify_state_change(self):
         """Notify registered callbacks of state change."""

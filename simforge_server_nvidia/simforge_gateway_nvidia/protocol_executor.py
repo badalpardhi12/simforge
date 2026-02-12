@@ -74,6 +74,13 @@ class ProtocolExecutor:
         except Exception as e:
             self._log.error(f"Proto-sim error: {e}")
             traceback.print_exc()
+            try:
+                await self._send_error(
+                    client, request_id,
+                    f"Protocol execution failed: {e}",
+                )
+            except Exception:
+                pass  # client may have disconnected
         finally:
             self.running = False
 
@@ -92,7 +99,20 @@ class ProtocolExecutor:
 
         # ── Optional home-before ─────────────────────────────────
         if go_home_before:
-            await self._home_if_needed(robot_name, cfg, mode)
+            home_ok, home_err = await self._home_if_needed(
+                robot_name, cfg, mode,
+            )
+            if not home_ok:
+                self._log.error(
+                    f"Home-before failed for {robot_name}: {home_err}"
+                )
+                await self._send_error(
+                    client, request_id,
+                    f"Cannot move {robot_name} to home position: "
+                    f"{home_err}. Clear the fault on the teach pendant "
+                    f"and try again.",
+                )
+                return
 
         # ── Pre-flight: check robot is controllable ──────────────
         # In real/both mode, verify the RTDE controller can actually
@@ -243,7 +263,13 @@ class ProtocolExecutor:
         # ── Optional home-after ──────────────────────────────────
         if go_home_after and completed > 0 and not self.stop_requested:
             self._log.info(f"Returning {robot_name} to home…")
-            await self._executor.execute_home(robot_name)
+            home_ok, home_err = await self._home_if_needed(
+                robot_name, cfg, mode,
+            )
+            if not home_ok:
+                self._log.warn(
+                    f"Home-after failed for {robot_name}: {home_err}"
+                )
 
         self.running = False
 
@@ -355,6 +381,14 @@ class ProtocolExecutor:
     # ── Helpers ──────────────────────────────────────────────────
 
     async def _home_if_needed(self, robot_name, cfg, mode):
+        """Move the robot home if needed.
+
+        Returns
+        -------
+        (ok, error_msg) : tuple[bool, str]
+            ok=True if the robot is at home (or was moved there).
+            ok=False + error_msg if home move failed.
+        """
         home = cfg["home_position"]
         st = self._js_mgr.robot_states[robot_name]
         current = st.joint_positions
@@ -378,7 +412,15 @@ class ProtocolExecutor:
 
         if not at_home:
             self._log.info(f"Moving {robot_name} to HOME…")
-            await self._executor.execute_home(robot_name)
+            ok = await self._executor.execute_home(robot_name)
+            if not ok:
+                # Check for a descriptive error from the RTDE controller
+                err = ""
+                if (RTDE_AVAILABLE
+                        and robot_name in self._executor._rtde):
+                    err = self._executor._rtde[robot_name].last_error
+                return (False, err or "Home move failed (unknown reason)")
+        return (True, "")
 
     def _detect_hardware_issues(self):
         issues = []
