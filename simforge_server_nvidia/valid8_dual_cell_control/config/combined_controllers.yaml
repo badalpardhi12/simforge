@@ -1,10 +1,8 @@
 # Combined Controllers Configuration for Valid8 Dual Cell
 #
-# This file defines all ros2_control controllers for both robots:
-# - nakul_ur5e (prefix: nakul_)
-# - sahadev_ur5e (prefix: sahadev_)
-#
-# Based on Universal Robots ROS2 Dual Robot Tutorial
+# Defines ros2_control controllers for both robots:
+#   nakul_ur5e  (prefix: nakul_)
+#   sahadev_ur5e (prefix: sahadev_)
 
 controller_manager:
   ros__parameters:
@@ -27,15 +25,6 @@ controller_manager:
     nakul_scaled_joint_trajectory_controller:
       type: ur_controllers/ScaledJointTrajectoryController
 
-    nakul_joint_trajectory_controller:
-      type: joint_trajectory_controller/JointTrajectoryController
-
-    nakul_forward_position_controller:
-      type: position_controllers/JointGroupPositionController
-
-    nakul_passthrough_trajectory_controller:
-      type: ur_controllers/PassthroughTrajectoryController
-
     # ========== Sahadev Controllers ==========
     sahadev_io_and_status_controller:
       type: ur_controllers/GPIOController
@@ -48,15 +37,6 @@ controller_manager:
 
     sahadev_scaled_joint_trajectory_controller:
       type: ur_controllers/ScaledJointTrajectoryController
-
-    sahadev_joint_trajectory_controller:
-      type: joint_trajectory_controller/JointTrajectoryController
-
-    sahadev_forward_position_controller:
-      type: position_controllers/JointGroupPositionController
-
-    sahadev_passthrough_trajectory_controller:
-      type: ur_controllers/PassthroughTrajectoryController
 
 # ========== Nakul Scaled Joint Trajectory Controller ==========
 nakul_scaled_joint_trajectory_controller:
@@ -83,40 +63,6 @@ nakul_scaled_joint_trajectory_controller:
       stopped_velocity_tolerance: 0.5
       goal_time: 2.0
     speed_scaling_interface_name: nakul_speed_scaling/speed_scaling_factor
-
-# ========== Nakul Joint Trajectory Controller ==========
-nakul_joint_trajectory_controller:
-  ros__parameters:
-    joints:
-      - nakul_shoulder_pan_joint
-      - nakul_shoulder_lift_joint
-      - nakul_elbow_joint
-      - nakul_wrist_1_joint
-      - nakul_wrist_2_joint
-      - nakul_wrist_3_joint
-    command_interfaces:
-      - position
-    state_interfaces:
-      - position
-      - velocity
-    state_publish_rate: 100.0
-    action_monitor_rate: 20.0
-    allow_partial_joints_goal: false
-    allow_nonzero_velocity_at_trajectory_end: false
-    constraints:
-      stopped_velocity_tolerance: 0.2
-      goal_time: 0.0
-
-# ========== Nakul Forward Position Controller ==========
-nakul_forward_position_controller:
-  ros__parameters:
-    joints:
-      - nakul_shoulder_pan_joint
-      - nakul_shoulder_lift_joint
-      - nakul_elbow_joint
-      - nakul_wrist_1_joint
-      - nakul_wrist_2_joint
-      - nakul_wrist_3_joint
 
 # ========== Nakul IO and Status Controller ==========
 nakul_io_and_status_controller:
@@ -168,40 +114,6 @@ sahadev_scaled_joint_trajectory_controller:
       goal_time: 2.0
     speed_scaling_interface_name: sahadev_speed_scaling/speed_scaling_factor
 
-# ========== Sahadev Joint Trajectory Controller ==========
-sahadev_joint_trajectory_controller:
-  ros__parameters:
-    joints:
-      - sahadev_shoulder_pan_joint
-      - sahadev_shoulder_lift_joint
-      - sahadev_elbow_joint
-      - sahadev_wrist_1_joint
-      - sahadev_wrist_2_joint
-      - sahadev_wrist_3_joint
-    command_interfaces:
-      - position
-    state_interfaces:
-      - position
-      - velocity
-    state_publish_rate: 100.0
-    action_monitor_rate: 20.0
-    allow_partial_joints_goal: false
-    allow_nonzero_velocity_at_trajectory_end: false
-    constraints:
-      stopped_velocity_tolerance: 0.2
-      goal_time: 0.0
-
-# ========== Sahadev Forward Position Controller ==========
-sahadev_forward_position_controller:
-  ros__parameters:
-    joints:
-      - sahadev_shoulder_pan_joint
-      - sahadev_shoulder_lift_joint
-      - sahadev_elbow_joint
-      - sahadev_wrist_1_joint
-      - sahadev_wrist_2_joint
-      - sahadev_wrist_3_joint
-
 # ========== Sahadev IO and Status Controller ==========
 sahadev_io_and_status_controller:
   ros__parameters:
@@ -226,34 +138,3 @@ sahadev_force_torque_sensor_broadcaster:
       - torque.z
     frame_id: sahadev_tool0
 
-# ========== Nakul Passthrough Trajectory Controller ==========
-nakul_passthrough_trajectory_controller:
-  ros__parameters:
-    joints:
-      - nakul_shoulder_pan_joint
-      - nakul_shoulder_lift_joint
-      - nakul_elbow_joint
-      - nakul_wrist_1_joint
-      - nakul_wrist_2_joint
-      - nakul_wrist_3_joint
-    state_interfaces:
-      - position
-      - velocity
-    speed_scaling_interface_name: nakul_speed_scaling/speed_scaling_factor
-    tf_prefix: nakul_
-
-# ========== Sahadev Passthrough Trajectory Controller ==========
-sahadev_passthrough_trajectory_controller:
-  ros__parameters:
-    joints:
-      - sahadev_shoulder_pan_joint
-      - sahadev_shoulder_lift_joint
-      - sahadev_elbow_joint
-      - sahadev_wrist_1_joint
-      - sahadev_wrist_2_joint
-      - sahadev_wrist_3_joint
-    state_interfaces:
-      - position
-      - velocity
-    speed_scaling_interface_name: sahadev_speed_scaling/speed_scaling_factor
-    tf_prefix: sahadev_

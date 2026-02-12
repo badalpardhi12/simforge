@@ -5,11 +5,10 @@
   <name>simforge_gateway_nvidia</name>
   <version>1.0.0</version>
   <description>
-    WebSocket gateway for simforge client communication with ROS2,
-    using NVIDIA cuRobo for GPU-accelerated motion planning.
-    Replaces MoveIt2 with cuRobo MotionGen / IKSolver.
+    SimForge command gateway: WebSocket server with NVIDIA cuRobo
+    GPU-accelerated motion planning and ur_rtde real-robot control.
   </description>
-  <maintainer email="badal@example.com">Badal</maintainer>
+  <maintainer email="team@valid8.ai">Valid8 Team</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
@@ -23,7 +22,6 @@
   <depend>trajectory_msgs</depend>
   <depend>control_msgs</depend>
   <depend>tf2_ros</depend>
-  <!-- NOTE: no moveit_msgs dependency — cuRobo replaces MoveIt -->
 
   <exec_depend>python3-websockets</exec_depend>
   <exec_depend>python3-numpy</exec_depend>

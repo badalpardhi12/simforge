@@ -1,9 +1,8 @@
 """
 Direct RTDE Robot Controller.
 
-Bypasses the ROS2 control stack (UR driver, ros2_control,
-scaled_joint_trajectory_controller) and communicates directly with the
-UR controller via the RTDE protocol.
+Communicates with the UR controller via the RTDE protocol using
+the ur_rtde library, bypassing the ROS2 control stack.
 
 Key methods:
   - move_j()                    — blocking joint move (for homing)
@@ -52,11 +51,11 @@ class URRTDEController:
                     f"Connecting RTDE to {self.robot_name} at {self.ip}..."
                 )
             # Only create the *receive* interface here.
-            # The *control* interface (RTDEControlInterface) has an
-            # internal C++ auto-reconnect thread that segfaults when
-            # the UR controller drops the connection while the object
-            # is idle.  We create it on demand in _ensure_ctrl() and
-            # tear it down immediately after each move/servoJ.
+            # The *control* interface (RTDEControlInterface) is created
+            # on demand in _ensure_ctrl() and torn down immediately
+            # after each move/servoJ — its internal C++ auto-reconnect
+            # thread segfaults when the UR drops the connection while
+            # the object is idle.
             self._recv = rtde_receive.RTDEReceiveInterface(self.ip)
             self._connected = True
             self._recv_healthy = True
@@ -309,13 +308,6 @@ class URRTDEController:
             return False
 
         # Create the control interface directly in-process.
-        # Note: we previously used a subprocess probe to guard against
-        # segfaults, but fork() inside a ROS2 + CUDA process inherits
-        # dead locks/threads causing the child to crash with exit
-        # code 1 even when the robot is perfectly reachable.  The
-        # original segfault risk was from the idle auto-reconnect
-        # thread, which we already mitigated by making _ctrl lazy and
-        # tearing it down immediately after each move.
         try:
             self._ctrl = rtde_control.RTDEControlInterface(self.ip)
             if self.logger:

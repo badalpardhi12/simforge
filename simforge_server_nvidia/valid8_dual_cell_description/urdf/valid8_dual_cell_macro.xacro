@@ -198,7 +198,7 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
            generates Y-axis as the tool-forward direction, and this rotation
            maps tool_tip_link's frame so Y-axis aligns with the physical
            iPhone pointing direction. -->
-      <origin xyz="-0.08 0 0.05" rpy="1.57 0 0"/>
+      <origin xyz="-0.08 0 0.01" rpy="1.57 0 0"/>
       <parent link="nakul_wrist_3_link"/>
       <child link="nakul_tool_base_link"/>
     </joint>

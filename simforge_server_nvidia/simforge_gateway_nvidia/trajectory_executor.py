@@ -1,10 +1,9 @@
 """
-Trajectory Executor — dispatches trajectories to RTDE and/or ROS2.
+Trajectory Executor — dispatches trajectories to RTDE or ROS2.
 
 Handles:
-  • RTDE servoJ streaming (real robot)
+  • RTDE servoJ streaming (real robot, 500 Hz)
   • ROS2 FollowJointTrajectory action (simulation)
-  • Dual dispatch: send to RTDE *and* sim in parallel so Foxglove matches
 """
 
 import asyncio
@@ -175,16 +174,10 @@ class TrajectoryExecutor:
             f"(timestamps used for dwell support)"
         )
 
-        # In real mode, do NOT fire the sim trajectory.
-        # The position_callback at ~50 Hz publishes commanded positions
-        # directly to /joint_states, which is the sole source of truth.
-        # Sending the trajectory to the sim's FollowJointTrajectory causes
-        # the active scaled_joint_trajectory_controller to write positions
-        # into the fake hardware.  Even with joint_state_broadcaster
-        # deactivated, the controller's execution on fake hardware can
-        # cause /joint_states to jump between the sim-interpolated
-        # trajectory (starting from the old home position) and the real
-        # RTDE positions — producing the glitchy jumping effect.
+        # In real mode, position_callback publishes commanded positions
+        # to /joint_states at ~50 Hz.  Do NOT fire the sim trajectory
+        # in parallel — the active trajectory controller on fake
+        # hardware would fight with the RTDE-sourced positions.
 
         # Build position callback for real-time /joint_states
         pos_cb = None
@@ -208,28 +201,6 @@ class TrajectoryExecutor:
         )
 
         return result
-
-    def _start_sim_trajectory(self, robot_name, trajectory, total_dur):
-        """Optionally send the trajectory to the sim FollowJointTrajectory."""
-        try:
-            sim_client = self._traj_clients.get(robot_name)
-            if sim_client is not None and sim_client.server_is_ready():
-                self._log.info(
-                    f"Sending trajectory to sim for {robot_name} in parallel"
-                )
-                return asyncio.ensure_future(
-                    self._execute_ros2(
-                        robot_name, trajectory,
-                        timeout=max(total_dur * 2, 60.0),
-                    )
-                )
-            self._log.info(
-                "Sim trajectory action not available — "
-                "sim robot will not mirror real movement"
-            )
-        except Exception as e:
-            self._log.warn(f"Could not start sim trajectory: {e}")
-        return None
 
     # ── ROS2 FollowJointTrajectory execution ─────────────────────
 

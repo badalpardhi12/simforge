@@ -23,7 +23,6 @@
   <!-- ROS2 packages -->
   <depend>robot_state_publisher</depend>
   <depend>joint_state_publisher</depend>
-  <depend>joint_state_publisher_gui</depend>
   <depend>xacro</depend>
   <depend>urdf</depend>
   <depend>launch</depend>

@@ -10,8 +10,8 @@
 #   - ee_link is nakul_tool_tip_link (where the iPhone camera is)
 #   - base_link is nakul_base_link
 #   - Collision spheres include the iPhone tool
-#   - Joint velocity/acceleration limits match the existing
-#     joint_limits.yaml used by the old MoveIt server
+#   - Joint velocity/acceleration limits match the UR driver's
+#     joint_limits.yaml
 #
 # cuRobo uses collision spheres (not meshes) for fast GPU collision
 # checking.  Sphere coverage is derived from the UR5e link geometry.

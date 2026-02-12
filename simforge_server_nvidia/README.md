@@ -1,53 +1,52 @@
 # SimForge Server — NVIDIA cuRobo Backend
 
-GPU-accelerated motion planning for the Valid8 dual UR5e robot cell,
-using **NVIDIA cuRobo** as a drop-in replacement for MoveIt2.
+GPU-accelerated motion planning for the Valid8 dual UR5e robot cell
+using **NVIDIA cuRobo** for trajectory optimisation and collision-free
+path planning.
 
-## What Changed
+## Features
 
-| Component | MoveIt2 Version | cuRobo Version |
-|-----------|----------------|----------------|
-| Motion planning | OMPL (sampling) | cuRobo MotionGen (trajectory optimisation on GPU) |
-| IK solver | KDL / bio_ik | cuRobo IKSolver (batch IK on GPU) |
-| Collision checking | FCL (CPU) | Signed distance fields (GPU) |
-| Trajectory quality | Requires cosine-blended retiming (~260 lines) | Inherently smooth minimum-jerk trajectories |
-| Planning time | ~500 ms typical | ~30 ms typical |
-| Docker dependencies | `ros-humble-moveit`, OMPL, FCL | PyTorch, `nvidia-curobo` |
-| `move_group` node | Required | **Not used** |
-
-## What's Preserved
-
-- ✅ WebSocket protocol on port 8766 (100% client-compatible)
-- ✅ Foxglove Bridge on port 9090 (unchanged)
-- ✅ ros2_control + UR driver (unchanged)
-- ✅ TF2 transforms (unchanged)
-- ✅ Mode switching (sim ↔ real) via signal files
-- ✅ `FollowJointTrajectory` action for trajectory execution
+- **cuRobo MotionGen** — GPU-accelerated trajectory optimisation (~30 ms planning)
+- **cuRobo IKSolver** — batch inverse kinematics on GPU
+- **Signed-distance-field collision checking** on GPU
+- **Dual execution modes** — RTDE servoJ at 500 Hz (real) or
+  `FollowJointTrajectory` via ros2_control (sim)
+- **WebSocket protocol** on port 8766 (client-compatible with simforge_client)
+- **Foxglove Bridge** on port 9090 for visualisation
+- **Mode switching** (sim ↔ real) via signal files
 
 ## Directory Structure
 
 ```
 simforge_server_nvidia/
-├── CMakeLists.txt           # ROS2 ament_cmake package
+├── CMakeLists.txt
 ├── package.xml
-├── docker-compose.yml       # sim/prod profiles with GPU access
-├── config/
-│   ├── nakul_ur5e_curobo.yml   # cuRobo robot config (nakul)
-│   ├── sahadev_ur5e_curobo.yml # cuRobo robot config (sahadev)
-│   └── world_collision.yml     # Collision cuboids (table, floor, face)
+├── docker-compose.yml           # sim / prod profiles with GPU access
 ├── docker/
-│   ├── Dockerfile              # CUDA 12.2 + ROS2 Humble + cuRobo
+│   ├── Dockerfile               # CUDA 12.2 + ROS2 Humble + cuRobo + UR driver
 │   └── ros_entrypoint.sh
 ├── launch/
-│   ├── gateway.launch.py       # cuRobo gateway node
-│   ├── sim.launch.py           # Simulation bringup (no MoveIt)
-│   └── real.launch.py          # Real robot bringup (no MoveIt)
+│   ├── gateway.launch.py        # cuRobo gateway node
+│   ├── sim.launch.py            # ros2_control with mock hardware
+│   └── real.launch.py           # UR driver hardware interface
 ├── nodes/
-│   └── command_gateway_curobo_node.py  # Main gateway (~900 lines vs ~2800)
+│   └── command_gateway_curobo_node.py   # ROS2 node entry point
 ├── scripts/
-│   └── start_server.sh         # Supervisor (no move_group health check)
+│   └── start_server.sh          # Supervisor script
+├── simforge_gateway/
+│   ├── __init__.py
+│   ├── config.py                # Robot configs (joints, IPs, limits)
+│   ├── curobo_planner.py        # cuRobo MotionGen / IK wrapper
+│   ├── protocol_executor.py     # Pose-by-pose fallback executor
+│   ├── rpc_handlers.py          # WebSocket command dispatch
+│   ├── rtde_controller.py       # ur_rtde servoJ / freedrive / IO
+│   └── trajectory_executor.py   # Trajectory execution (sim + real)
+├── config/                      # cuRobo YAML configs
+│   ├── nakul_ur5e_curobo.yml
+│   ├── sahadev_ur5e_curobo.yml
+│   └── world_collision.yml
 └── tests/
-    └── test_curobo_gateway.py  # Automated sim→real test
+    └── test_curobo_gateway.py
 ```
 
 ## Quick Start
@@ -80,9 +79,7 @@ python tests/test_curobo_gateway.py --server <SERVER_IP>
 
 - NVIDIA GPU with CUDA 12.2+ support
 - NVIDIA Container Toolkit (`nvidia-container-toolkit`)
-- Tested on:
-  - NVIDIA RTX Pro 6000 (x86_64)
-  - NVIDIA Jetson Thor (aarch64 — use L4T base image variant)
+- Tested on NVIDIA RTX Pro 6000 (x86_64)
 
 ## Configuration
 
@@ -103,21 +100,24 @@ INTERPOLATION_DT=0.01   # 100 Hz waypoints (smoother)
 ## Architecture
 
 ```
-┌──────────────┐     WebSocket :8766     ┌────────────────────────┐
-│ simforge_     │ ◄──────────────────────►│ command_gateway_       │
-│ client (GUI)  │                         │ curobo_node.py         │
-└──────────────┘                         │                        │
-                                         │  ┌─────────────────┐   │
-┌──────────────┐     WebSocket :9090     │  │ cuRobo MotionGen│   │
-│ Foxglove     │ ◄──── foxglove_bridge   │  │ (GPU / CUDA)    │   │
-│ Studio       │                         │  └────────┬────────┘   │
-└──────────────┘                         │           │             │
-                                         │  FollowJointTrajectory │
-                                         │           │             │
-                                         └───────────┼─────────────┘
-                                                     │
-                                         ┌───────────▼─────────────┐
-                                         │ ros2_control_node       │
-                                         │ (UR driver / fake HW)   │
-                                         └─────────────────────────┘
+┌──────────────┐     WebSocket :8766     ┌──────────────────────────┐
+│ simforge_     │ ◄─────────────────────►│ command_gateway_curobo   │
+│ client (GUI)  │                        │                          │
+└──────────────┘                        │  rpc_handlers            │
+                                        │       │                   │
+┌──────────────┐     WebSocket :9090    │  curobo_planner (GPU)    │
+│ Foxglove     │ ◄── foxglove_bridge    │       │                   │
+│ Studio       │                        │  trajectory_executor     │
+└──────────────┘                        │    ┌──────┴──────┐        │
+                                        │    │             │        │
+                                        │  (sim)        (real)     │
+                                        └────┼─────────────┼────────┘
+                                             │             │
+                                     FollowJoint     ur_rtde servoJ
+                                     Trajectory       (500 Hz RTDE)
+                                             │
+                                   ┌─────────▼──────────┐
+                                   │ ros2_control_node   │
+                                   │ (UR driver / mock)  │
+                                   └────────────────────┘
 ```

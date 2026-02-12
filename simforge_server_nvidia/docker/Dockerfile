@@ -1,18 +1,13 @@
 # ──────────────────────────────────────────────────────────────
-# SimForge Server — NVIDIA cuRobo Backend  (self-contained)
+# SimForge Server — NVIDIA cuRobo Backend
 #
 # GPU-accelerated motion planning with NVIDIA cuRobo.
-# Replaces MoveIt2 entirely.
+# Real-robot control via ur_rtde (direct RTDE protocol).
+# Simulated control via ros2_control (mock hardware).
 #
-# Build context: simforge_server_nvidia/   (no external deps)
-#
-# Supports:
-#   - NVIDIA RTX Pro 6000 (x86_64)
-#   - NVIDIA Jetson Thor (aarch64 — use Dockerfile.l4t variant)
+# Build context: simforge_server_nvidia/
 #
 # Base: nvidia/cuda:12.8.0-devel-ubuntu22.04 + ROS2 Humble
-# Key additions: PyTorch, cuRobo (nvidia-curobo)
-# Key removals: MoveIt2 (not installed at all)
 # ──────────────────────────────────────────────────────────────
 
 FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
@@ -67,6 +62,12 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # ── UR Robot Driver + ros2_control ───────────────────────────
+# Required for:
+#   - ros2_control_node (fake hardware in sim, UR driver in real)
+#   - joint_state_broadcaster (/joint_states in sim mode)
+#   - scaled_joint_trajectory_controller (FollowJointTrajectory in sim)
+#   - controller_stopper_node (headless mode URScript re-send)
+#   - ur_description URDF macros
 RUN apt-get update && apt-get install -y \
     ros-humble-ur-robot-driver \
     ros-humble-ur-description \
@@ -93,10 +94,10 @@ RUN apt-get update && apt-get install -y \
 # Initialise rosdep
 RUN rosdep init || true && rosdep update
 
-# ── PyTorch (from main PyPI — includes CUDA 12.x + Blackwell sm_120) ─
+# ── PyTorch ──────────────────────────────────────────────────
 RUN pip3 install --no-cache-dir torch
 
-# ── NVIDIA cuRobo (from source — takes ~20 minutes) ─────────
+# ── NVIDIA cuRobo (from source) ─────────────────────────────
 RUN apt-get update && apt-get install -y git-lfs ninja-build && rm -rf /var/lib/apt/lists/*
 ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0+PTX"
 RUN git lfs install && \
@@ -121,10 +122,7 @@ RUN pip3 install --no-cache-dir \
 # ── Create workspace ────────────────────────────────────────
 WORKDIR /ros2_ws
 
-# ────────────────────────────────────────────────────────────
-# Source layers — ordered from least-to-most frequently changed
-# so that Docker layer caching works correctly.
-# ────────────────────────────────────────────────────────────
+# ── Source layers (ordered least→most frequently changed) ────
 
 # Layer 1 — Cell description / control (rarely change)
 COPY valid8_dual_cell_description /ros2_ws/src/valid8_dual_cell_description
@@ -161,7 +159,6 @@ ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
-# ── Ports ────────────────────────────────────────────────────
 # 9090 — Foxglove Bridge WebSocket
 # 8766 — cuRobo Command Gateway WebSocket
 EXPOSE 9090

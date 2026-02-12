@@ -1,14 +1,11 @@
 """
-Valid8 Dual Cell Bringup — Simulation Mode (NVIDIA cuRobo backend)
+Valid8 Dual Cell Bringup — Simulation Mode
 
 Launches:
- - Robot State Publisher with mock hardware
- - Controllers (ros2_control — same as MoveIt version)
+ - Robot State Publisher with mock hardware (ros2_control)
+ - Controllers (joint_state_broadcaster, trajectory controllers)
  - Foxglove Bridge for visualization (port 9090)
  - cuRobo Command Gateway (port 8766)
-
-NOT launched:
- - MoveIt2 move_group (replaced by cuRobo inside gateway)
 
 Usage:
   ros2 launch simforge_gateway_nvidia sim.launch.py
@@ -39,7 +36,7 @@ def generate_launch_description():
 
     use_sim_time = SetParameter(name='use_sim_time', value=False)
 
-    # ── Start robots with fake hardware (same as MoveIt version) ──
+    # ── Start robots with mock hardware (ros2_control) ──
     start_robots = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([

@@ -1,8 +1,8 @@
 """
-SimForge Gateway Launch File (NVIDIA cuRobo backend)
+SimForge Gateway Launch File
 
 Launches the command gateway WebSocket server with cuRobo GPU
-motion planning.  No MoveIt2 is started.
+motion planning.
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
@@ -36,8 +36,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'max_velocity_scaling',
             default_value='0.25',
-            description='Max velocity scaling factor (0.0-1.0). '
-                        'Maps to cuRobo time_dilation_factor (0.5 = 50%% max speed).',
+            description='Max velocity scaling factor (0.0-1.0).',
         ),
         DeclareLaunchArgument(
             'max_acceleration_scaling',

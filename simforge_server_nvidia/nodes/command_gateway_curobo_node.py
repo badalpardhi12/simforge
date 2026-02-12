@@ -8,8 +8,6 @@ Wires together the modular subsystems:
   • JointStateManager   — mode-aware /joint_states publishing
   • ProtocolExecutor    — multi-pose protocol execution
   • RPCHandlers         — WebSocket RPC implementations
-
-This file is ~300 lines (down from 2 700 in the monolith).
 """
 
 import asyncio

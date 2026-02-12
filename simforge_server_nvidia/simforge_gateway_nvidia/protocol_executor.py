@@ -155,7 +155,7 @@ class ProtocolExecutor:
             self._log.warn(
                 "Multi-waypoint planning failed — fallback"
             )
-            await self._run_legacy(
+            await self._run_pose_by_pose(
                 client, request_id, robot_name, poses,
                 idle_time, mode, move_speed, cfg, total,
             )
@@ -304,15 +304,15 @@ class ProtocolExecutor:
             "hardware_abort": hw_abort,
         }))
 
-    # ── Legacy fallback (pose-by-pose) ───────────────────────────
+    # ── Pose-by-pose fallback ─────────────────────────────────────
 
-    async def _run_legacy(
+    async def _run_pose_by_pose(
         self, client, request_id, robot_name, poses,
         idle_time, mode, move_speed, cfg, total,
     ):
         """Pose-by-pose cuRobo fallback."""
         completed, ik_failed, plan_failed = 0, 0, 0
-        self._log.info("Running pose-by-pose execution (cuRobo fallback)")
+        self._log.info("Running pose-by-pose execution (fallback)")
 
         for i, pose_data in enumerate(poses):
             if self.stop_requested:
@@ -361,7 +361,7 @@ class ProtocolExecutor:
                 )
 
         self.running = False
-        summary = f"Completed {completed}/{total} poses (cuRobo legacy)"
+        summary = f"Completed {completed}/{total} poses (pose-by-pose fallback)"
         hardware_issues = self._detect_hardware_issues()
 
         await client.websocket.send(json.dumps({

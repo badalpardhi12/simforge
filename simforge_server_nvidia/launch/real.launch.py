@@ -1,14 +1,11 @@
 """
-Valid8 Dual Cell Bringup — Real Robot Mode (NVIDIA cuRobo backend)
+Valid8 Dual Cell Bringup — Real Robot Mode
 
 Launches:
  - Robot State Publisher with real hardware (UR driver)
  - Controllers (ros2_control with UR driver)
  - Foxglove Bridge for visualization (port 9090)
  - cuRobo Command Gateway (port 8766, delayed 8 s for startup)
-
-NOT launched:
- - MoveIt2 move_group (replaced by cuRobo inside gateway)
 
 Usage:
   ros2 launch simforge_gateway_nvidia real.launch.py

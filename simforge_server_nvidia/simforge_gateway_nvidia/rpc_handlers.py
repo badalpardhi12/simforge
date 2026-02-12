@@ -1,8 +1,7 @@
 """
 RPC Handlers — one method per WebSocket RPC.
 
-Extracted from the monolithic gateway so each handler is testable
-and readable in isolation.
+Each handler is independently testable.
 """
 
 import asyncio

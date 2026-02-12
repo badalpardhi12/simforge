@@ -2,14 +2,9 @@
 # ──────────────────────────────────────────────────────────────
 # SimForge Server Startup Script — NVIDIA cuRobo Backend
 #
-# Starts the ROS2 stack (robots + controllers + Foxglove)
-# in a managed subprocess, and then starts the cuRobo Command
-# Gateway node independently.
-#
-# KEY DIFFERENCE from MoveIt version:
-#   - MoveIt move_group is NOT launched or health-checked
-#   - cuRobo initialisation happens INSIDE the gateway node
-#   - Health check only requires joint_states + robot_description
+# Starts the ROS2 stack (robot_state_publisher + controllers +
+# Foxglove Bridge) in a managed subprocess, then starts the
+# cuRobo Command Gateway node independently.
 #
 # Usage (inside Docker):
 #   /start_server.sh [--sim|--real]
@@ -41,11 +36,10 @@ get_hardware_flag() {
 }
 
 # ── Wait for ROS2 topics to be actively publishing ──
-# NOTE: NO move_group check — cuRobo replaces MoveIt
 wait_for_stack_health() {
     local max_wait=60
     local elapsed=0
-    echo "Waiting for ROS2 stack to become healthy (cuRobo mode)..."
+    echo "Waiting for ROS2 stack to become healthy..."
 
     while [ $elapsed -lt $max_wait ]; do
         # Check if /joint_states has publishers
@@ -60,7 +54,7 @@ wait_for_stack_health() {
 
         if [ "$JS_PUBS" -gt 0 ] 2>/dev/null && \
            [ "$RD_PUBS" -gt 0 ] 2>/dev/null; then
-            echo "ROS2 stack is healthy! (no MoveIt — cuRobo runs inside gateway)"
+            echo "ROS2 stack is healthy!"
             return 0
         fi
 
@@ -76,7 +70,7 @@ wait_for_stack_health() {
 start_ros_stack() {
     local use_fake="$1"
     echo "============================================"
-    echo "Starting ROS2 stack — cuRobo backend"
+    echo "Starting ROS2 stack"
     echo "  use_fake_hardware=${use_fake}"
     echo "  Nakul IP:   $NAKUL_IP"
     echo "  Sahadev IP: $SAHADEV_IP"
@@ -137,7 +131,6 @@ stop_ros_stack() {
         pkill -f "foxglove_bridge" 2>/dev/null || true
         pkill -f "controller_stopper_node" 2>/dev/null || true
         pkill -f "urscript_interface" 2>/dev/null || true
-        # NOTE: no pkill for move_group — cuRobo replaces it
         sleep 3
         echo "ROS2 stack stopped"
     fi
@@ -176,7 +169,7 @@ GATEWAY_PID=$!
 echo "Gateway PID: $GATEWAY_PID"
 
 # ── Main loop: watch for mode switch requests ──
-echo "Server running (cuRobo backend). Watching for mode switch requests..."
+echo "Server running. Watching for mode switch requests..."
 while true; do
     if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
         echo "Gateway process died, exiting..."

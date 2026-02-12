@@ -33,7 +33,7 @@ if CUROBO_AVAILABLE:
 import numpy as np
 
 
-# ── Trajectory wrapper (avoids moveit_msgs dependency) ───────────
+# ── Trajectory wrapper ───────────────────────────────────────────────
 
 class TrajectoryWrapper:
     """Minimal container that mimics RobotTrajectory."""
