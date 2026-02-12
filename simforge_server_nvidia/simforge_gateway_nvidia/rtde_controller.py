@@ -561,7 +561,12 @@ class URRTDEController:
                 if stop_check_fn and stop_check_fn():
                     if logger:
                         logger.info("RTDE servoJ aborted by stop request")
-                    self._ctrl.servoStop()
+                    try:
+                        self._ctrl.servoStop()
+                    except Exception:
+                        pass
+                    self._teardown_ctrl()
+                    self.reconnect_receive()
                     return False
 
                 t = si * servo_dt
@@ -617,12 +622,31 @@ class URRTDEController:
                             self.last_error = msg
                             if logger:
                                 logger.error(msg)
+                            self._teardown_ctrl()
+                            self.reconnect_receive()
                             return False
                     except Exception:
-                        pass  # ctrl itself is dead; fall through
+                        # ctrl itself is dead — tear it down immediately
+                        # to prevent the C++ auto-reconnect thread from
+                        # looping and eventually segfaulting.
+                        msg = (
+                            f"RTDE control interface dead during "
+                            f"servoJ safety check on {self.robot_name} "
+                            f"at cmd {si}/{n_servo}"
+                        )
+                        self.last_error = msg
+                        if logger:
+                            logger.error(msg)
+                        self._teardown_ctrl()
+                        self.reconnect_receive()
+                        return False
 
                 # TCP-level disconnect check (link fully lost).
-                if not self._ctrl.isConnected():
+                try:
+                    ctrl_connected = self._ctrl.isConnected()
+                except Exception:
+                    ctrl_connected = False
+                if not ctrl_connected:
                     msg = (
                         f"RTDE control interface lost during servoJ "
                         f"on {self.robot_name} at cmd {si}/{n_servo}"
@@ -630,6 +654,8 @@ class URRTDEController:
                     self.last_error = msg
                     if logger:
                         logger.warn(msg)
+                    self._teardown_ctrl()
+                    self.reconnect_receive()
                     return False
 
                 try:
@@ -648,6 +674,8 @@ class URRTDEController:
                     self.last_error = msg
                     if logger:
                         logger.error(msg)
+                    self._teardown_ctrl()
+                    self.reconnect_receive()
                     return False
 
                 # servoJ returns False when the control script is dead
@@ -660,6 +688,8 @@ class URRTDEController:
                     self.last_error = msg
                     if logger:
                         logger.error(msg)
+                    self._teardown_ctrl()
+                    self.reconnect_receive()
                     return False
 
                 # Publish commanded position at ~50 Hz
