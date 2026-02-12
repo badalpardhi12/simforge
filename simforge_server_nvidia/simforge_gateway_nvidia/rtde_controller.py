@@ -211,6 +211,9 @@ class URRTDEController:
           or segfault).
         - If the robot mode is not RUNNING (7), we refuse — the UR
           control script cannot execute without an active program.
+        - If the recv interface is dead and we cannot verify the robot
+          state, we refuse — creating the control interface blindly
+          can segfault the process.
         """
         if self._ctrl is not None:
             try:
@@ -228,52 +231,82 @@ class URRTDEController:
         if self._recv is not None and not self._recv_healthy:
             self.reconnect_receive()
 
-        if self._recv is not None and self._recv_healthy:
-            try:
-                if self._recv.isProtectiveStopped():
-                    msg = (
-                        f"Cannot create RTDE control interface — "
-                        f"{self.robot_name} is in PROTECTIVE STOP. "
-                        f"Clear on teach pendant first."
-                    )
-                    self.last_error = msg
-                    if self.logger:
-                        self.logger.error(msg)
-                    return False
-                if self._recv.isEmergencyStopped():
-                    msg = (
-                        f"Cannot create RTDE control interface — "
-                        f"{self.robot_name} is in EMERGENCY STOP. "
-                        f"Clear on teach pendant first."
-                    )
-                    self.last_error = msg
-                    if self.logger:
-                        self.logger.error(msg)
-                    return False
-            except Exception:
-                pass  # recv may be dead; proceed to try anyway
+        # If recv is still dead after reconnect attempt, we CANNOT
+        # verify the robot state.  Refuse to create the control
+        # interface — the RTDEControlInterface constructor can segfault
+        # when the robot program is not running, and without recv we
+        # have no way to check.
+        if self._recv is None or not self._recv_healthy:
+            msg = (
+                f"Cannot create RTDE control interface — "
+                f"{self.robot_name} receive interface is dead "
+                f"(cannot verify robot state). Reconnect first."
+            )
+            self.last_error = msg
+            if self.logger:
+                self.logger.error(msg)
+            return False
 
-            # Check robot mode: 7 = RUNNING (program active).
-            # Without a running program, the RTDEControlInterface
-            # constructor will upload a control script that immediately
-            # dies, triggering a reconnect storm that holds the RTDE
-            # input registers and blocks all future connections.
-            try:
-                robot_mode = self._recv.getRobotMode()
-                if robot_mode != 7:
-                    msg = (
-                        f"Cannot create RTDE control interface — "
-                        f"{self.robot_name} robot mode is "
-                        f"{robot_mode} (need 7/RUNNING). "
-                        f"Start the robot program on the teach "
-                        f"pendant first."
-                    )
-                    self.last_error = msg
-                    if self.logger:
-                        self.logger.error(msg)
-                    return False
-            except Exception:
-                pass  # recv may be dead; proceed to try anyway
+        # recv is healthy — run safety checks
+        try:
+            if self._recv.isProtectiveStopped():
+                msg = (
+                    f"Cannot create RTDE control interface — "
+                    f"{self.robot_name} is in PROTECTIVE STOP. "
+                    f"Clear on teach pendant first."
+                )
+                self.last_error = msg
+                if self.logger:
+                    self.logger.error(msg)
+                return False
+            if self._recv.isEmergencyStopped():
+                msg = (
+                    f"Cannot create RTDE control interface — "
+                    f"{self.robot_name} is in EMERGENCY STOP. "
+                    f"Clear on teach pendant first."
+                )
+                self.last_error = msg
+                if self.logger:
+                    self.logger.error(msg)
+                return False
+        except Exception as e:
+            msg = (
+                f"Cannot create RTDE control interface — "
+                f"{self.robot_name} safety check failed: {e}"
+            )
+            self.last_error = msg
+            if self.logger:
+                self.logger.error(msg)
+            return False
+
+        # Check robot mode: 7 = RUNNING (program active).
+        # Without a running program, the RTDEControlInterface
+        # constructor will upload a control script that immediately
+        # dies, triggering a reconnect storm that holds the RTDE
+        # input registers and blocks all future connections.
+        try:
+            robot_mode = self._recv.getRobotMode()
+            if robot_mode != 7:
+                msg = (
+                    f"Cannot create RTDE control interface — "
+                    f"{self.robot_name} robot mode is "
+                    f"{robot_mode} (need 7/RUNNING). "
+                    f"Start the robot program on the teach "
+                    f"pendant first."
+                )
+                self.last_error = msg
+                if self.logger:
+                    self.logger.error(msg)
+                return False
+        except Exception as e:
+            msg = (
+                f"Cannot create RTDE control interface — "
+                f"{self.robot_name} mode check failed: {e}"
+            )
+            self.last_error = msg
+            if self.logger:
+                self.logger.error(msg)
+            return False
 
         # Create the control interface directly in-process.
         # Note: we previously used a subprocess probe to guard against
