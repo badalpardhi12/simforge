@@ -72,44 +72,50 @@ robot_cfg:
         - center: [0.0, 0.0, -0.03]
           radius: 0.04
       nakul_tool_base_link:
-        # iPhone tool collision box in tool_base_link frame (NO rotation):
+        # iPhone tool collision box in tool_base_link frame:
         #   size: 0.3 x 0.13 x 0.055
-        #   origin: (-0.065, 0, 0.02), rpy=(0, 0, 0)
-        # Effective extents:
-        #   X: [-0.215 … +0.085]  (0.30 m, along the tool length)
-        #   Y: [-0.065 … +0.065]  (0.13 m, WIDE dimension)
-        #   Z: [-0.008 … +0.048]  (0.055 m, thin)
+        #   origin: (-0.065, 0, 0.02), rpy=(1.5708, 0, 0)
         #
-        # Two rows of spheres (Y=+0.03 and Y=-0.03) along X with
-        # radius=0.065 → each sphere covers ±0.065 from its center,
-        # giving Y coverage ≈ [-0.095, +0.095] (≥30 mm margin).
-        # X coverage: 6 spheres from X=+0.085 to X=-0.215.
-        # Z center at 0.02 (box centroid).
-        # Row 1: Y = +0.03
-        - center: [0.085, 0.03, 0.02]
+        # The 90° X rotation swaps Y and Z of the box:
+        #   X: 0.30 m  (along the tool arm)       — unchanged
+        #   Y: 0.055 m (phone thickness)           — THIN dimension
+        #   Z: 0.13 m  (phone width)               — WIDE dimension
+        #
+        # Effective extents in tool_base_link:
+        #   X: [-0.215 … +0.085]  (0.30 m)
+        #   Y: [-0.008 … +0.048]  (0.055 m, thin — centered on y≈0.02)
+        #   Z: [-0.045 … +0.085]  (0.13 m, WIDE)
+        #
+        # Two rows of spheres along Z (wide dimension) at Z=+0.05
+        # and Z=-0.01 with radius=0.065.  Each sphere covers ±0.065
+        # from its center → Z coverage ≈ [-0.075, +0.115] (≥30 mm margin).
+        # X: 6 spheres from +0.085 to -0.215.
+        # Y: single plane at Y=0.0 (box centroid Y=0).
+        # Row 1: Z = +0.05
+        - center: [0.085, 0.0, 0.05]
           radius: 0.065
-        - center: [0.025, 0.03, 0.02]
+        - center: [0.025, 0.0, 0.05]
           radius: 0.065
-        - center: [-0.035, 0.03, 0.02]
+        - center: [-0.035, 0.0, 0.05]
           radius: 0.065
-        - center: [-0.095, 0.03, 0.02]
+        - center: [-0.095, 0.0, 0.05]
           radius: 0.065
-        - center: [-0.155, 0.03, 0.02]
+        - center: [-0.155, 0.0, 0.05]
           radius: 0.065
-        - center: [-0.215, 0.03, 0.02]
+        - center: [-0.215, 0.0, 0.05]
           radius: 0.065
-        # Row 2: Y = -0.03
-        - center: [0.085, -0.03, 0.02]
+        # Row 2: Z = -0.01
+        - center: [0.085, 0.0, -0.01]
           radius: 0.065
-        - center: [0.025, -0.03, 0.02]
+        - center: [0.025, 0.0, -0.01]
           radius: 0.065
-        - center: [-0.035, -0.03, 0.02]
+        - center: [-0.035, 0.0, -0.01]
           radius: 0.065
-        - center: [-0.095, -0.03, 0.02]
+        - center: [-0.095, 0.0, -0.01]
           radius: 0.065
-        - center: [-0.155, -0.03, 0.02]
+        - center: [-0.155, 0.0, -0.01]
           radius: 0.065
-        - center: [-0.215, -0.03, 0.02]
+        - center: [-0.215, 0.0, -0.01]
           radius: 0.065
 
     collision_sphere_buffer: 0.005
@@ -128,7 +134,7 @@ robot_cfg:
       nakul_wrist_1_link: 0
       nakul_wrist_2_link: 0
       nakul_wrist_3_link: 0
-      nakul_tool_base_link: 0
+      nakul_tool_base_link: 0.01
 
     use_global_cumul: True
     mesh_link_names: null

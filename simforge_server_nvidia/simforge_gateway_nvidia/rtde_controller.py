@@ -554,51 +554,41 @@ class URRTDEController:
                 ]
 
                 # ── Safety checks ──────────────────────────────────
-                # 1. Check for protective stop / e-stop via the receive
-                #    interface.  The control interface stays "connected"
-                #    during a protective stop — isConnected() returns
-                #    True — but the UR control script is dead, so every
-                #    servoJ call becomes a no-op that prints
-                #    "RTDE control script is not running!" in a tight
-                #    loop while the sim happily keeps advancing.
+                # Check for protective stop / e-stop / script death.
+                #
+                # The recv interface is usually dead during servoJ
+                # (marked unhealthy + EOF errors), so we cannot rely
+                # on it.  Instead use the CONTROL interface's
+                # isProgramRunning() — this returns False when the UR
+                # control script dies (e.g. protective stop).  Also
+                # check the servoJ return value below.
                 if si % cb_interval == 0:  # check at ~50 Hz, not 500 Hz
+                    # Primary check: is the UR control script alive?
                     try:
-                        if (self._recv is not None
-                                and self._recv.isProtectiveStopped()):
+                        if not self._ctrl.isProgramRunning():
+                            # Script died — determine why
+                            reason = "PROGRAM STOPPED"
+                            try:
+                                if (self._recv is not None
+                                        and self._recv.isProtectiveStopped()):
+                                    reason = "PROTECTIVE STOP"
+                                elif (self._recv is not None
+                                        and self._recv.isEmergencyStopped()):
+                                    reason = "EMERGENCY STOP"
+                            except Exception:
+                                pass  # recv dead; we still know script died
                             msg = (
-                                f"PROTECTIVE STOP on {self.robot_name} "
+                                f"{reason} on {self.robot_name} "
                                 f"at cmd {si}/{n_servo} — aborting servoJ"
                             )
                             self.last_error = msg
                             if logger:
                                 logger.error(msg)
-                            if position_callback:
-                                try:
-                                    position_callback(
-                                        self.robot_name, q_target)
-                                except Exception:
-                                    pass
-                            return False
-                        if (self._recv is not None
-                                and self._recv.isEmergencyStopped()):
-                            msg = (
-                                f"EMERGENCY STOP on {self.robot_name} "
-                                f"at cmd {si}/{n_servo} — aborting servoJ"
-                            )
-                            self.last_error = msg
-                            if logger:
-                                logger.error(msg)
-                            if position_callback:
-                                try:
-                                    position_callback(
-                                        self.robot_name, q_target)
-                                except Exception:
-                                    pass
                             return False
                     except Exception:
-                        pass  # recv died — fall through to isConnected
+                        pass  # ctrl itself is dead; fall through
 
-                # 2. TCP-level disconnect check (link fully lost).
+                # TCP-level disconnect check (link fully lost).
                 if not self._ctrl.isConnected():
                     msg = (
                         f"RTDE control interface lost during servoJ "
@@ -607,16 +597,11 @@ class URRTDEController:
                     self.last_error = msg
                     if logger:
                         logger.warn(msg)
-                    if position_callback:
-                        try:
-                            position_callback(self.robot_name, q_target)
-                        except Exception:
-                            pass
                     return False
 
                 try:
                     t_start = self._ctrl.initPeriod()
-                    self._ctrl.servoJ(
+                    servo_ok = self._ctrl.servoJ(
                         q_target, 0.0, 0.0, servo_dt,
                         lookahead_time, gain,
                     )
@@ -630,11 +615,18 @@ class URRTDEController:
                     self.last_error = msg
                     if logger:
                         logger.error(msg)
-                    if position_callback:
-                        try:
-                            position_callback(self.robot_name, q_target)
-                        except Exception:
-                            pass
+                    return False
+
+                # servoJ returns False when the control script is dead
+                if not servo_ok:
+                    msg = (
+                        f"servoJ returned False on {self.robot_name} "
+                        f"at cmd {si}/{n_servo} — UR control script "
+                        f"not running (likely protective stop)"
+                    )
+                    self.last_error = msg
+                    if logger:
+                        logger.error(msg)
                     return False
 
                 # Publish commanded position at ~50 Hz
