@@ -158,10 +158,32 @@ class ProtocolExecutor:
         exec_start = time.monotonic()
         pose_time_idx = 0
         last_reported = -1
+        hw_abort = False  # set True when we detect a protective/e-stop
 
         while not exec_task.done():
             elapsed = time.monotonic() - exec_start
             progress = min(elapsed / total_dur, 1.0) if total_dur > 0 else 1.0
+
+            # ── Check for hardware faults every iteration (~2 Hz) ──
+            hw_issues_mid = self._detect_hardware_issues()
+            if hw_issues_mid:
+                hw_abort = True
+                self._log.error(
+                    f"Hardware fault during execution: "
+                    f"{', '.join(hw_issues_mid)} — stopping"
+                )
+                # Send immediate error feedback so the client knows NOW
+                await self._send_feedback(
+                    client, request_id,
+                    last_reported if last_reported >= 0 else 0,
+                    total, progress * 100, "error",
+                    message=(
+                        f"⚠ HARDWARE FAULT: {', '.join(hw_issues_mid)}. "
+                        f"Robot stopped — aborting protocol."
+                    ),
+                )
+                self.stop_requested = True
+                break
 
             while (pose_time_idx < len(pose_times)
                    and elapsed >= pose_times[pose_time_idx][1]):
@@ -191,6 +213,10 @@ class ProtocolExecutor:
         except (asyncio.TimeoutError, asyncio.CancelledError):
             exec_ok = False
 
+        # If hardware aborted, force exec_ok = False regardless
+        if hw_abort:
+            exec_ok = False
+
         completed = len(valid_indices) if exec_ok else 0
         plan_failed = 0 if exec_ok else 1
 
@@ -211,7 +237,7 @@ class ProtocolExecutor:
         hardware_issues = self._detect_hardware_issues()
         if hardware_issues:
             summary_parts.append(
-                f"⚠ Hardware: {', '.join(hardware_issues)} disconnected"
+                f"⚠ Hardware: {', '.join(hardware_issues)}"
             )
 
         summary = " | ".join(summary_parts)
@@ -220,7 +246,7 @@ class ProtocolExecutor:
         await client.websocket.send(json.dumps({
             "type": "rpc_result",
             "request_id": request_id,
-            "success": completed > 0,
+            "success": completed > 0 and not hw_abort,
             "message": summary,
             "completed": completed,
             "collision_rejected": 0,
@@ -229,6 +255,7 @@ class ProtocolExecutor:
             "total": total,
             "stopped": self.stop_requested,
             "hardware_issues": hardware_issues,
+            "hardware_abort": hw_abort,
         }))
 
     # ── Legacy fallback (pose-by-pose) ───────────────────────────

@@ -170,7 +170,7 @@ nakul_arm:
     - SPARS
     - SPARStwo
   projection_evaluator: joints(nakul_shoulder_pan_joint,nakul_shoulder_lift_joint)
-  longest_valid_segment_fraction: 0.05
+  longest_valid_segment_fraction: 0.01
 
 sahadev_arm:
   default_planner_config: RRTConnect
@@ -199,7 +199,7 @@ sahadev_arm:
     - SPARS
     - SPARStwo
   projection_evaluator: joints(sahadev_shoulder_pan_joint,sahadev_shoulder_lift_joint)
-  longest_valid_segment_fraction: 0.05
+  longest_valid_segment_fraction: 0.01
 
 dual_arms:
   default_planner_config: RRTConnect
@@ -209,4 +209,4 @@ dual_arms:
     - PRM
     - PRMstar
   projection_evaluator: joints(nakul_shoulder_pan_joint,sahadev_shoulder_pan_joint)
-  longest_valid_segment_fraction: 0.05
+  longest_valid_segment_fraction: 0.01

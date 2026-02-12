@@ -17,57 +17,57 @@ world:
     - type: urdf
       name: face_object_0
       urdf: ../../../assets/non_pii_face/non_pii_face.urdf
-      pose_position: [1.0, 0.0, 1.0]
+      pose_position: [1.5, 0.0, 1.0]
       pose_orientation_rpy: [0.0, 0.0, 90.0]
       collision_enabled: true
       dynamic: false
     - type: urdf
       name: face_object_1
       urdf: ../../../assets/non_pii_face/non_pii_face.urdf
-      pose_position: [0.707, 0.707, 1.0]
+      pose_position: [1.0605, 1.0605, 1.0]
       pose_orientation_rpy: [0.0, 0.0, 135.0]
       collision_enabled: true
       dynamic: false
     - type: urdf
       name: face_object_2
       urdf: ../../../assets/non_pii_face/non_pii_face.urdf
-      pose_position: [0.0, 1.0, 1.0]
+      pose_position: [0.0, 1.5, 1.0]
       pose_orientation_rpy: [0.0, 0.0, 180.0]
       collision_enabled: true
       dynamic: false
     - type: urdf
       name: face_object_3
       urdf: ../../../assets/non_pii_face/non_pii_face.urdf
-      pose_position: [-0.707, 0.707, 1.0]
+      pose_position: [-1.0605, 1.0605, 1.0]
       pose_orientation_rpy: [0.0, 0.0, 225.0]
       collision_enabled: true
       dynamic: false
     - type: urdf
       name: face_object_4
       urdf: ../../../assets/non_pii_face/non_pii_face.urdf
-      pose_position: [-1.0, 0.0, 1.0]
+      pose_position: [-1.5, 0.0, 1.0]
       pose_orientation_rpy: [0.0, 0.0, 270.0]
       collision_enabled: true
       dynamic: false
     - type: urdf
       name: face_object_5
       urdf: ../../../assets/non_pii_face/non_pii_face.urdf
-      pose_position: [-0.707, -0.707, 1.0]
+      pose_position: [-1.0605, -1.0605, 1.0]
       pose_orientation_rpy: [0.0, 0.0, 315.0]
       collision_enabled: true
       dynamic: false
     - type: urdf
       name: face_object_6
       urdf: ../../../assets/non_pii_face/non_pii_face.urdf
-      pose_position: [0.0, -1.0, 1.0]
+      pose_position: [0.0, -1.5, 1.0]
       pose_orientation_rpy: [0.0, 0.0, 0.0]
       collision_enabled: true
       dynamic: false
     - type: urdf
       name: face_object_7
       urdf: ../../../assets/non_pii_face/non_pii_face.urdf
-      pose_position: [0.707, -0.707, 1.0]
-      pose_orientation_rpy: [0.0, 0.0, 45.0]
+      pose_position: [1.0605, -1.0605, 1.0]
+                        pose_orientation_rpy: [0.0, 0.0, 45.0]
       collision_enabled: true
       dynamic: false
 robots:

@@ -103,13 +103,22 @@
   <disable_collisions link1="nakul_wrist_1_link" link2="nakul_wrist_2_link" reason="Adjacent"/>
   <disable_collisions link1="nakul_wrist_2_link" link2="nakul_wrist_3_link" reason="Adjacent"/>
   <disable_collisions link1="nakul_wrist_3_link" link2="nakul_tool0" reason="Adjacent"/>
+  <!-- Tool is physically bolted to wrist_3 — these pairs always overlap.
+       wrist_3 ↔ tool_base and wrist_3 ↔ tool_tip must be Adjacent so
+       MoveIt doesn't see phantom self-collisions and plan contorted paths. -->
   <disable_collisions link1="nakul_wrist_3_link" link2="nakul_tool_base_link" reason="Adjacent"/>
-  <disable_collisions link1="nakul_wrist_2_link" link2="nakul_tool_base_link" reason="Adjacent"/>
-  <disable_collisions link1="nakul_wrist_1_link" link2="nakul_tool_base_link" reason="Never"/>
+  <disable_collisions link1="nakul_wrist_3_link" link2="nakul_tool_tip_link" reason="Adjacent"/>
+  <!-- Tool collision pairs:
+       wrist_1 ↔ tool_base_link is intentionally ENABLED so MoveIt
+       checks for collisions between the long iPhone tool and the wrist.
+       forearm ↔ tool_base_link is also ENABLED — the 0.3m tool can
+       reach the forearm in tight configurations.
+       wrist_2 and tip_link pairs are safe to disable (they can't
+       physically collide). -->
   <disable_collisions link1="nakul_wrist_2_link" link2="nakul_tool_tip_link" reason="Never"/>
+  <disable_collisions link1="nakul_wrist_1_link" link2="nakul_tool_tip_link" reason="Never"/>
   <disable_collisions link1="nakul_flange" link2="nakul_tool_base_link" reason="Adjacent"/>
   <disable_collisions link1="nakul_tool0" link2="nakul_tool_base_link" reason="Adjacent"/>
-  <disable_collisions link1="nakul_forearm_link" link2="nakul_tool_base_link" reason="Never"/>
   <disable_collisions link1="nakul_forearm_link" link2="nakul_tool_tip_link" reason="Never"/>
   <disable_collisions link1="nakul_upper_arm_link" link2="nakul_tool_base_link" reason="Never"/>
   <disable_collisions link1="nakul_upper_arm_link" link2="nakul_tool_tip_link" reason="Never"/>
@@ -124,7 +133,7 @@
   <disable_collisions link1="nakul_base_link_inertia" link2="shop_floor" reason="Adjacent"/>
   <disable_collisions link1="nakul_base_link_inertia" link2="table_link" reason="Adjacent"/>
   <disable_collisions link1="nakul_shoulder_link" link2="table_link" reason="Adjacent"/>
-  
+
   <!-- ── NAKUL: Never pairs (non-colliding by geometry) ─────────────── -->
   <disable_collisions link1="nakul_base_link" link2="nakul_upper_arm_link" reason="Never"/>
   <disable_collisions link1="nakul_base_link" link2="nakul_forearm_link" reason="Never"/>

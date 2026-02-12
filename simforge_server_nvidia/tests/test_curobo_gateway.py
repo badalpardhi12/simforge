@@ -285,16 +285,20 @@ class GatewayTestClient:
 
 async def run_test(args):
     # Determine mode
-    if args.real_only:
+    if args.both:
+        test_mode = "both"
+    elif args.real_only:
         test_mode = "real"
     else:
         test_mode = "simulation"
 
     print(f"═══════════════════════════════════════")
     print(f"  cuRobo Gateway Test — {test_mode.upper()} mode")
-    if test_mode == "real":
+    if test_mode in ("real", "both"):
         print(f"  ⚠  Real robot will move!  Speed={args.speed}")
         print(f"  ⚠  Uses RTDE servoJ (bypasses ROS2 control stack)")
+    if test_mode == "both":
+        print(f"  ℹ  Sim + Real in parallel (matches client GUI flow)")
     print(f"═══════════════════════════════════════\n")
 
     client = GatewayTestClient(args.server, args.port)
@@ -374,6 +378,8 @@ async def run_test(args):
                     "idle_time": 1.0,
                     "mode": "simulation",
                     "move_speed": args.speed,
+                    "go_home_before": True,
+                    "go_home_after": True,
                 },
                 timeout=300,
             )
@@ -425,6 +431,8 @@ async def run_test(args):
                     "idle_time": 2.0,
                     "mode": "real",
                     "move_speed": args.speed,
+                    "go_home_before": True,
+                    "go_home_after": True,
                 },
                 timeout=300,
             )
@@ -441,6 +449,70 @@ async def run_test(args):
                 "move_home", {"robot_name": robot_name}, timeout=60,
             )
             print(f"  Home: {home_result.get('message')}")
+        else:
+            print(f"  ✗ Mode not ready: {prep.get('message')}")
+
+    # ── Both mode (sim + real in parallel) ───────────────────────
+    if test_mode == "both":
+        print("\n═══ Both Mode (sim + real) ═══")
+        print(f"  Speed: {args.speed}")
+        print(f"  This matches the client GUI 'Real Robot' flow")
+
+        # Step 1: prepare simulation first (matches client flow)
+        print("\n  Preparing simulation mode first…")
+        prep_sim = await client.rpc(
+            "prepare_mode", {"mode": "simulation"}, timeout=120,
+        )
+        print(f"  Prepare sim: {prep_sim.get('message')}")
+
+        # Step 2: switch to 'both' (connects RTDE, starts publisher)
+        print("  Switching to 'both' mode…")
+        prep = await client.rpc(
+            "prepare_mode", {"mode": "both"}, timeout=180,
+        )
+        print(f"  Prepare both: {prep.get('message')}")
+
+        if prep.get("ready") or prep.get("success"):
+            # Re-check robot status
+            status2 = await client.rpc(
+                "get_robot_status", {"robot_name": robot_name},
+            )
+            print(
+                f"  Robot: mode={status2.get('current_mode')}, "
+                f"real={status2.get('real_robot_available')}"
+            )
+            conn = status2.get("connection_details", {})
+            print(f"  RTDE: {conn.get('rtde', 'unknown')}")
+            print(f"  cuRobo: {conn.get('curobo', 'unknown')}")
+
+            # Run protocol with go_home_before/after
+            print(f"\n  Running proto_sim (both) with RTDE servoJ…")
+            client._feedback.clear()
+            result = await client.rpc(
+                "run_proto_sim",
+                {
+                    "robot_name": robot_name,
+                    "poses": poses,
+                    "idle_time": 2.0,
+                    "mode": "both",
+                    "move_speed": args.speed,
+                    "go_home_before": True,
+                    "go_home_after": True,
+                },
+                timeout=600,
+            )
+            print(f"\n  Result: {result.get('message')}")
+            print(
+                f"    completed={result.get('completed')}, "
+                f"ik_failed={result.get('ik_failed')}, "
+                f"real_failed={result.get('real_failed')}"
+            )
+            if result.get("hardware_issues"):
+                print(
+                    f"    ⚠ hardware_issues: {result['hardware_issues']}"
+                )
+            if result.get("stopped"):
+                print("    ⚠ Protocol was stopped")
         else:
             print(f"  ✗ Mode not ready: {prep.get('message')}")
 
@@ -461,8 +533,8 @@ Examples:
   # Real robot test at conservative speed
   python test_curobo_gateway.py --server 10.0.0.5 --real-only --speed 0.15
 
-  # Real robot test at moderate speed (default)
-  python test_curobo_gateway.py --server 10.0.0.5 --real-only --speed 0.3
+  # Both mode (matches client GUI 'Real Robot') — sim + real in parallel
+  python test_curobo_gateway.py --server 10.0.0.5 --both --speed 0.1
 
   # Real robot test at higher speed
   python test_curobo_gateway.py --server 10.0.0.5 --real-only --speed 0.5
@@ -485,6 +557,10 @@ Examples:
     mode_group.add_argument(
         "--real-only", action="store_true",
         help="Run on real robot only (uses RTDE servoJ, no ROS2 control stack)",
+    )
+    mode_group.add_argument(
+        "--both", action="store_true",
+        help="Run sim + real in parallel (matches client GUI 'Real Robot' flow)",
     )
 
     parser.add_argument(

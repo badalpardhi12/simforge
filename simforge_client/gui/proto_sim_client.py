@@ -1143,9 +1143,30 @@ class ProtoSimClientFrame(wx.Frame):
 
             # Surface any hardware issues reported by the server
             hw_issues = response.get("hardware_issues", [])
+            hw_abort = response.get("hardware_abort", False)
             if hw_issues:
-                self._log(f"  ⚠ Hardware issues: {', '.join(hw_issues)} disconnected")
-            if response.get("stopped"):
+                self._log(f"  ⚠ Hardware issues: {', '.join(hw_issues)}")
+            if hw_abort:
+                self._log("  ⛔ Protocol ABORTED due to hardware fault!")
+                # Show a prominent error dialog so the user cannot miss it
+                def _show_hw_error(issues=hw_issues, msg=response.get("message", "")):
+                    detail = (
+                        "The robot hit a protective stop or emergency stop "
+                        "during protocol execution.\n\n"
+                        "Hardware faults:\n"
+                        + "\n".join(f"  • {iss}" for iss in issues)
+                        + "\n\n"
+                        f"Server message:\n  {msg}\n\n"
+                        "Please check the robot teach pendant, clear the "
+                        "fault, and try again."
+                    )
+                    wx.MessageDialog(
+                        self, detail,
+                        "Robot Hardware Fault — Protocol Aborted",
+                        wx.OK | wx.ICON_ERROR,
+                    ).ShowModal()
+                wx.CallAfter(_show_hw_error)
+            elif response.get("stopped"):
                 self._log("  Protocol was stopped by user")
                 
         except Exception as e:

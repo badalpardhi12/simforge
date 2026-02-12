@@ -36,6 +36,21 @@ services:
       - MAX_VELOCITY_SCALING=${MAX_VELOCITY_SCALING:-0.2}
       - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-0.2}
     network_mode: host
+    # ── Real-time scheduling support ──
+    # CAP_SYS_NICE allows the ros2_control_node and UR driver to set
+    # SCHED_FIFO real-time priority on their control loop threads.
+    # Without this, the 500 Hz control loop runs under SCHED_OTHER
+    # (normal time-sharing) and gets preempted, causing jerky motion.
+    # See: https://docs.universal-robots.com/Universal_Robots_ROS_Documentation/doc/ur_client_library/doc/real_time.html
+    cap_add:
+      - SYS_NICE
+    ulimits:
+      rtprio:
+        soft: 99
+        hard: 99
+      memlock:
+        soft: 102400
+        hard: 102400
     stdin_open: true
     tty: true
     command: /start_server.sh --sim
@@ -61,6 +76,18 @@ services:
       - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-0.2}
     network_mode: host
     privileged: true
+    # ── Real-time scheduling support ──
+    # privileged: true already grants all caps, but we explicitly set
+    # ulimits for the RT scheduler.
+    cap_add:
+      - SYS_NICE
+    ulimits:
+      rtprio:
+        soft: 99
+        hard: 99
+      memlock:
+        soft: 102400
+        hard: 102400
     stdin_open: true
     tty: true
     command: /start_server.sh --real

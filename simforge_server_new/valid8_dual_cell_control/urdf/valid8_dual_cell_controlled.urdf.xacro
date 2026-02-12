@@ -10,8 +10,25 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
 Uses a patched version of ur.ros2_control.xacro that exposes servoj_gain
 and servoj_lookahead_time as configurable parameters (upstream hardcodes
 them).  Tuned values for non-RT dual-robot system:
-  servoj_gain=750         (default 2000): softer position tracking
-  servoj_lookahead_time=0.1 (default 0.03): more smoothing of trajectory
+  servoj_gain=750         (default 2000): soft position tracking that
+                          absorbs spline interpolation acceleration
+                          discontinuities.  The controller sends position
+                          commands at 500Hz via servoj — high gain
+                          amplifies every discontinuity into a physical
+                          jerk.  750 gives smooth tracking without
+                          feeling sluggish.  Range tested: 1000 still
+                          jerky, 500 too sluggish, 750 is the sweet spot.
+  servoj_lookahead_time=0.2  (default 0.03, max 0.2): maximum smoothing
+                          window.  servoj internally smooths the position
+                          command stream — higher lookahead = more
+                          smoothing.  0.2s (max) is ideal for non-RT
+                          systems where timing jitter from the ROS
+                          control loop is significant.
+  keep_alive_count=50     (default 2): ~100ms grace period at 500Hz. The
+                          default of 2 causes frequent reverse-interface
+                          drops on non-RT systems under scheduler jitter,
+                          which cascades into controller_stopper
+                          deactivating trajectory controllers mid-motion.
 -->
 <robot name="valid8_dual_cell" xmlns:xacro="http://wiki.ros.org/xacro">
 
@@ -43,19 +60,20 @@ them).  Tuned values for non-RT dual-robot system:
   <!-- Nakul uses default UR ports: 50001-50004 -->
   <!--
     keep_alive_count: Number of control-loop cycles without data before
-    the URScript program on the robot exits.  The default of 2 is very
-    aggressive on non-RT systems running dual robots — two missed 2 ms
-    cycles (4 ms) can happen easily under scheduler jitter.  We raise
-    this to 10 (~20 ms grace period at 500 Hz) to prevent spurious
-    reverse-interface drops.
+    the URScript program on the robot exits.  Set to 50 (~100 ms grace
+    at 500 Hz).  The default of 2 is far too aggressive for non-RT
+    dual-robot setups — scheduler jitter on non-RT Linux can easily
+    cause >20 ms gaps between successive servoj commands.
 
-    servoj_gain: Proportional gain for servoj (range 100-2000).
-    Default 2000 is very stiff. 750 provides smoother tracking on
-    non-RT systems by tolerating small position errors gracefully.
+    servoj_gain: Proportional gain for servoj (range 100-3000).
+    Default 2000 is maximum stiffness — amplifies every acceleration
+    discontinuity from the spline interpolator into a physical jerk.
+    750 provides smooth tracking that absorbs spline boundary effects.
 
     servoj_lookahead_time: Lookahead window for servoj (range 0.03-0.2).
-    Default 0.03s is too aggressive for non-RT dual-robot systems.
-    0.1s adds trajectory smoothing at the URScript level.
+    Default 0.03s gives almost no smoothing.  0.2s (maximum) gives
+    the internal servoj PD controller maximum smoothing, essential for
+    non-RT systems where the 500Hz command stream has timing jitter.
   -->
   <xacro:ur_ros2_control_patched
     name="nakul_ur5e"
@@ -72,9 +90,9 @@ them).  Tuned values for non-RT dual-robot system:
     script_sender_port="50002"
     trajectory_port="50003"
     script_command_port="50004"
-    keep_alive_count="10"
+    keep_alive_count="50"
     servoj_gain="750"
-    servoj_lookahead_time="0.1"
+    servoj_lookahead_time="0.2"
   />
 
   <!-- ========== Sahadev ros2_control Hardware Interface ========== -->
@@ -94,9 +112,9 @@ them).  Tuned values for non-RT dual-robot system:
     script_sender_port="50006"
     trajectory_port="50007"
     script_command_port="50008"
-    keep_alive_count="10"
+    keep_alive_count="50"
     servoj_gain="750"
-    servoj_lookahead_time="0.1"
+    servoj_lookahead_time="0.2"
   />
 
 </robot>

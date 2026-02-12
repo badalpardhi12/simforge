@@ -144,6 +144,27 @@ def launch_setup(context, *args, **kwargs):
                                 "default_planner_request_adapters/ResolveConstraintFrames "
                                 "default_planner_request_adapters/AddTimeOptimalParameterization",
             "start_state_max_bounds_error": 0.1,
+            # ── TOTG (Time-Optimal Trajectory Generation) tuning ─────
+            # resample_dt=0.1 produces ~10 waypoints/sec with 100ms
+            # spacing.  This is optimal for the ScaledJointTrajectory
+            # Controller's spline interpolation because:
+            #   - Wider spacing reduces cubic spline coefficient
+            #     magnification (c2 ~ 1/T^2, c3 ~ 1/T^3)
+            #   - Fewer segment boundaries = fewer acceleration
+            #     discontinuities = less jerkiness
+            #   - 0.02 (50 pts/sec) was COUNTERPRODUCTIVE — 50
+            #     acceleration discontinuities per second at segment
+            #     boundaries, with spline coefficients amplified by
+            #     1/0.02^3 = 125,000
+            #
+            # path_tolerance=0.1 allows TOTG to round corners at
+            # intermediate waypoints for C1 continuity.
+            #
+            # NOTE: This MoveIt2 Humble build uses FLAT param names
+            # (ompl.resample_dt), NOT the nested totg. namespace.
+            "path_tolerance": 0.1,
+            "resample_dt": 0.1,
+            "min_angle_change": 0.001,
         }
     }
 
@@ -202,6 +223,10 @@ def launch_setup(context, *args, **kwargs):
                 "default_planner_request_adapters/ResolveConstraintFrames "
                 "default_planner_request_adapters/AddTimeOptimalParameterization",
             "start_state_max_bounds_error": 0.1,
+            # TOTG params — match ompl_pipeline_config
+            "path_tolerance": 0.1,
+            "resample_dt": 0.1,
+            "min_angle_change": 0.001,
         }
     }
     # Merge planner configs into old-style too

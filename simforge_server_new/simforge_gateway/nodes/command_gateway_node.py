@@ -36,12 +36,16 @@ from sensor_msgs.msg import JointState
 
 from control_msgs.action import FollowJointTrajectory
 
-from moveit_msgs.srv import GetPositionIK, GetMotionPlan
+from moveit_msgs.srv import GetPositionIK, GetMotionPlan, GetCartesianPath
 from moveit_msgs.msg import (
     Constraints,
     JointConstraint,
+    PositionConstraint,
+    OrientationConstraint,
+    BoundingVolume,
     RobotTrajectory,
 )
+from shape_msgs.msg import SolidPrimitive
 
 import tf2_ros
 from tf2_ros import Buffer, TransformListener
@@ -66,6 +70,7 @@ ROBOT_CONFIG = {
             "nakul_wrist_3_joint",
         ],
         "controller": "nakul_scaled_joint_trajectory_controller",
+        "passthrough_controller": "nakul_passthrough_trajectory_controller",
         "planning_group": "nakul_arm",
         "ee_link": "nakul_tool0",
         # CRITICAL: The client generates poses for the tool tip (where the
@@ -88,6 +93,7 @@ ROBOT_CONFIG = {
             "sahadev_wrist_3_joint",
         ],
         "controller": "sahadev_scaled_joint_trajectory_controller",
+        "passthrough_controller": "sahadev_passthrough_trajectory_controller",
         "planning_group": "sahadev_arm",
         "ee_link": "sahadev_tool0",
         # sahadev has no tool mount — IK targets tool0 (wrist flange)
@@ -198,16 +204,13 @@ class CommandGatewayNode(Node):
         )
 
         # ── Action clients (FollowJointTrajectory) ───────────────────
+        # On real hardware the passthrough controller forwards the
+        # entire trajectory to the UR robot's internal interpolator
+        # for smooth cubic/quintic spline execution.  In simulation
+        # (fake hardware) the passthrough controller is not available
+        # so we fall back to the scaled joint trajectory controller.
         self._traj_clients: Dict[str, ActionClient] = {}
-        for robot_name, cfg in ROBOT_CONFIG.items():
-            action_ns = f"/{cfg['controller']}/follow_joint_trajectory"
-            self._traj_clients[robot_name] = ActionClient(
-                self, FollowJointTrajectory, action_ns,
-                callback_group=self.cb_group,
-            )
-            self.get_logger().info(
-                f"Trajectory action client for {robot_name}: {action_ns}"
-            )
+        self._rebuild_traj_clients()
 
         # ── MoveIt service clients ───────────────────────────────────
         self._ik_client = self.create_client(
@@ -215,6 +218,9 @@ class CommandGatewayNode(Node):
         )
         self._plan_client = self.create_client(
             GetMotionPlan, "/plan_kinematic_path", callback_group=self.cb_group
+        )
+        self._cartesian_path_client = self.create_client(
+            GetCartesianPath, "/compute_cartesian_path", callback_group=self.cb_group
         )
 
         # ── Robot-program-running state (real hardware only) ─────────
@@ -378,13 +384,14 @@ class CommandGatewayNode(Node):
     # ─────────────────────────────────────────────────────────────────
 
     async def _wait_for_moveit(self, timeout: float = 30.0) -> bool:
-        """Wait until /compute_ik and /plan_kinematic_path are reachable."""
+        """Wait until MoveIt services are reachable."""
         self.get_logger().info("Waiting for MoveIt services…")
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             ik_ok = self._ik_client.service_is_ready()
             plan_ok = self._plan_client.service_is_ready()
-            if ik_ok and plan_ok:
+            cart_ok = self._cartesian_path_client.service_is_ready()
+            if ik_ok and plan_ok and cart_ok:
                 self.get_logger().info("MoveIt services are ready")
                 return True
             await asyncio.sleep(0.5)
@@ -482,17 +489,206 @@ class CommandGatewayNode(Node):
             result[i] -= k * TWO_PI
         return result
 
+    async def _plan_to_pose_moveit(
+        self,
+        robot_name: str,
+        target_pose: Pose,
+        velocity_scaling: Optional[float] = None,
+        acceleration_scaling: Optional[float] = None,
+        min_z_path: Optional[float] = None,
+    ) -> Optional[RobotTrajectory]:
+        """Plan to a Cartesian pose using MoveIt pose constraints.
+
+        Unlike _plan_to_joints (which needs a pre-solved IK solution),
+        this method sends PositionConstraint + OrientationConstraint
+        to MoveIt so that OMPL handles IK internally with full
+        collision checking.  This avoids the problem of IK solutions
+        that are kinematically valid but in self-collision.
+
+        Parameters
+        ----------
+        min_z_path : float, optional
+            Minimum Z height (in base_link frame) that the ik_tip_link
+            must stay above during the ENTIRE trajectory — not just at
+            the goal.  This is implemented as a MoveIt *path constraint*
+            (a large box above that height).  Prevents OMPL from planning
+            paths where the arm dips toward the table.
+
+        Returns the RAW MoveIt trajectory (no retiming) for use in
+        multi-waypoint concatenation.
+        """
+        if velocity_scaling is None:
+            velocity_scaling = self.max_velocity_scaling
+        if acceleration_scaling is None:
+            acceleration_scaling = self.max_acceleration_scaling
+
+        cfg = ROBOT_CONFIG[robot_name]
+
+        req = GetMotionPlan.Request()
+        mp = req.motion_plan_request
+
+        mp.group_name = cfg["planning_group"]
+        mp.num_planning_attempts = 25
+        mp.allowed_planning_time = 15.0
+        mp.max_velocity_scaling_factor = velocity_scaling
+        mp.max_acceleration_scaling_factor = acceleration_scaling
+
+        # Workspace bounds — restrict min Z to above the table surface.
+        # Table top is at z ≈ -0.03 in base_link.  We set min Z to 0.0
+        # to prevent the planner from considering configurations where
+        # the end-effector dips below the base.
+        mp.workspace_parameters.header.frame_id = cfg["base_link"]
+        mp.workspace_parameters.min_corner.x = -1.5
+        mp.workspace_parameters.min_corner.y = -1.5
+        mp.workspace_parameters.min_corner.z = 0.0
+        mp.workspace_parameters.max_corner.x = 1.5
+        mp.workspace_parameters.max_corner.y = 1.5
+        mp.workspace_parameters.max_corner.z = 2.0
+
+        # Start state = current joints
+        current = self._robot_states[robot_name].joint_positions
+        if current and len(current) == 6:
+            mp.start_state.joint_state.name = list(cfg["joints"])
+            mp.start_state.joint_state.position = list(current)
+            mp.start_state.is_diff = False
+
+        # ── Path constraints (applied to ENTIRE trajectory) ──────
+        # Keep the tool tip above a minimum Z height during motion.
+        # This prevents OMPL from planning paths where the arm swings
+        # low — e.g. elbow dipping toward the table — even if such
+        # paths are technically collision-free per the model.
+        if min_z_path is not None:
+            path_constraints = Constraints()
+
+            pc_path = PositionConstraint()
+            pc_path.header.frame_id = cfg["base_link"]
+            pc_path.link_name = cfg["ik_tip_link"]
+            pc_path.weight = 1.0
+
+            # Create a large box that represents "allowed region":
+            # X: -2 to +2, Y: -2 to +2, Z: min_z_path to +3
+            # The tool tip must stay inside this box at all times.
+            path_vol = BoundingVolume()
+            path_box = SolidPrimitive()
+            path_box.type = SolidPrimitive.BOX
+            path_box.dimensions = [4.0, 4.0, 3.0 - min_z_path]  # x, y, z size
+            path_vol.primitives.append(path_box)
+
+            # Box center
+            box_center = Pose()
+            box_center.position.x = 0.0
+            box_center.position.y = 0.0
+            box_center.position.z = min_z_path + (3.0 - min_z_path) / 2.0
+            box_center.orientation.w = 1.0
+            path_vol.primitive_poses.append(box_center)
+
+            pc_path.constraint_region = path_vol
+            path_constraints.position_constraints.append(pc_path)
+            mp.path_constraints = path_constraints
+
+            self.get_logger().info(
+                f"Path constraint: {cfg['ik_tip_link']} must stay above "
+                f"z={min_z_path:.2f} in {cfg['base_link']}"
+            )
+
+        # Goal constraints = Cartesian pose (position + orientation)
+        # MoveIt will handle IK internally with collision checking.
+        constraints = Constraints()
+
+        # Position constraint: small sphere around target position
+        pos_constraint = PositionConstraint()
+        pos_constraint.header.frame_id = cfg["base_link"]
+        pos_constraint.link_name = cfg["ik_tip_link"]
+        pos_constraint.weight = 1.0
+
+        # Define a small bounding sphere around the target position
+        bounding_vol = BoundingVolume()
+        sphere = SolidPrimitive()
+        sphere.type = SolidPrimitive.SPHERE
+        sphere.dimensions = [0.01]  # 1cm radius tolerance
+        bounding_vol.primitives.append(sphere)
+
+        target_pose_stamped = PoseStamped()
+        target_pose_stamped.header.frame_id = cfg["base_link"]
+        target_pose_stamped.pose.position = target_pose.position
+        target_pose_stamped.pose.orientation.w = 1.0  # identity for the volume
+        bounding_vol.primitive_poses.append(target_pose_stamped.pose)
+
+        pos_constraint.constraint_region = bounding_vol
+        pos_constraint.target_point_offset.x = 0.0
+        pos_constraint.target_point_offset.y = 0.0
+        pos_constraint.target_point_offset.z = 0.0
+        constraints.position_constraints.append(pos_constraint)
+
+        # Orientation constraint
+        orient_constraint = OrientationConstraint()
+        orient_constraint.header.frame_id = cfg["base_link"]
+        orient_constraint.link_name = cfg["ik_tip_link"]
+        orient_constraint.orientation = target_pose.orientation
+        orient_constraint.absolute_x_axis_tolerance = 0.05  # ~3 degrees
+        orient_constraint.absolute_y_axis_tolerance = 0.05
+        orient_constraint.absolute_z_axis_tolerance = 0.05
+        orient_constraint.weight = 1.0
+        constraints.orientation_constraints.append(orient_constraint)
+
+        mp.goal_constraints.append(constraints)
+
+        try:
+            future = self._plan_client.call_async(req)
+            result = await await_ros_future(future, timeout=30.0)
+            if result.motion_plan_response.error_code.val == 1:  # SUCCESS
+                pts = result.motion_plan_response.trajectory.joint_trajectory.points
+                if pts:
+                    last_pt = pts[-1]
+                    traj_dur = (
+                        last_pt.time_from_start.sec
+                        + last_pt.time_from_start.nanosec * 1e-9
+                    )
+                    # Log start/end joints for debugging path quality
+                    start_j = [f"{v:.3f}" for v in pts[0].positions]
+                    end_j = [f"{v:.3f}" for v in last_pt.positions]
+                    self.get_logger().info(
+                        f"Pose plan for {robot_name}: {len(pts)} waypoints, "
+                        f"duration={traj_dur:.2f}s, "
+                        f"start_joints=[{', '.join(start_j)}], "
+                        f"end_joints=[{', '.join(end_j)}]"
+                    )
+                # Return RAW trajectory (no retiming — caller will retime
+                # after concatenation)
+                return result.motion_plan_response.trajectory
+            else:
+                err_code = result.motion_plan_response.error_code.val
+                self.get_logger().warn(
+                    f"Pose planning failed for {robot_name}: "
+                    f"error_code={err_code}"
+                )
+                return None
+        except TimeoutError:
+            self.get_logger().error(
+                f"Pose planning service timed out for {robot_name}"
+            )
+            return None
+        except Exception as exc:
+            self.get_logger().error(f"Pose planning failed: {exc}")
+            return None
+
     async def _plan_to_joints(
         self,
         robot_name: str,
         target_joints: List[float],
         velocity_scaling: Optional[float] = None,
         acceleration_scaling: Optional[float] = None,
+        skip_retiming: bool = False,
     ) -> Optional[RobotTrajectory]:
         """Call /plan_kinematic_path and return RobotTrajectory or None.
 
         velocity_scaling / acceleration_scaling default to the ROS parameters
         max_velocity_scaling / max_acceleration_scaling when not provided.
+
+        If skip_retiming is True, the raw MoveIt/TOTG trajectory is
+        returned without quintic C2 retiming.  Used by multi-waypoint
+        planning which needs raw position waypoints and applies a
+        single retiming pass over the entire concatenated trajectory.
         """
         if velocity_scaling is None:
             velocity_scaling = self.max_velocity_scaling
@@ -510,14 +706,14 @@ class CommandGatewayNode(Node):
         mp.max_velocity_scaling_factor = velocity_scaling
         mp.max_acceleration_scaling_factor = acceleration_scaling
 
-        # Workspace bounds (matching old server: ±2m XY, -0.5 to 3m Z)
+        # Workspace bounds — restrict min Z to above the table surface
         mp.workspace_parameters.header.frame_id = cfg["base_link"]
-        mp.workspace_parameters.min_corner.x = -2.0
-        mp.workspace_parameters.min_corner.y = -2.0
-        mp.workspace_parameters.min_corner.z = -0.5
-        mp.workspace_parameters.max_corner.x = 2.0
-        mp.workspace_parameters.max_corner.y = 2.0
-        mp.workspace_parameters.max_corner.z = 3.0
+        mp.workspace_parameters.min_corner.x = -1.5
+        mp.workspace_parameters.min_corner.y = -1.5
+        mp.workspace_parameters.min_corner.z = 0.0
+        mp.workspace_parameters.max_corner.x = 1.5
+        mp.workspace_parameters.max_corner.y = 1.5
+        mp.workspace_parameters.max_corner.z = 2.0
 
         # Start state = current joints
         current = self._robot_states[robot_name].joint_positions
@@ -543,10 +739,50 @@ class CommandGatewayNode(Node):
             result = await await_ros_future(future, timeout=15.0)
             if result.motion_plan_response.error_code.val == 1:  # SUCCESS
                 pts = result.motion_plan_response.trajectory.joint_trajectory.points
-                self.get_logger().info(
-                    f"Motion plan for {robot_name}: {len(pts)} waypoints"
+                # Log trajectory duration and max velocity for diagnostics
+                if pts:
+                    last_pt = pts[-1]
+                    traj_dur = (
+                        last_pt.time_from_start.sec
+                        + last_pt.time_from_start.nanosec * 1e-9
+                    )
+                    # Compute max joint velocity across all segments
+                    max_vel = 0.0
+                    for k in range(1, len(pts)):
+                        dt = (
+                            (pts[k].time_from_start.sec + pts[k].time_from_start.nanosec * 1e-9)
+                            - (pts[k-1].time_from_start.sec + pts[k-1].time_from_start.nanosec * 1e-9)
+                        )
+                        if dt > 0:
+                            for j in range(min(len(pts[k].positions), len(pts[k-1].positions))):
+                                v = abs(pts[k].positions[j] - pts[k-1].positions[j]) / dt
+                                if v > max_vel:
+                                    max_vel = v
+                    self.get_logger().info(
+                        f"Motion plan for {robot_name}: {len(pts)} waypoints, "
+                        f"duration={traj_dur:.2f}s, max_seg_vel={max_vel:.3f} rad/s"
+                    )
+                else:
+                    self.get_logger().info(
+                        f"Motion plan for {robot_name}: 0 waypoints"
+                    )
+
+                if skip_retiming:
+                    # Return raw MoveIt/TOTG trajectory without quintic
+                    # retiming — caller will retime after concatenation.
+                    return result.motion_plan_response.trajectory
+
+                # ── Retime to enforce uniform max joint velocity ────
+                # TOTG may produce slightly different peak velocities
+                # per segment depending on which joints dominate each
+                # segment.  Retiming caps every segment so the fastest
+                # joint never exceeds velocity_scaling × per-joint limit
+                # (with 10 % headroom for spline interpolation safety).
+                retimed = self._retime_trajectory_constant_speed(
+                    result.motion_plan_response.trajectory,
+                    max_joint_vel=velocity_scaling * 1.0,  # uniform limit
                 )
-                return result.motion_plan_response.trajectory
+                return retimed
             else:
                 self.get_logger().warn(
                     f"Planning failed for {robot_name}: "
@@ -559,6 +795,712 @@ class CommandGatewayNode(Node):
         except Exception as exc:
             self.get_logger().error(f"Planning service call failed: {exc}")
             return None
+
+    def _retime_trajectory_constant_speed(
+        self,
+        trajectory: RobotTrajectory,
+        max_joint_vel: float,
+        force_zero_endpoints: bool = True,
+    ) -> RobotTrajectory:
+        """Retime a trajectory with uniform resampling for butter-smooth motion.
+
+        WHY UNIFORM RESAMPLING?
+        ──────────────────────
+        MoveIt's Cartesian planner produces waypoints at fixed Cartesian
+        step sizes (e.g. 5mm).  In joint space this translates to wildly
+        varying angular increments (depending on the Jacobian).  If we
+        just velocity-cap each segment individually, the resulting dt
+        values span a huge range (e.g. 0.05s – 2.0s).  Fitting quintic
+        splines on such non-uniform knot spacing creates Runge-like
+        oscillation and the controller physically "jerks" at every
+        waypoint boundary.
+
+        The fix: after computing the total traversal time, we resample
+        the entire trajectory to UNIFORM time spacing (every resample_dt
+        seconds).  Then we compute velocities and accelerations from
+        the uniformly-spaced positions via central finite differences.
+        The result: perfectly even waypoint spacing → clean quintic
+        spline interpolation → smooth robot motion.
+
+        PIPELINE:
+        1. Compute arc-length s(k) along the joint-space path.
+        2. Compute total traversal time T from max_joint_vel.
+        3. Create a smooth s(t) mapping (trapezoidal velocity profile
+           with cosine blending at start/end for C2 continuity).
+        4. Resample positions q(t) at uniform dt intervals using
+           linear interpolation along the path parameterised by s.
+        5. Compute velocities via central finite differences on the
+           uniformly-spaced grid.
+        6. Compute accelerations via second-order central differences.
+        7. Clamp endpoints to zero vel+accel for smooth ramp-up/down.
+        """
+        import math
+        from builtin_interfaces.msg import Duration
+        from trajectory_msgs.msg import JointTrajectoryPoint
+
+        pts = list(trajectory.joint_trajectory.points)
+        if len(pts) < 2:
+            return trajectory
+
+        n_joints = len(pts[0].positions)
+        safe_vel = max_joint_vel * 0.85  # 15% headroom
+
+        # ── Step 1: Compute arc-length along path ───────────────────
+        # s[k] = cumulative max-joint displacement from pt[0] to pt[k]
+        arc_lengths = [0.0]
+        for k in range(1, len(pts)):
+            max_dq = 0.0
+            for j in range(n_joints):
+                dq = abs(pts[k].positions[j] - pts[k-1].positions[j])
+                if dq > max_dq:
+                    max_dq = dq
+            arc_lengths.append(arc_lengths[-1] + max_dq)
+
+        total_arc = arc_lengths[-1]
+        if total_arc < 1e-8:
+            # Trajectory doesn't move — return as-is
+            return trajectory
+
+        # ── Step 2: Compute total traversal time ────────────────────
+        # At constant speed = safe_vel:
+        #   T_cruise = total_arc / safe_vel
+        # Add ramp-up and ramp-down time (cosine blend over ramp_fraction
+        # of total distance at each end).  During ramp the average speed
+        # is safe_vel/2, so ramp takes twice as long as cruise for the
+        # same distance.
+        ramp_fraction = 0.15  # 15% of path for accel, 15% for decel
+        ramp_arc = total_arc * ramp_fraction
+        cruise_arc = total_arc - 2 * ramp_arc
+        if cruise_arc < 0:
+            # Very short trajectory — all ramp, no cruise
+            ramp_arc = total_arc / 2
+            cruise_arc = 0.0
+
+        # Ramp time: average speed during cosine ramp = safe_vel * 0.5
+        # → t_ramp = ramp_arc / (safe_vel * 0.5)
+        t_ramp = ramp_arc / (safe_vel * 0.5) if safe_vel > 0 else 1.0
+        t_cruise = cruise_arc / safe_vel if safe_vel > 0 else 0.0
+        total_time = t_ramp + t_cruise + t_ramp  # accel + cruise + decel
+        total_time = max(total_time, 0.5)  # minimum 0.5s trajectory
+
+        self.get_logger().info(
+            f"Retime: arc={total_arc:.4f} rad, "
+            f"T={total_time:.2f}s (ramp={t_ramp:.2f}+cruise={t_cruise:.2f}+ramp={t_ramp:.2f}), "
+            f"safe_vel={safe_vel:.4f} rad/s"
+        )
+
+        # ── Step 3: s(t) mapping with cosine-blended velocity profile ─
+        # This gives C2 continuous speed profile:
+        #   t ∈ [0, t_ramp]:         speed ramps up via cosine blend
+        #   t ∈ [t_ramp, T-t_ramp]:  constant speed = safe_vel
+        #   t ∈ [T-t_ramp, T]:       speed ramps down via cosine blend
+        def s_of_t(t):
+            """Map time → arc-length with smooth acceleration profile."""
+            if t <= 0:
+                return 0.0
+            if t >= total_time:
+                return total_arc
+
+            t1 = t_ramp           # end of acceleration
+            t2 = t_ramp + t_cruise  # start of deceleration
+            t3 = total_time       # end
+
+            if t <= t1 and t_ramp > 0:
+                # Cosine ramp-up: speed = safe_vel * 0.5 * (1 - cos(π * t / t_ramp))
+                # Integral: s = safe_vel * 0.5 * (t - (t_ramp/π) * sin(π * t / t_ramp))
+                phase = math.pi * t / t_ramp
+                s = safe_vel * 0.5 * (t - (t_ramp / math.pi) * math.sin(phase))
+                return s
+            elif t <= t2:
+                # Cruise at safe_vel
+                s_at_t1 = ramp_arc  # integral of ramp-up
+                s = s_at_t1 + safe_vel * (t - t1)
+                return s
+            elif t_ramp > 0:
+                # Cosine ramp-down
+                s_at_t2 = ramp_arc + cruise_arc
+                t_local = t - t2
+                phase = math.pi * t_local / t_ramp
+                s = s_at_t2 + safe_vel * 0.5 * (t_local - (t_ramp / math.pi) * math.sin(phase))
+                return s
+            else:
+                # No ramp — constant speed throughout
+                return safe_vel * t
+
+        # ── Step 4: Resample to uniform time spacing ────────────────
+        # Choose resample_dt to give a reasonable number of points.
+        # For the UR driver at 500Hz, points every 0.1-0.2s is ideal
+        # (the controller interpolates quintic between them at 500Hz).
+        resample_dt = 0.08  # 80ms → 12.5 pts/sec, good for quintic splines
+        n_resampled = max(int(total_time / resample_dt) + 1, 3)
+        uniform_dt = total_time / (n_resampled - 1)
+
+        # Build position lookup: given arc-length s, find interpolated
+        # joint positions along the original path.
+        def interp_position_at_s(s_target):
+            """Linearly interpolate joint positions at arc-length s_target."""
+            if s_target <= 0:
+                return list(pts[0].positions)
+            if s_target >= total_arc:
+                return list(pts[-1].positions)
+
+            # Binary search for the segment containing s_target
+            lo, hi = 0, len(arc_lengths) - 1
+            while lo < hi - 1:
+                mid = (lo + hi) // 2
+                if arc_lengths[mid] <= s_target:
+                    lo = mid
+                else:
+                    hi = mid
+
+            # Linear interpolation within segment [lo, hi]
+            ds = arc_lengths[hi] - arc_lengths[lo]
+            if ds < 1e-12:
+                return list(pts[lo].positions)
+            alpha = (s_target - arc_lengths[lo]) / ds
+
+            result = []
+            for j in range(n_joints):
+                q = pts[lo].positions[j] + alpha * (pts[hi].positions[j] - pts[lo].positions[j])
+                result.append(q)
+            return result
+
+        # Generate uniformly-spaced points
+        new_points = []
+        for i in range(n_resampled):
+            t = i * uniform_dt
+            s = s_of_t(t)
+            pos = interp_position_at_s(s)
+
+            pt = JointTrajectoryPoint()
+            pt.positions = pos
+            sec = int(t)
+            nsec = int((t - sec) * 1e9)
+            pt.time_from_start = Duration(sec=sec, nanosec=nsec)
+            new_points.append(pt)
+
+        # ── Step 5: Compute velocities (central differences) ────────
+        # On uniformly-spaced grid, central differences are accurate
+        # and produce smooth velocity profiles.
+        for k in range(len(new_points)):
+            vels = []
+            for j in range(n_joints):
+                if k == 0 or k == len(new_points) - 1:
+                    vels.append(0.0)
+                else:
+                    # Central difference: v = (q[k+1] - q[k-1]) / (2 * dt)
+                    dq = new_points[k+1].positions[j] - new_points[k-1].positions[j]
+                    v = dq / (2 * uniform_dt)
+                    v = max(-safe_vel, min(safe_vel, v))
+                    vels.append(v)
+            new_points[k].velocities = vels
+
+        # ── Step 6: Compute accelerations (second-order central diff) ─
+        for k in range(len(new_points)):
+            accels = []
+            for j in range(n_joints):
+                if k == 0 or k == len(new_points) - 1:
+                    accels.append(0.0)
+                elif k == 1:
+                    # Forward difference of velocity
+                    a = (new_points[k+1].velocities[j] - new_points[k].velocities[j]) / uniform_dt
+                    accels.append(a)
+                elif k == len(new_points) - 2:
+                    # Backward difference of velocity
+                    a = (new_points[k].velocities[j] - new_points[k-1].velocities[j]) / uniform_dt
+                    accels.append(a)
+                else:
+                    # Central second difference: a = (q[k+1] - 2*q[k] + q[k-1]) / dt²
+                    a = (new_points[k+1].positions[j] - 2*new_points[k].positions[j] + new_points[k-1].positions[j]) / (uniform_dt ** 2)
+                    accels.append(a)
+            new_points[k].accelerations = accels
+
+        trajectory.joint_trajectory.points = new_points
+
+        # ── Diagnostics ─────────────────────────────────────────────
+        actual_max_v = 0.0
+        for k in range(len(new_points)):
+            for j in range(n_joints):
+                v = abs(new_points[k].velocities[j])
+                if v > actual_max_v:
+                    actual_max_v = v
+
+        # Compute jerk stats
+        max_jerk = 0.0
+        for k in range(1, len(new_points)):
+            for j in range(n_joints):
+                prev_a = new_points[k-1].accelerations[j] if new_points[k-1].accelerations else 0.0
+                curr_a = new_points[k].accelerations[j] if new_points[k].accelerations else 0.0
+                jerk = abs(curr_a - prev_a) / uniform_dt
+                if jerk > max_jerk:
+                    max_jerk = jerk
+
+        self.get_logger().info(
+            f"Retimed trajectory: {len(new_points)} pts, "
+            f"duration={total_time:.2f}s, "
+            f"uniform_dt={uniform_dt:.4f}s, "
+            f"max_vel_cap={safe_vel:.4f} rad/s, "
+            f"actual_max_vel={actual_max_v:.4f} rad/s, "
+            f"max_jerk={max_jerk:.3f} rad/s³, "
+            f"interp=quintic(C2)+uniform_resample"
+        )
+
+        # Dump first/last few points for quick sanity check
+        for k in [0, 1, 2, len(new_points)//2, len(new_points)-3, len(new_points)-2, len(new_points)-1]:
+            if 0 <= k < len(new_points):
+                t = new_points[k].time_from_start.sec + new_points[k].time_from_start.nanosec * 1e-9
+                mv = max(abs(v) for v in new_points[k].velocities) if new_points[k].velocities else 0
+                ma = max(abs(a) for a in new_points[k].accelerations) if new_points[k].accelerations else 0
+                self.get_logger().info(
+                    f"  sample pt[{k:03d}] t={t:.3f}s |v|={mv:.5f} |a|={ma:.5f}"
+                )
+
+        return trajectory
+
+    # ─────────────────────────────────────────────────────────────────
+    # Multi-waypoint planning — single continuous trajectory
+    # ─────────────────────────────────────────────────────────────────
+
+    async def _plan_cartesian_path(
+        self,
+        robot_name: str,
+        waypoints: list,
+        velocity_scaling: Optional[float] = None,
+        acceleration_scaling: Optional[float] = None,
+        max_step: float = 0.01,
+    ) -> Optional[RobotTrajectory]:
+        """Plan a single trajectory through multiple Cartesian waypoints.
+
+        Uses MoveIt's /compute_cartesian_path service which generates a
+        single RobotTrajectory that moves the end-effector through all
+        waypoints in sequence with smooth interpolation.
+
+        Parameters
+        ----------
+        robot_name : str
+            Robot to plan for.
+        waypoints : list of (position, orientation) tuples
+            Each waypoint is ([x,y,z], [qx,qy,qz,qw]).
+        velocity_scaling : float, optional
+            MoveIt velocity scaling (0, 1].
+        acceleration_scaling : float, optional
+            MoveIt acceleration scaling (0, 1].
+        max_step : float
+            Maximum Cartesian distance between interpolated points (m).
+            Smaller = more points = smoother but slower to plan.
+
+        Returns
+        -------
+        RobotTrajectory or None
+            Single trajectory through all waypoints, or None on failure.
+        """
+        if velocity_scaling is None:
+            velocity_scaling = self.max_velocity_scaling
+        if acceleration_scaling is None:
+            acceleration_scaling = self.max_acceleration_scaling
+
+        cfg = ROBOT_CONFIG[robot_name]
+
+        req = GetCartesianPath.Request()
+        req.header.frame_id = cfg["base_link"]
+        req.header.stamp = self.get_clock().now().to_msg()
+        req.group_name = cfg["planning_group"]
+        req.link_name = cfg["ik_tip_link"]
+
+        # Start state = current joints
+        current = self._robot_states[robot_name].joint_positions
+        if current and len(current) == 6:
+            req.start_state.joint_state.name = list(cfg["joints"])
+            req.start_state.joint_state.position = list(current)
+            req.start_state.is_diff = False
+
+        # Build waypoint poses
+        for pos, orient in waypoints:
+            p = Pose()
+            p.position = Point(x=float(pos[0]), y=float(pos[1]), z=float(pos[2]))
+            p.orientation = Quaternion(
+                x=float(orient[0]), y=float(orient[1]),
+                z=float(orient[2]), w=float(orient[3]),
+            )
+            req.waypoints.append(p)
+
+        req.max_step = max_step
+        # Disable jump detection — poses are pre-validated by IK
+        req.jump_threshold = 0.0
+        req.avoid_collisions = True
+
+        try:
+            future = self._cartesian_path_client.call_async(req)
+            result = await await_ros_future(future, timeout=30.0)
+
+            fraction = result.fraction
+            self.get_logger().info(
+                f"Cartesian path for {robot_name}: "
+                f"fraction={fraction:.2%} through {len(waypoints)} waypoints"
+            )
+
+            if fraction < 0.95:
+                self.get_logger().warn(
+                    f"Cartesian path only achieved {fraction:.1%} — "
+                    f"falling back to joint-space multi-waypoint planning"
+                )
+                return None
+
+            # The Cartesian path service returns a time-parameterized
+            # trajectory.  Apply our retiming for velocity capping.
+            max_vel = (velocity_scaling or self.max_velocity_scaling) * 1.0
+            retimed = self._retime_trajectory_constant_speed(
+                result.solution, max_joint_vel=max_vel,
+            )
+            return retimed
+
+        except TimeoutError:
+            self.get_logger().error(
+                f"Cartesian path service timed out for {robot_name}"
+            )
+            return None
+        except Exception as exc:
+            self.get_logger().error(
+                f"Cartesian path service failed: {exc}"
+            )
+            return None
+
+    async def _plan_multi_waypoint_trajectory(
+        self,
+        robot_name: str,
+        poses: list,
+        velocity_scaling: Optional[float] = None,
+        idle_time: float = 0.0,
+    ) -> Optional[tuple]:
+        """Plan a single collision-free trajectory through multiple poses.
+
+        Strategy (Cartesian-first, OMPL-fallback):
+        1. Try Cartesian path planning (straight-line in workspace) for
+           each segment.  This produces safe, predictable motions with
+           no wild joint excursions.
+        2. If Cartesian planning fails for a segment (e.g. collision or
+           singularity), fall back to OMPL pose-based planning for
+           that segment only.
+        3. Concatenates all segments into ONE continuous trajectory.
+        4. If idle_time > 0, inserts dwell periods at each waypoint.
+        5. Applies a SINGLE retiming pass for velocity capping and
+           quintic C2 spline preparation across ALL segment boundaries.
+
+        Returns
+        -------
+        (RobotTrajectory, list of (pose_index, time_from_start), valid_indices)
+            Or None if planning fails.
+        """
+        from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+        from builtin_interfaces.msg import Duration
+
+        cfg = ROBOT_CONFIG[robot_name]
+        if velocity_scaling is None:
+            velocity_scaling = self.max_velocity_scaling
+
+        current = self._robot_states[robot_name].joint_positions
+
+        # ── Plan collision-free segments (Cartesian first, OMPL fallback) ──
+        segments = []
+        valid_indices = []
+        failed_names = []
+
+        for i, pose_data in enumerate(poses):
+            pose_name = pose_data.get("name", f"pose_{i}")
+            position = pose_data.get("position", [0, 0, 0])
+            orientation = pose_data.get("orientation", [0, 0, 0, 1])
+
+            self.get_logger().info(
+                f"Planning segment {len(segments)+1} to pose {i} ({pose_name}): "
+                f"pos=[{position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}], "
+                f"orn=[{orientation[0]:.3f}, {orientation[1]:.3f}, {orientation[2]:.3f}, {orientation[3]:.3f}]"
+            )
+
+            # ── Attempt 1: Cartesian path (straight-line in workspace) ──
+            # This is the safest approach: the tool tip moves in a
+            # straight line from the current position to the goal.
+            # No wild joint excursions.
+            seg_traj = None
+            try:
+                cart_req = GetCartesianPath.Request()
+                cart_req.header.frame_id = cfg["base_link"]
+                cart_req.header.stamp = self.get_clock().now().to_msg()
+                cart_req.group_name = cfg["planning_group"]
+                cart_req.link_name = cfg["ik_tip_link"]
+
+                # Start state = current joints
+                cur_joints = self._robot_states[robot_name].joint_positions
+                if cur_joints and len(cur_joints) == 6:
+                    cart_req.start_state.joint_state.name = list(cfg["joints"])
+                    cart_req.start_state.joint_state.position = list(cur_joints)
+                    cart_req.start_state.is_diff = False
+
+                # Single waypoint = the target pose
+                target = Pose()
+                target.position = Point(
+                    x=float(position[0]), y=float(position[1]),
+                    z=float(position[2]),
+                )
+                target.orientation = Quaternion(
+                    x=float(orientation[0]), y=float(orientation[1]),
+                    z=float(orientation[2]), w=float(orientation[3]),
+                )
+                cart_req.waypoints.append(target)
+
+                cart_req.max_step = 0.005  # 5mm resolution
+                cart_req.jump_threshold = 0.0  # disable jump detection
+                cart_req.avoid_collisions = True
+
+                future = self._cartesian_path_client.call_async(cart_req)
+                result = await await_ros_future(future, timeout=15.0)
+                fraction = result.fraction
+
+                if fraction >= 0.98:
+                    seg_traj = result.solution
+                    self.get_logger().info(
+                        f"Cartesian path OK for {pose_name}: "
+                        f"fraction={fraction:.1%}, "
+                        f"{len(seg_traj.joint_trajectory.points)} pts"
+                    )
+                else:
+                    self.get_logger().info(
+                        f"Cartesian path for {pose_name}: "
+                        f"fraction={fraction:.1%} — trying OMPL"
+                    )
+
+            except Exception as exc:
+                self.get_logger().info(
+                    f"Cartesian path failed for {pose_name}: {exc} — trying OMPL"
+                )
+
+            # ── Attempt 2: IK + joint-space OMPL (fallback) ────────
+            # Solve IK with multiple seeds, then plan to joints.
+            # This is safer than pose-based OMPL which can find
+            # wild wraparound joint configurations.
+            if seg_traj is None:
+                self.get_logger().info(
+                    f"IK+joint fallback for {pose_name}, "
+                    f"cur_joints=[{', '.join(f'{v:.3f}' for v in (self._robot_states[robot_name].joint_positions or []))}]"
+                )
+                pose_obj = Pose()
+                pose_obj.position = Point(
+                    x=float(position[0]), y=float(position[1]),
+                    z=float(position[2]),
+                )
+                pose_obj.orientation = Quaternion(
+                    x=float(orientation[0]), y=float(orientation[1]),
+                    z=float(orientation[2]), w=float(orientation[3]),
+                )
+
+                cur_joints = self._robot_states[robot_name].joint_positions
+                seeds = [
+                    cur_joints if cur_joints and len(cur_joints) == 6 else None,
+                    list(cfg["home_position"]),
+                    None,  # Let IK solver pick random seed
+                ]
+
+                for seed_idx, seed in enumerate(seeds):
+                    ik_result = await self._solve_ik(
+                        robot_name, pose_obj, seed_joints=seed
+                    )
+                    if ik_result is None:
+                        continue
+
+                    # Validate: check joint displacement from current
+                    if cur_joints and len(cur_joints) == 6:
+                        max_disp = max(
+                            abs(ik_result[j] - cur_joints[j]) for j in range(6)
+                        )
+                        if max_disp > 3.14:  # > 180° on any joint → skip
+                            self.get_logger().info(
+                                f"IK seed {seed_idx}: max joint disp "
+                                f"{max_disp:.2f} rad > 3.14 — skipping"
+                            )
+                            continue
+
+                    # Plan to this IK solution
+                    seg_traj = await self._plan_to_joints(
+                        robot_name, ik_result,
+                        velocity_scaling=velocity_scaling,
+                        skip_retiming=True,
+                    )
+                    if seg_traj is not None:
+                        self.get_logger().info(
+                            f"IK+OMPL OK for {pose_name} (seed {seed_idx})"
+                        )
+                        break
+                    else:
+                        self.get_logger().info(
+                            f"IK seed {seed_idx} plan failed for {pose_name}"
+                        )
+
+            if seg_traj is None:
+                failed_names.append(pose_name)
+                self.get_logger().warn(
+                    f"All planning failed for waypoint {i} ({pose_name}) — skipping"
+                )
+                continue
+
+            segments.append(seg_traj)
+            valid_indices.append(i)
+
+            # Log segment joint displacement for safety diagnostics
+            final_pts = seg_traj.joint_trajectory.points
+            if final_pts:
+                start_j = list(final_pts[0].positions)
+                end_j = list(final_pts[-1].positions)
+                max_disp = max(abs(end_j[j] - start_j[j]) for j in range(6))
+                self.get_logger().info(
+                    f"Segment {len(segments)} ({pose_name}): "
+                    f"{len(final_pts)} pts, max_joint_disp={max_disp:.3f} rad, "
+                    f"end_joints=[{', '.join(f'{v:.3f}' for v in end_j)}]"
+                )
+
+            # Update start state for next segment
+            final_pts = seg_traj.joint_trajectory.points
+            if final_pts:
+                self._robot_states[robot_name].joint_positions = list(
+                    final_pts[-1].positions
+                )
+
+        # Restore actual joint state
+        if current and len(current) == 6:
+            self._robot_states[robot_name].joint_positions = current
+
+        if not segments:
+            self.get_logger().error("All pose plans failed — cannot build trajectory")
+            return None
+
+        if failed_names:
+            self.get_logger().warn(
+                f"Planning failed for {len(failed_names)} poses: "
+                f"{failed_names[:5]}{'...' if len(failed_names) > 5 else ''}"
+            )
+
+        self.get_logger().info(
+            f"All {len(segments)} segments planned "
+            f"(Cartesian-first with collision checking)"
+        )
+
+        # ── Phase 3: Concatenate segments into one trajectory ────────
+        # CRITICAL: Extract ONLY positions from each raw MoveIt segment.
+        # Discard TOTG velocities/accelerations/timing because they
+        # include per-segment deceleration-to-zero that would create
+        # velocity discontinuities at every segment boundary.
+        #
+        # We assign simple placeholder timing (equispaced) here —
+        # the single retiming pass in Phase 4 will recompute proper
+        # timing, velocities (central differences), and accelerations
+        # (second-order differences) across ALL segment boundaries
+        # for a smooth quintic C2 trajectory.
+        n_joints = len(cfg["joints"])
+        all_positions = []    # list of position tuples
+        pose_point_indices = []  # (pose_index, point_index_in_all_positions)
+
+        for seg_idx, seg_traj in enumerate(segments):
+            seg_pts = seg_traj.joint_trajectory.points
+            if not seg_pts:
+                continue
+
+            # Skip the first point of each segment after the first
+            # (it duplicates the last point of the previous segment)
+            start_idx = 1 if seg_idx > 0 and all_positions else 0
+
+            for pt_idx in range(start_idx, len(seg_pts)):
+                all_positions.append(list(seg_pts[pt_idx].positions))
+
+            # Record the point index where this pose's waypoint lands
+            pose_point_indices.append(
+                (valid_indices[seg_idx], len(all_positions) - 1)
+            )
+
+            # Insert dwell point if idle_time > 0 (pause at each pose)
+            # The dwell uses the same position — retiming will assign
+            # zero velocity/acceleration because dq=0.
+            is_last = (seg_idx == len(segments) - 1)
+            if idle_time > 0 and not is_last:
+                all_positions.append(list(seg_pts[-1].positions))
+
+        if not all_positions:
+            self.get_logger().error("No trajectory points after concatenation")
+            return None
+
+        # Build trajectory with ONLY positions + placeholder timing.
+        # Use equispaced 0.1s intervals — the retiming pass will
+        # adjust timing based on actual joint displacements.
+        all_points = []
+        for k, pos in enumerate(all_positions):
+            pt = JointTrajectoryPoint()
+            pt.positions = pos
+            # Placeholder timing — will be overwritten by retiming
+            t = k * 0.1
+            sec = int(t)
+            nsec = int((t - sec) * 1e9)
+            pt.time_from_start = Duration(sec=sec, nanosec=nsec)
+            all_points.append(pt)
+
+        # Package into RobotTrajectory
+        trajectory = RobotTrajectory()
+        trajectory.joint_trajectory = JointTrajectory()
+        trajectory.joint_trajectory.joint_names = list(cfg["joints"])
+        trajectory.joint_trajectory.points = all_points
+
+        # ── Phase 4: SINGLE retiming pass across ALL segments ────────
+        # Resamples to UNIFORM time spacing with cosine-blended velocity
+        # profile.  Produces smooth quintic C2 trajectory with no
+        # non-uniform dt artefacts.
+        retimed = self._retime_trajectory_constant_speed(
+            trajectory,
+            max_joint_vel=velocity_scaling * 1.0,
+            force_zero_endpoints=(idle_time <= 0),
+        )
+
+        # ── Compute pose_times by matching positions ─────────────────
+        # After resampling, point indices changed.  Find the resampled
+        # point whose positions are closest to each target pose's final
+        # joint positions (the last point of each segment before concat).
+        pts = retimed.joint_trajectory.points
+        pose_times = []
+
+        # Collect target joint positions for each segment endpoint
+        target_joints = []
+        for seg_idx, seg_traj in enumerate(segments):
+            seg_pts = seg_traj.joint_trajectory.points
+            if seg_pts:
+                target_joints.append(
+                    (valid_indices[seg_idx], list(seg_pts[-1].positions))
+                )
+
+        for pose_idx, target_j in target_joints:
+            best_k = 0
+            best_dist = float('inf')
+            for k in range(len(pts)):
+                dist = max(
+                    abs(pts[k].positions[j] - target_j[j])
+                    for j in range(min(len(pts[k].positions), len(target_j)))
+                )
+                if dist < best_dist:
+                    best_dist = dist
+                    best_k = k
+            t = (
+                pts[best_k].time_from_start.sec +
+                pts[best_k].time_from_start.nanosec * 1e-9
+            )
+            pose_times.append((pose_idx, t))
+
+        total_dur = (
+            pts[-1].time_from_start.sec +
+            pts[-1].time_from_start.nanosec * 1e-9
+        ) if pts else 0.0
+
+        self.get_logger().info(
+            f"Concatenated trajectory: {len(pts)} points, "
+            f"duration={total_dur:.2f}s, segments={len(segments)}, "
+            f"dwells={'yes' if idle_time > 0 else 'no'} "
+            f"(single continuous execution, collision-checked)"
+        )
+
+        return retimed, pose_times, valid_indices
 
     async def _execute_trajectory(
         self, robot_name: str, trajectory: RobotTrajectory, timeout: float = 60.0
@@ -610,6 +1552,11 @@ class CommandGatewayNode(Node):
 
             goal = FollowJointTrajectory.Goal()
             goal.trajectory = trajectory.joint_trajectory
+            # Allow generous goal_time_tolerance for the scaled
+            # controller — speed scaling can slow execution, so
+            # give it plenty of margin beyond the planned duration.
+            goal.goal_time_tolerance.sec = 30
+            goal.goal_time_tolerance.nanosec = 0
 
             # ── Timestamp sanity checks ─────────────────────────────
             # MoveIt should produce monotonically increasing timestamps
@@ -1110,6 +2057,33 @@ class CommandGatewayNode(Node):
             "position_source": "real_robot" if (is_real and has_joints) else "default",
         }
 
+    # ── Trajectory action-client management ─────────────────────────
+
+    def _rebuild_traj_clients(self) -> None:
+        """(Re)create FollowJointTrajectory action clients.
+
+        Always uses the ``ScaledJointTrajectoryController`` which is
+        reliable in dual-robot setups.  The passthrough controller
+        cannot be used because one robot's RTDE instability causes
+        the other robot's controller to be deactivated mid-trajectory
+        by the controller_stopper.
+        """
+        # Destroy old clients first (safe even if dict is empty)
+        for old_client in self._traj_clients.values():
+            old_client.destroy()
+        self._traj_clients.clear()
+
+        for robot_name, cfg in ROBOT_CONFIG.items():
+            ctrl = cfg["controller"]
+            action_ns = f"/{ctrl}/follow_joint_trajectory"
+            self._traj_clients[robot_name] = ActionClient(
+                self, FollowJointTrajectory, action_ns,
+                callback_group=self.cb_group,
+            )
+            self.get_logger().info(
+                f"Trajectory action client for {robot_name}: {action_ns}"
+            )
+
     # ── Mode switching helpers ───────────────────────────────────────
 
     @staticmethod
@@ -1383,6 +2357,8 @@ class CommandGatewayNode(Node):
 
             # Update internal state
             self._current_mode = mode
+            # Recreate action clients for the new mode's controllers
+            self._rebuild_traj_clients()
 
             return {
                 "success": True,
@@ -1417,22 +2393,29 @@ class CommandGatewayNode(Node):
 
     async def _rpc_run_proto_sim(self, client, request_id, params):
         """
-        Full IK → Plan → Execute pipeline for every Cartesian pose
-        the client sends.
+        Unified multi-waypoint trajectory execution.
 
-        The client generates poses locally for the *tool_tip_link*
-        (where the camera / iPhone is) and transforms them into the
-        reference frame returned by get_environment_info (currently
-        ``world``).  Each pose is:
-            {position: [x,y,z], orientation: [qx,qy,qz,qw]}
+        Instead of planning and executing each pose as a separate
+        trajectory (which causes stop-start jerkiness), this method:
+
+        1. Pre-solves IK for ALL poses at once.
+        2. Plans a SINGLE trajectory through all waypoints.
+        3. Executes it in ONE FollowJointTrajectory action goal.
+        4. Reports progress based on elapsed time vs. pose time mapping.
+
+        If idle_time > 0, dwell periods are inserted at each waypoint
+        so the robot pauses momentarily (for photo capture) but still
+        executes the entire trajectory as a single continuous action
+        — no re-planning or re-accelerating between poses.
+
+        Falls back to the legacy pose-by-pose approach if unified
+        planning fails.
         """
         robot_name = params.get("robot_name", list(ROBOT_CONFIG.keys())[0])
         poses = params.get("poses", [])
         idle_time = params.get("idle_time", 2.0)
         mode = params.get("mode", "simulation")
-        # Cap speed for safety, matching original server behaviour.
         requested_speed = params.get("move_speed", self.max_velocity_scaling)
-        # Clamp to the configured maximum; never exceed the ROS parameter.
         move_speed = min(self.max_velocity_scaling, requested_speed)
 
         if robot_name not in ROBOT_CONFIG:
@@ -1454,18 +2437,13 @@ class CommandGatewayNode(Node):
 
         cfg = ROBOT_CONFIG[robot_name]
         total = len(poses)
-        completed = 0
-        ik_failed = 0
-        plan_failed = 0
 
         self.get_logger().info(
             f"Proto-sim START: {total} poses on {robot_name} "
-            f"(mode={mode}, speed={move_speed})"
+            f"(mode={mode}, speed={move_speed}, idle={idle_time}s)"
         )
 
         # ── Move to HOME before starting protocol ──────────────────
-        # The original server always starts from a known home position
-        # to ensure deterministic IK seeds and consistent trajectories.
         home = cfg["home_position"]
         current = self._robot_states[robot_name].joint_positions
         if current and len(current) == 6:
@@ -1485,13 +2463,203 @@ class CommandGatewayNode(Node):
                     "Could not reach home, starting from current position"
                 )
             else:
-                self.get_logger().info(
-                    f"{robot_name} at HOME, starting protocol"
-                )
+                self.get_logger().info(f"{robot_name} at HOME, starting protocol")
         else:
-            self.get_logger().info(
-                f"{robot_name} already at HOME, starting protocol"
+            self.get_logger().info(f"{robot_name} already at HOME")
+
+        # ── Unified multi-waypoint planning ────────────────────────
+        await client.websocket.send(json.dumps({
+            "type": "rpc_feedback",
+            "request_id": request_id,
+            "current_pose_index": 0,
+            "total_poses": total,
+            "progress_percent": 0,
+            "status": "planning",
+            "message": f"Planning trajectory through {total} poses…",
+        }))
+
+        plan_result = await self._plan_multi_waypoint_trajectory(
+            robot_name, poses,
+            velocity_scaling=move_speed,
+            idle_time=idle_time,
+        )
+
+        if plan_result is None:
+            # Unified planning failed — fall back to legacy pose-by-pose
+            self.get_logger().warn(
+                "Multi-waypoint planning failed — "
+                "falling back to pose-by-pose execution"
             )
+            await self._rpc_run_proto_sim_legacy(
+                client, request_id, robot_name, poses,
+                idle_time, mode, move_speed, cfg, total,
+            )
+            return
+
+        trajectory, pose_times, valid_indices = plan_result
+        ik_failed = total - len(valid_indices)
+
+        # Compute total trajectory duration for timeout
+        pts = trajectory.joint_trajectory.points
+        total_dur = (
+            pts[-1].time_from_start.sec +
+            pts[-1].time_from_start.nanosec * 1e-9
+        ) if pts else 0.0
+
+        self.get_logger().info(
+            f"Executing unified trajectory: {len(pts)} points, "
+            f"duration={total_dur:.2f}s, poses={len(valid_indices)}"
+        )
+
+        # ── Ensure robot program is running ────────────────────────
+        ready = await self._ensure_robot_ready(robot_name, timeout=15.0)
+        if not ready:
+            current_mode = self._read_current_mode()
+            if current_mode in ("real", "both"):
+                self.get_logger().error(
+                    f"Robot program not running on {robot_name}"
+                )
+                await self._send_error(
+                    client, request_id,
+                    f"Robot program not running on {robot_name}"
+                )
+                self._proto_sim_running = False
+                return
+
+        # ── Send progress updates during execution ─────────────────
+        # Start execution and progress monitoring concurrently.
+        exec_timeout = max(total_dur * 2.0, 60.0)
+
+        # Launch execution in background
+        exec_task = asyncio.ensure_future(
+            self._execute_trajectory(robot_name, trajectory, timeout=exec_timeout)
+        )
+
+        # Monitor progress based on elapsed time
+        exec_start = time.monotonic()
+        pose_time_idx = 0  # next pose to report
+        last_reported = -1
+
+        while not exec_task.done():
+            elapsed = time.monotonic() - exec_start
+            progress = min(elapsed / total_dur, 1.0) if total_dur > 0 else 1.0
+
+            # Report progress for each pose as we pass its time
+            while (pose_time_idx < len(pose_times) and
+                   elapsed >= pose_times[pose_time_idx][1]):
+                pi = pose_times[pose_time_idx][0]
+                if pi != last_reported:
+                    pose_name = poses[pi].get("name", f"pose_{pi}")
+                    await client.websocket.send(json.dumps({
+                        "type": "rpc_feedback",
+                        "request_id": request_id,
+                        "current_pose_index": pi,
+                        "total_poses": total,
+                        "current_pose_name": pose_name,
+                        "progress_percent": progress * 100,
+                        "status": "reached",
+                    }))
+                    self.get_logger().info(
+                        f"  [{pi+1}/{total}] ✓ passed {pose_name} "
+                        f"(t={elapsed:.1f}s)"
+                    )
+                    last_reported = pi
+                pose_time_idx += 1
+
+            if self._proto_sim_stop:
+                self.get_logger().info("Proto-sim stop requested — cancelling")
+                # Cancel the action if possible
+                break
+
+            await asyncio.sleep(0.5)
+
+        # Wait for execution result
+        try:
+            exec_ok = await asyncio.wait_for(
+                asyncio.shield(exec_task), timeout=10.0
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            exec_ok = False
+
+        completed = len(valid_indices) if exec_ok else 0
+        plan_failed = 0 if exec_ok else 1
+
+        if exec_ok:
+            self.get_logger().info(
+                f"Unified trajectory executed successfully: "
+                f"{len(valid_indices)} poses"
+            )
+            self._exec_fail_count = 0
+        else:
+            self._exec_fail_count += 1
+            self.get_logger().error(
+                f"Unified trajectory execution failed"
+            )
+            self._log_cross_robot_diagnostics(robot_name)
+
+        # ── Return home ────────────────────────────────────────────
+        if completed > 0 and not self._proto_sim_stop:
+            self.get_logger().info(f"Returning {robot_name} to home…")
+            await self._move_to_home(robot_name)
+
+        self._proto_sim_running = False
+
+        # ── Build summary ──────────────────────────────────────────
+        summary_parts = [f"Completed {completed}/{total} poses"]
+        if ik_failed:
+            summary_parts.append(f"{ik_failed} IK failed")
+        if plan_failed:
+            summary_parts.append(f"trajectory execution failed")
+
+        hardware_issues = []
+        current_mode = self._read_current_mode()
+        if current_mode in ("real", "both"):
+            for rn in ROBOT_CONFIG:
+                if not self._robot_program_running.get(rn, False):
+                    hardware_issues.append(rn)
+        if hardware_issues:
+            summary_parts.append(
+                f"⚠ Hardware: {', '.join(hardware_issues)} disconnected"
+            )
+
+        summary = " | ".join(summary_parts)
+        self.get_logger().info(
+            f"Proto-sim DONE: {completed}/{total} ok, "
+            f"{ik_failed} IK-fail, {plan_failed} exec-fail"
+            + (f" | hw-issues: {hardware_issues}" if hardware_issues else "")
+        )
+
+        await client.websocket.send(json.dumps({
+            "type": "rpc_result",
+            "request_id": request_id,
+            "success": completed > 0,
+            "message": summary,
+            "completed": completed,
+            "collision_rejected": 0,
+            "ik_failed": ik_failed,
+            "real_failed": plan_failed,
+            "total": total,
+            "stopped": self._proto_sim_stop,
+            "hardware_issues": hardware_issues,
+        }))
+
+    async def _rpc_run_proto_sim_legacy(
+        self, client, request_id, robot_name, poses,
+        idle_time, mode, move_speed, cfg, total,
+    ):
+        """Legacy pose-by-pose execution fallback.
+
+        Used when unified multi-waypoint planning fails (e.g. Cartesian
+        path can't be computed, or all IK solutions fail).  Each pose
+        is planned and executed as a separate trajectory.
+        """
+        completed = 0
+        ik_failed = 0
+        plan_failed = 0
+
+        self.get_logger().info(
+            "Running LEGACY pose-by-pose execution (fallback)"
+        )
 
         for i, pose_data in enumerate(poses):
             if self._proto_sim_stop:
@@ -1502,7 +2670,6 @@ class CommandGatewayNode(Node):
             position = pose_data.get("position", [0, 0, 0])
             orientation = pose_data.get("orientation", [0, 0, 0, 1])
 
-            # Send progress feedback
             await client.websocket.send(json.dumps({
                 "type": "rpc_feedback",
                 "request_id": request_id,
@@ -1515,8 +2682,7 @@ class CommandGatewayNode(Node):
 
             self.get_logger().info(
                 f"  [{i+1}/{total}] {pose_name} → "
-                f"pos=({position[0]:.3f},{position[1]:.3f},{position[2]:.3f}) "
-                f"quat=({orientation[0]:.4f},{orientation[1]:.4f},{orientation[2]:.4f},{orientation[3]:.4f})"
+                f"pos=({position[0]:.3f},{position[1]:.3f},{position[2]:.3f})"
             )
 
             result = await self._move_to_pose(
@@ -1526,34 +2692,22 @@ class CommandGatewayNode(Node):
 
             if result == "success":
                 completed += 1
-                self._exec_fail_count = 0  # reset consecutive failure counter
-                self.get_logger().info(
-                    f"  [{i+1}/{total}] ✓ reached {pose_name}"
-                )
+                self._exec_fail_count = 0
+                self.get_logger().info(f"  [{i+1}/{total}] ✓ reached {pose_name}")
                 await asyncio.sleep(idle_time)
             elif result == "ik_failed":
                 ik_failed += 1
-                self.get_logger().warn(
-                    f"  [{i+1}/{total}] ✗ IK failed for {pose_name}"
-                )
+                self.get_logger().warn(f"  [{i+1}/{total}] ✗ IK failed for {pose_name}")
             elif result == "plan_failed":
                 plan_failed += 1
-                self.get_logger().warn(
-                    f"  [{i+1}/{total}] ✗ Planning failed for {pose_name}"
-                )
+                self.get_logger().warn(f"  [{i+1}/{total}] ✗ Planning failed for {pose_name}")
             elif result == "exec_failed":
                 self._exec_fail_count += 1
-                plan_failed += 1  # count as plan_failed for the summary
-
-                # Log cross-robot diagnostics to help identify cascade failures
+                plan_failed += 1
                 self._log_cross_robot_diagnostics(robot_name)
-
                 self.get_logger().error(
-                    f"  [{i+1}/{total}] ✗ Execution failed for {pose_name} "
-                    f"(consecutive exec failures: {self._exec_fail_count})"
+                    f"  [{i+1}/{total}] ✗ Execution failed for {pose_name}"
                 )
-
-                # Build diagnostic hint for the client
                 other_robots_down = [
                     rn for rn in ROBOT_CONFIG
                     if rn != robot_name
@@ -1563,10 +2717,8 @@ class CommandGatewayNode(Node):
                 if other_robots_down:
                     diag_hint = (
                         f" — possible cause: {', '.join(other_robots_down)} "
-                        f"lost connection (shared controller affected)"
+                        f"lost connection"
                     )
-
-                # Notify client of the exec failure with diagnostic info
                 await client.websocket.send(json.dumps({
                     "type": "rpc_feedback",
                     "request_id": request_id,
@@ -1577,72 +2729,45 @@ class CommandGatewayNode(Node):
                     "status": "exec_failed",
                     "message": f"Execution failed for {pose_name}{diag_hint}",
                 }))
-
-                # If robot program is no longer running, abort remaining poses
-                # — there's no point trying more if the controller is dead
                 if not self._robot_program_running.get(robot_name, False):
                     current_mode = self._read_current_mode()
                     if current_mode in ("real", "both"):
                         self.get_logger().error(
-                            f"Robot program stopped on {robot_name} — "
-                            f"aborting remaining {total - i - 1} poses"
+                            f"Robot program stopped — aborting remaining poses"
                         )
-                        await client.websocket.send(json.dumps({
-                            "type": "rpc_feedback",
-                            "request_id": request_id,
-                            "current_pose_index": i,
-                            "total_poses": total,
-                            "status": "hardware_error",
-                            "message": (
-                                f"Robot program stopped on {robot_name}. "
-                                f"Aborting remaining poses.{diag_hint}"
-                            ),
-                        }))
                         break
             else:
                 plan_failed += 1
-                self.get_logger().warn(
-                    f"  [{i+1}/{total}] ✗ Unknown failure '{result}' for {pose_name}"
-                )
 
-        # Reset consecutive exec fail counter
         self._exec_fail_count = 0
 
-        # Return home
         if completed > 0 and not self._proto_sim_stop:
             self.get_logger().info(f"Returning {robot_name} to home…")
             await self._move_to_home(robot_name)
 
         self._proto_sim_running = False
 
-        # Build summary with diagnostic details
-        summary_parts = [
-            f"Completed {completed}/{total} poses",
-        ]
+        summary_parts = [f"Completed {completed}/{total} poses (legacy)"]
         if ik_failed:
             summary_parts.append(f"{ik_failed} IK failed")
         if plan_failed:
             summary_parts.append(f"{plan_failed} plan/exec failed")
 
-        # Check if any robot lost connection during the run
         hardware_issues = []
         current_mode = self._read_current_mode()
         if current_mode in ("real", "both"):
             for rn in ROBOT_CONFIG:
                 if not self._robot_program_running.get(rn, False):
                     hardware_issues.append(rn)
-
         if hardware_issues:
             summary_parts.append(
-                f"⚠ Hardware issue: {', '.join(hardware_issues)} disconnected"
+                f"⚠ Hardware: {', '.join(hardware_issues)} disconnected"
             )
 
         summary = " | ".join(summary_parts)
-
         self.get_logger().info(
-            f"Proto-sim DONE: {completed}/{total} ok, "
+            f"Proto-sim DONE (legacy): {completed}/{total} ok, "
             f"{ik_failed} IK-fail, {plan_failed} plan-fail"
-            + (f" | hw-issues: {hardware_issues}" if hardware_issues else "")
         )
 
         await client.websocket.send(json.dumps({

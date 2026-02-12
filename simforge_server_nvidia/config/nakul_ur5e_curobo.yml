@@ -72,24 +72,44 @@ robot_cfg:
         - center: [0.0, 0.0, -0.03]
           radius: 0.04
       nakul_tool_base_link:
-        # iPhone tool collision box: 0.3 x 0.13 x 0.055 at
-        # origin (-0.065, 0, 0.02) rotated 90° around X.
-        # After rotation the effective extent in tool_base_link is:
+        # iPhone tool collision box in tool_base_link frame (NO rotation):
+        #   size: 0.3 x 0.13 x 0.055
+        #   origin: (-0.065, 0, 0.02), rpy=(0, 0, 0)
+        # Effective extents:
         #   X: [-0.215 … +0.085]  (0.30 m, along the tool length)
-        #   Y: [-0.028 … +0.028]  (0.055 m, thin side)
-        #   Z: [-0.045 … +0.085]  (0.13 m, wide side now vertical)
-        # Cover with 6 overlapping spheres along X, radius 0.065
-        - center: [0.085, 0.0, 0.02]
+        #   Y: [-0.065 … +0.065]  (0.13 m, WIDE dimension)
+        #   Z: [-0.008 … +0.048]  (0.055 m, thin)
+        #
+        # Two rows of spheres (Y=+0.03 and Y=-0.03) along X with
+        # radius=0.065 → each sphere covers ±0.065 from its center,
+        # giving Y coverage ≈ [-0.095, +0.095] (≥30 mm margin).
+        # X coverage: 6 spheres from X=+0.085 to X=-0.215.
+        # Z center at 0.02 (box centroid).
+        # Row 1: Y = +0.03
+        - center: [0.085, 0.03, 0.02]
           radius: 0.065
-        - center: [0.025, 0.0, 0.02]
+        - center: [0.025, 0.03, 0.02]
           radius: 0.065
-        - center: [-0.035, 0.0, 0.02]
+        - center: [-0.035, 0.03, 0.02]
           radius: 0.065
-        - center: [-0.095, 0.0, 0.02]
+        - center: [-0.095, 0.03, 0.02]
           radius: 0.065
-        - center: [-0.155, 0.0, 0.02]
+        - center: [-0.155, 0.03, 0.02]
           radius: 0.065
-        - center: [-0.215, 0.0, 0.02]
+        - center: [-0.215, 0.03, 0.02]
+          radius: 0.065
+        # Row 2: Y = -0.03
+        - center: [0.085, -0.03, 0.02]
+          radius: 0.065
+        - center: [0.025, -0.03, 0.02]
+          radius: 0.065
+        - center: [-0.035, -0.03, 0.02]
+          radius: 0.065
+        - center: [-0.095, -0.03, 0.02]
+          radius: 0.065
+        - center: [-0.155, -0.03, 0.02]
+          radius: 0.065
+        - center: [-0.215, -0.03, 0.02]
           radius: 0.065
 
     collision_sphere_buffer: 0.005
