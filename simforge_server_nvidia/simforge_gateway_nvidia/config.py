@@ -2,6 +2,15 @@
 Robot configuration, constants, and shared dataclasses.
 
 All modules import from here to avoid circular dependencies.
+
+The environment is selected by the ENV_CONFIG environment variable.
+Default: 'valid8_dual_ur5e' (backward compatible with the original
+hardcoded dual UR5e setup).
+
+Robot IPs can be overridden via environment variables:
+  ROBOT_IP_NAKUL_UR5E=192.168.1.9
+  ROBOT_IP_SAHADEV_UR5E=192.168.1.16
+  ROBOT_IP_UR20=10.0.0.1
 """
 
 import math
@@ -12,50 +21,34 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-# ── Robot configuration ──────────────────────────────────────────
+# ── Environment-driven configuration ────────────────────────────
 
-ROBOT_CONFIG: Dict[str, dict] = {
-    "nakul_ur5e": {
-        "prefix": "nakul_",
-        "ip": "192.168.1.9",
-        "joints": [
-            "nakul_shoulder_pan_joint",
-            "nakul_shoulder_lift_joint",
-            "nakul_elbow_joint",
-            "nakul_wrist_1_joint",
-            "nakul_wrist_2_joint",
-            "nakul_wrist_3_joint",
-        ],
-        "controller": "nakul_scaled_joint_trajectory_controller",
-        "ee_link": "nakul_tool0",
-        "ik_tip_link": "nakul_tool_tip_link",
-        "base_link": "nakul_base_link",
-        "home_position": [0.0, -math.pi / 2, 0.0,
-                          -math.pi / 2, 0.0, 0.0],
-        "curobo_config": "nakul_ur5e_curobo.yml",
-    },
-    "sahadev_ur5e": {
-        "prefix": "sahadev_",
-        "ip": "192.168.1.16",
-        "joints": [
-            "sahadev_shoulder_pan_joint",
-            "sahadev_shoulder_lift_joint",
-            "sahadev_elbow_joint",
-            "sahadev_wrist_1_joint",
-            "sahadev_wrist_2_joint",
-            "sahadev_wrist_3_joint",
-        ],
-        "controller": "sahadev_scaled_joint_trajectory_controller",
-        "ee_link": "sahadev_tool0",
-        "ik_tip_link": "sahadev_tool0",
-        "base_link": "sahadev_base_link",
-        "home_position": [0.0, -math.pi / 2, 0.0,
-                          -math.pi / 2, 0.0, 0.0],
-        "curobo_config": "sahadev_ur5e_curobo.yml",
-    },
-}
+from .env_loader import load_environment, get_available_environments
 
-KNOWN_OBJECTS = ["face_link", "table_link", "shop_floor"]
+ENV_CONFIG_NAME = os.environ.get("ENV_CONFIG", "valid8_dual_ur5e")
+
+try:
+    _env = load_environment(ENV_CONFIG_NAME)
+    ROBOT_CONFIG: Dict[str, dict] = _env.robot_config
+    KNOWN_OBJECTS: List[str] = _env.known_objects
+    ENV_CONTROL_PACKAGE: str = _env.control_package
+    ENV_DESCRIPTION_PACKAGE: str = _env.description_package
+    ENV_WORLD_COLLISION_CONFIG: str = _env.world_collision_config
+    ENV_NAME: str = _env.name
+except FileNotFoundError:
+    # Fallback: if running outside Docker with no config dir,
+    # provide minimal defaults so imports don't break.
+    import warnings
+    warnings.warn(
+        f"Environment config '{ENV_CONFIG_NAME}' not found. "
+        f"Using empty defaults. Available: {get_available_environments()}"
+    )
+    ROBOT_CONFIG = {}
+    KNOWN_OBJECTS = []
+    ENV_CONTROL_PACKAGE = ""
+    ENV_DESCRIPTION_PACKAGE = ""
+    ENV_WORLD_COLLISION_CONFIG = "world_collision.yml"
+    ENV_NAME = ENV_CONFIG_NAME
 
 # ── Mode-switch signal files (shared with start_server.sh) ───
 MODE_SWITCH_FILE = "/tmp/simforge_mode_switch"

@@ -9,9 +9,20 @@
 #   9090  — Foxglove Bridge WebSocket
 #   8766  — cuRobo Command Gateway WebSocket
 #
+# Environment selection:
+#   ENV_CONFIG selects the robot environment:
+#     valid8_dual_ur5e  — Dual UR5e cell (default)
+#     face_robot_ur20   — Single UR20 with 8 face targets
+#
+#   Robot IPs via env vars:
+#     ROBOT_IP_NAKUL_UR5E, ROBOT_IP_SAHADEV_UR5E  (dual UR5e)
+#     ROBOT_IP_UR20                                 (single UR20)
+#
 # Usage:
 #   Simulation:  docker compose --profile sim up
 #   Production:  docker compose --profile prod up
+#
+#   Face robot:  ENV_CONFIG=face_robot_ur20 docker compose --profile sim up
 #
 # GPU requirements:
 #   - NVIDIA driver 535+ with CUDA 12.2 support
@@ -30,8 +41,15 @@ services:
     environment:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - ENV_CONFIG=${ENV_CONFIG:-valid8_dual_ur5e}
+      # Robot IPs (used in real mode, harmless in sim)
+      - ROBOT_IP_NAKUL_UR5E=${ROBOT_IP_NAKUL_UR5E:-192.168.1.9}
+      - ROBOT_IP_SAHADEV_UR5E=${ROBOT_IP_SAHADEV_UR5E:-192.168.1.16}
+      - ROBOT_IP_UR20=${ROBOT_IP_UR20:-0.0.0.0}
+      # Legacy compat
       - NAKUL_ROBOT_IP=${NAKUL_ROBOT_IP:-192.168.1.9}
       - SAHADEV_ROBOT_IP=${SAHADEV_ROBOT_IP:-192.168.1.16}
+      # Motion planning
       - MAX_VELOCITY_SCALING=${MAX_VELOCITY_SCALING:-0.25}
       - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-0.25}
       - INTERPOLATION_DT=${INTERPOLATION_DT:-0.02}
@@ -73,8 +91,15 @@ services:
     environment:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - ENV_CONFIG=${ENV_CONFIG:-valid8_dual_ur5e}
+      # Robot IPs
+      - ROBOT_IP_NAKUL_UR5E=${ROBOT_IP_NAKUL_UR5E:-192.168.1.9}
+      - ROBOT_IP_SAHADEV_UR5E=${ROBOT_IP_SAHADEV_UR5E:-192.168.1.16}
+      - ROBOT_IP_UR20=${ROBOT_IP_UR20:-0.0.0.0}
+      # Legacy compat
       - NAKUL_ROBOT_IP=${NAKUL_ROBOT_IP:-192.168.1.9}
       - SAHADEV_ROBOT_IP=${SAHADEV_ROBOT_IP:-192.168.1.16}
+      # Motion planning
       - MAX_VELOCITY_SCALING=${MAX_VELOCITY_SCALING:-0.25}
       - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-0.25}
       - INTERPOLATION_DT=${INTERPOLATION_DT:-0.02}

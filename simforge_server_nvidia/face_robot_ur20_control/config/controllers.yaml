@@ -1,0 +1,74 @@
+# Controller Configuration for Face Robot UR20
+#
+# Single UR20 robot — no prefix on joint names.
+
+controller_manager:
+  ros__parameters:
+    update_rate: 500  # Hz
+
+    # Joint State Broadcaster
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    # UR20 Controllers
+    io_and_status_controller:
+      type: ur_controllers/GPIOController
+
+    speed_scaling_state_broadcaster:
+      type: ur_controllers/SpeedScalingStateBroadcaster
+
+    force_torque_sensor_broadcaster:
+      type: force_torque_sensor_broadcaster/ForceTorqueSensorBroadcaster
+
+    scaled_joint_trajectory_controller:
+      type: ur_controllers/ScaledJointTrajectoryController
+
+# ========== Scaled Joint Trajectory Controller ==========
+scaled_joint_trajectory_controller:
+  ros__parameters:
+    joints:
+      - shoulder_pan_joint
+      - shoulder_lift_joint
+      - elbow_joint
+      - wrist_1_joint
+      - wrist_2_joint
+      - wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    state_publish_rate: 100.0
+    action_monitor_rate: 20.0
+    allow_partial_joints_goal: false
+    allow_nonzero_velocity_at_trajectory_end: false
+    open_loop_control: false
+    interpolation_method: splines
+    constraints:
+      stopped_velocity_tolerance: 0.5
+      goal_time: 2.0
+    speed_scaling_interface_name: speed_scaling/speed_scaling_factor
+
+# ========== IO and Status Controller ==========
+io_and_status_controller:
+  ros__parameters:
+    tf_prefix: ""
+
+# ========== Speed Scaling State Broadcaster ==========
+speed_scaling_state_broadcaster:
+  ros__parameters:
+    state_publish_rate: 100.0
+    tf_prefix: ""
+
+# ========== Force Torque Sensor Broadcaster ==========
+force_torque_sensor_broadcaster:
+  ros__parameters:
+    sensor_name: tcp_fts_sensor
+    state_interface_names:
+      - force.x
+      - force.y
+      - force.z
+      - torque.x
+      - torque.y
+      - torque.z
+    frame_id: tool0

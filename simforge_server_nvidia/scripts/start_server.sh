@@ -6,6 +6,11 @@
 # Foxglove Bridge) in a managed subprocess, then starts the
 # cuRobo Command Gateway node independently.
 #
+# Environment is selected by ENV_CONFIG (default: valid8_dual_ur5e).
+# Robot IPs come from environment variables:
+#   valid8_dual_ur5e: ROBOT_IP_NAKUL_UR5E, ROBOT_IP_SAHADEV_UR5E
+#   face_robot_ur20:  ROBOT_IP_UR20
+#
 # Usage (inside Docker):
 #   /start_server.sh [--sim|--real]
 # ──────────────────────────────────────────────────────────────
@@ -16,8 +21,18 @@ source /ros2_ws/install/setup.bash
 
 MODE="${1:---sim}"
 
-NAKUL_IP="${NAKUL_ROBOT_IP:-192.168.1.9}"
-SAHADEV_IP="${SAHADEV_ROBOT_IP:-192.168.1.16}"
+# ── Environment config ──
+export ENV_CONFIG="${ENV_CONFIG:-valid8_dual_ur5e}"
+echo "Environment: $ENV_CONFIG"
+
+# ── Legacy env var support (backward compat) ──
+# Map old-style NAKUL_ROBOT_IP/SAHADEV_ROBOT_IP to new ROBOT_IP_* vars
+if [ -n "$NAKUL_ROBOT_IP" ] && [ -z "$ROBOT_IP_NAKUL_UR5E" ]; then
+    export ROBOT_IP_NAKUL_UR5E="$NAKUL_ROBOT_IP"
+fi
+if [ -n "$SAHADEV_ROBOT_IP" ] && [ -z "$ROBOT_IP_SAHADEV_UR5E" ]; then
+    export ROBOT_IP_SAHADEV_UR5E="$SAHADEV_ROBOT_IP"
+fi
 
 # ── Signal files shared with the gateway ──
 MODE_SWITCH_FILE="/tmp/simforge_mode_switch"
@@ -71,9 +86,8 @@ start_ros_stack() {
     local use_fake="$1"
     echo "============================================"
     echo "Starting ROS2 stack"
+    echo "  Environment: $ENV_CONFIG"
     echo "  use_fake_hardware=${use_fake}"
-    echo "  Nakul IP:   $NAKUL_IP"
-    echo "  Sahadev IP: $SAHADEV_IP"
     echo "============================================"
 
     rm -f "$STACK_READY_FILE"
@@ -84,8 +98,6 @@ start_ros_stack() {
             launch_gateway:=false &
     else
         ros2 launch simforge_gateway_nvidia real.launch.py \
-            nakul_robot_ip:="$NAKUL_IP" \
-            sahadev_robot_ip:="$SAHADEV_IP" \
             launch_foxglove:=true \
             launch_gateway:=false \
             headless_mode:=true &

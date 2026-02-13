@@ -1,0 +1,46 @@
+# ──────────────────────────────────────────────────────────────────
+# Environment Configuration: valid8_dual_ur5e
+#
+# Dual UR5e cell — the original Valid8 setup.
+# Two UR5e robots on an optical table with a single face target.
+# ──────────────────────────────────────────────────────────────────
+
+environment:
+  name: valid8_dual_ur5e
+  description: "Valid8 dual UR5e evaluation cell"
+
+  # ROS2 packages for this environment
+  control_package: valid8_dual_cell_control
+  description_package: valid8_dual_cell_description
+
+  # cuRobo world collision config (in simforge_gateway_nvidia/config/)
+  world_collision_config: world_collision.yml
+
+  # Known world objects for collision avoidance
+  known_objects:
+    - face_link
+    - table_link
+    - shop_floor
+
+  robots:
+    nakul_ur5e:
+      prefix: "nakul_"
+      ur_type: ur5e
+      ip: "192.168.1.9"
+      controller: nakul_scaled_joint_trajectory_controller
+      ee_link: nakul_tool0
+      ik_tip_link: nakul_tool_tip_link
+      base_link: nakul_base_link
+      home_position: [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]
+      curobo_config: nakul_ur5e_curobo.yml
+
+    sahadev_ur5e:
+      prefix: "sahadev_"
+      ur_type: ur5e
+      ip: "192.168.1.16"
+      controller: sahadev_scaled_joint_trajectory_controller
+      ee_link: sahadev_tool0
+      ik_tip_link: sahadev_tool0
+      base_link: sahadev_base_link
+      home_position: [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]
+      curobo_config: sahadev_ur5e_curobo.yml

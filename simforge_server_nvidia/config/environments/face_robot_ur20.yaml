@@ -1,0 +1,41 @@
+# ──────────────────────────────────────────────────────────────────
+# Environment Configuration: face_robot_ur20
+#
+# Single UR20 with iPhone tool and 8 face targets in a circle.
+# Simulation-only (no real robot IP configured yet).
+# ──────────────────────────────────────────────────────────────────
+
+environment:
+  name: face_robot_ur20
+  description: "UR20 face interaction demo with 8 face targets"
+
+  # ROS2 packages for this environment
+  control_package: face_robot_ur20_control
+  description_package: face_robot_ur20_description
+
+  # cuRobo world collision config (in simforge_gateway_nvidia/config/)
+  world_collision_config: face_robot_ur20_world_collision.yml
+
+  # Known world objects for collision avoidance
+  known_objects:
+    - shop_floor
+    - face_link_0
+    - face_link_1
+    - face_link_2
+    - face_link_3
+    - face_link_4
+    - face_link_5
+    - face_link_6
+    - face_link_7
+
+  robots:
+    ur20:
+      prefix: ""
+      ur_type: ur20
+      ip: "0.0.0.0"
+      controller: scaled_joint_trajectory_controller
+      ee_link: tool0
+      ik_tip_link: tool_tip_link
+      base_link: base_link
+      home_position: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
+      curobo_config: ur20_curobo.yml

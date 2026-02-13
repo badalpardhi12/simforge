@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<!--
+Face Robot UR20 Controlled URDF
+
+Extends the description with ros2_control tags for a single UR20.
+Uses the patched ur_ros2_control_patched.xacro for tunable servoj params.
+
+  servoj_gain=750:       Soft tracking for non-RT systems.
+  servoj_lookahead_time=0.2: Maximum smoothing window.
+  keep_alive_count=50:   ~100ms grace period at 500Hz.
+-->
+<robot name="face_robot_ur20" xmlns:xacro="http://wiki.ros.org/xacro">
+
+  <!-- Include base description -->
+  <xacro:include filename="$(find face_robot_ur20_description)/urdf/face_robot_ur20.urdf.xacro"/>
+
+  <!-- Include PATCHED UR ros2_control macro -->
+  <xacro:include filename="$(find valid8_dual_cell_control)/urdf/ur_ros2_control_patched.xacro"/>
+
+  <!-- ========== ros2_control Arguments ========== -->
+  <xacro:arg name="robot_ip" default="0.0.0.0"/>
+  <xacro:arg name="use_fake_hardware" default="false"/>
+  <xacro:arg name="fake_sensor_commands" default="false"/>
+  <xacro:arg name="hash_kinematics" default="calib_12788084448423163542"/>
+  <xacro:arg name="headless_mode" default="false"/>
+  <xacro:arg name="script_filename" default="$(find ur_robot_driver)/resources/ros_control.urscript"/>
+  <xacro:arg name="output_recipe_filename" default="$(find ur_robot_driver)/resources/rtde_output_recipe.txt"/>
+  <xacro:arg name="input_recipe_filename" default="$(find ur_robot_driver)/resources/rtde_input_recipe.txt"/>
+
+  <!-- ========== UR20 ros2_control Hardware Interface ========== -->
+  <xacro:ur_ros2_control_patched
+    name="ur20"
+    tf_prefix=""
+    robot_ip="$(arg robot_ip)"
+    use_fake_hardware="$(arg use_fake_hardware)"
+    fake_sensor_commands="$(arg fake_sensor_commands)"
+    hash_kinematics="$(arg hash_kinematics)"
+    headless_mode="$(arg headless_mode)"
+    script_filename="$(arg script_filename)"
+    output_recipe_filename="$(arg output_recipe_filename)"
+    input_recipe_filename="$(arg input_recipe_filename)"
+    reverse_port="50001"
+    script_sender_port="50002"
+    trajectory_port="50003"
+    script_command_port="50004"
+    keep_alive_count="50"
+    servoj_gain="750"
+    servoj_lookahead_time="0.2"
+  />
+
+</robot>

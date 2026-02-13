@@ -1,0 +1,147 @@
+# ──────────────────────────────────────────────────────────────
+# cuRobo Robot Configuration: UR20 with iPhone Tool
+#
+# Single UR20, no tf_prefix.
+# ee_link: tool_tip_link (iPhone camera tip)
+# base_link: base_link
+#
+# Collision spheres scaled for UR20 link geometry:
+#   - UR20 links are ~2x longer than UR5e
+#   - shoulder_link: radius ~0.08 (vs 0.06 for UR5e)
+#   - upper_arm_link: length 0.862m, radius ~0.075
+#   - forearm_link: length 0.7287m, radius ~0.065
+#   - wrist links: radius ~0.055
+#   - tool_base_link: same iPhone tool as nakul
+# ──────────────────────────────────────────────────────────────
+robot_cfg:
+  kinematics:
+    use_usd_kinematics: False
+    urdf_path: "URDF_LOADED_AT_RUNTIME"
+    asset_root_path: ""
+    base_link: "base_link"
+    ee_link: "tool_tip_link"
+    link_names: null
+    lock_joints: null
+    extra_links: null
+
+    collision_link_names:
+      - "shoulder_link"
+      - "upper_arm_link"
+      - "forearm_link"
+      - "wrist_1_link"
+      - "wrist_2_link"
+      - "wrist_3_link"
+      - "tool_base_link"
+
+    collision_spheres:
+      shoulder_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.08
+        - center: [0.0, 0.0, -0.05]
+          radius: 0.08
+
+      upper_arm_link:
+        # UR20 upper arm is 0.862m long (along -X in link frame)
+        # with visual offset at z=0.26
+        - center: [0.0, 0.0, 0.26]
+          radius: 0.08
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.075
+        - center: [-0.15, 0.0, 0.18]
+          radius: 0.07
+        - center: [-0.30, 0.0, 0.18]
+          radius: 0.065
+        - center: [-0.45, 0.0, 0.18]
+          radius: 0.065
+        - center: [-0.60, 0.0, 0.18]
+          radius: 0.065
+        - center: [-0.75, 0.0, 0.18]
+          radius: 0.07
+
+      forearm_link:
+        # UR20 forearm is 0.7287m long (along -X in link frame)
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.065
+        - center: [-0.12, 0.0, 0.02]
+          radius: 0.06
+        - center: [-0.24, 0.0, 0.02]
+          radius: 0.055
+        - center: [-0.36, 0.0, 0.02]
+          radius: 0.055
+        - center: [-0.48, 0.0, 0.02]
+          radius: 0.055
+        - center: [-0.60, 0.0, 0.02]
+          radius: 0.06
+
+      wrist_1_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.055
+        - center: [0.0, 0.035, 0.0]
+          radius: 0.055
+
+      wrist_2_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.055
+        - center: [0.0, -0.035, 0.0]
+          radius: 0.055
+
+      wrist_3_link:
+        - center: [0.0, 0.0, -0.035]
+          radius: 0.05
+
+      tool_base_link:
+        # Same iPhone tool geometry as nakul
+        - center: [0.085, 0.0, 0.05]
+          radius: 0.065
+        - center: [0.025, 0.0, 0.05]
+          radius: 0.065
+        - center: [-0.035, 0.0, 0.05]
+          radius: 0.065
+        - center: [-0.095, 0.0, 0.05]
+          radius: 0.065
+        - center: [-0.155, 0.0, 0.05]
+          radius: 0.065
+        - center: [-0.215, 0.0, 0.05]
+          radius: 0.065
+        - center: [0.085, 0.0, -0.01]
+          radius: 0.065
+        - center: [0.025, 0.0, -0.01]
+          radius: 0.065
+        - center: [-0.035, 0.0, -0.01]
+          radius: 0.065
+        - center: [-0.095, 0.0, -0.01]
+          radius: 0.065
+        - center: [-0.155, 0.0, -0.01]
+          radius: 0.065
+        - center: [-0.215, 0.0, -0.01]
+          radius: 0.065
+
+    collision_sphere_buffer: 0.0
+    extra_collision_spheres: {}
+
+    self_collision_ignore: {}
+
+    self_collision_buffer:
+      upper_arm_link: 0
+      forearm_link: 0
+      wrist_1_link: 0
+      wrist_2_link: 0
+      wrist_3_link: 0
+      tool_base_link: 0.005
+
+    use_global_cumul: True
+    mesh_link_names: null
+
+    cspace:
+      joint_names:
+        - "shoulder_pan_joint"
+        - "shoulder_lift_joint"
+        - "elbow_joint"
+        - "wrist_1_joint"
+        - "wrist_2_joint"
+        - "wrist_3_joint"
+      retract_config: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
+      null_space_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      cspace_distance_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      max_jerk: 500.0
+      max_acceleration: 10.0

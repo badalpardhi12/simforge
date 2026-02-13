@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<!--
+Face Robot UR20 Cell URDF
+
+Single UR20 robot with iPhone tool and 8 face targets.
+
+This XACRO includes the UR robot macro from ur_description and
+the face_robot_ur20_macro that defines the workcell.
+-->
+<robot name="face_robot_ur20" xmlns:xacro="http://wiki.ros.org/xacro">
+
+  <!-- Include UR robot macro from ur_description -->
+  <xacro:include filename="$(find ur_description)/urdf/ur_macro.xacro"/>
+
+  <!-- Include face robot UR20 cell macro -->
+  <xacro:include filename="$(find face_robot_ur20_description)/urdf/face_robot_ur20_macro.xacro"/>
+
+  <!-- ========== Arguments ========== -->
+  <xacro:arg name="ur_type" default="ur20"/>
+  <xacro:arg name="joint_limits_parameters_file" default="$(find ur_description)/config/$(arg ur_type)/joint_limits.yaml"/>
+  <xacro:arg name="kinematics_parameters_file" default="$(find ur_description)/config/$(arg ur_type)/default_kinematics.yaml"/>
+  <xacro:arg name="physical_parameters_file" default="$(find ur_description)/config/$(arg ur_type)/physical_parameters.yaml"/>
+  <xacro:arg name="visual_parameters_file" default="$(find ur_description)/config/$(arg ur_type)/visual_parameters.yaml"/>
+
+  <!-- ========== World Link ========== -->
+  <link name="world"/>
+
+  <!-- ========== Face Robot UR20 Workcell ========== -->
+  <xacro:face_robot_ur20_cell parent="world"
+    ur_type="$(arg ur_type)"
+    joint_limits_parameters_file="$(arg joint_limits_parameters_file)"
+    kinematics_parameters_file="$(arg kinematics_parameters_file)"
+    physical_parameters_file="$(arg physical_parameters_file)"
+    visual_parameters_file="$(arg visual_parameters_file)"
+  >
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:face_robot_ur20_cell>
+
+</robot>

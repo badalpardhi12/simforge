@@ -37,7 +37,7 @@ except ImportError:
 # ── Package imports ──────────────────────────────────────────────
 from simforge_gateway_nvidia.config import (
     ROBOT_CONFIG, RTDE_AVAILABLE, CUROBO_AVAILABLE,
-    ConnectedClient, RobotStateInfo, CONFIG_DIR,
+    ConnectedClient, RobotStateInfo, CONFIG_DIR, ENV_NAME,
 )
 from simforge_gateway_nvidia.rtde_controller import URRTDEController
 from simforge_gateway_nvidia.joint_state_manager import JointStateManager
@@ -180,6 +180,7 @@ class CommandGatewayNode(Node):
             f"Command Gateway (cuRobo) initialised -- "
             f"WS on {self.ws_host}:{self.ws_port}"
         )
+        self.get_logger().info(f"Environment: {ENV_NAME}")
         self.get_logger().info(f"Robots: {list(ROBOT_CONFIG.keys())}")
         self.get_logger().info(
             f"Motion scaling: vel={self.max_velocity_scaling}, "

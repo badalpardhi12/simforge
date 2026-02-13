@@ -18,6 +18,7 @@ from builtin_interfaces.msg import Duration
 
 from .config import (
     ROBOT_CONFIG, CUROBO_AVAILABLE, CUROBO_IMPORT_ERROR, RobotStateInfo,
+    ENV_WORLD_COLLISION_CONFIG,
 )
 from .collision_matrix import compute_self_collision_ignore
 
@@ -95,13 +96,18 @@ class CuroboPlanner:
 
         tensor_args = TensorDeviceType()
 
-        # World collision config
+        # World collision config — use env-specific config name
         world_cfg_dict = {"cuboid": {}}
         if self.config_dir:
-            wc = self.config_dir / "world_collision.yml"
+            wc = self.config_dir / ENV_WORLD_COLLISION_CONFIG
             if wc.exists():
                 world_cfg_dict = load_yaml(str(wc))
                 self._log.info(f"Loaded world collision config: {wc}")
+            else:
+                self._log.warn(
+                    f"World collision config not found: {wc}, "
+                    f"using empty world"
+                )
 
         for robot_name, cfg in ROBOT_CONFIG.items():
             curobo_config_name = cfg.get("curobo_config")

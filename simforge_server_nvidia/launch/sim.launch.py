@@ -1,5 +1,5 @@
 """
-Valid8 Dual Cell Bringup — Simulation Mode
+SimForge Server — Simulation Mode
 
 Launches:
  - Robot State Publisher with mock hardware (ros2_control)
@@ -7,9 +7,14 @@ Launches:
  - Foxglove Bridge for visualization (port 9090)
  - cuRobo Command Gateway (port 8766)
 
+Environment is selected by the ENV_CONFIG environment variable.
+Defaults to 'valid8_dual_ur5e' for backward compatibility.
+
 Usage:
   ros2 launch simforge_gateway_nvidia sim.launch.py
+  ENV_CONFIG=face_robot_ur20 ros2 launch simforge_gateway_nvidia sim.launch.py
 """
+import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
@@ -22,6 +27,14 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     launch_foxglove = LaunchConfiguration('launch_foxglove')
     launch_gateway = LaunchConfiguration('launch_gateway')
+
+    # Determine control package from ENV_CONFIG
+    env_config = os.environ.get('ENV_CONFIG', 'valid8_dual_ur5e')
+    control_package_map = {
+        'valid8_dual_ur5e': 'valid8_dual_cell_control',
+        'face_robot_ur20': 'face_robot_ur20_control',
+    }
+    control_package = control_package_map.get(env_config, 'valid8_dual_cell_control')
 
     declared_arguments = [
         DeclareLaunchArgument(
@@ -40,7 +53,7 @@ def generate_launch_description():
     start_robots = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
-                FindPackageShare('valid8_dual_cell_control'),
+                FindPackageShare(control_package),
                 'launch', 'start_robots.launch.py',
             ])
         ),

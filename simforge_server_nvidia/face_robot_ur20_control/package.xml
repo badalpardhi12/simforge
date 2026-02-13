@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd"
+            schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>face_robot_ur20_control</name>
+  <version>1.0.0</version>
+  <description>
+    Face Robot UR20 control — ros2_control configuration and launch
+    files for a single UR20 robot with iPhone tool.
+  </description>
+  <maintainer email="team@valid8.ai">Valid8 Team</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>ur_description</depend>
+  <depend>ur_robot_driver</depend>
+  <depend>controller_manager</depend>
+  <depend>joint_state_broadcaster</depend>
+  <depend>robot_state_publisher</depend>
+  <depend>xacro</depend>
+
+  <exec_depend>face_robot_ur20_description</exec_depend>
+  <exec_depend>valid8_dual_cell_control</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
