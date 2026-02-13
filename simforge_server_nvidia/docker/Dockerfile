@@ -124,11 +124,11 @@ WORKDIR /ros2_ws
 
 # ── Source layers (ordered least→most frequently changed) ────
 
-# Layer 1 — Cell description / control packages (rarely change)
-COPY valid8_dual_cell_description /ros2_ws/src/valid8_dual_cell_description
-COPY valid8_dual_cell_control     /ros2_ws/src/valid8_dual_cell_control
-COPY face_robot_ur20_description  /ros2_ws/src/face_robot_ur20_description
-COPY face_robot_ur20_control      /ros2_ws/src/face_robot_ur20_control
+# Layer 1 — Environment-specific ROS2 packages (rarely change)
+COPY environments/valid8_dual_ur5e/description /ros2_ws/src/valid8_dual_cell_description
+COPY environments/valid8_dual_ur5e/control     /ros2_ws/src/valid8_dual_cell_control
+COPY environments/face_robot_ur20/description  /ros2_ws/src/face_robot_ur20_description
+COPY environments/face_robot_ur20/control      /ros2_ws/src/face_robot_ur20_control
 
 # Layer 2 — Gateway package manifest (changes when deps change)
 COPY CMakeLists.txt  /ros2_ws/src/simforge_gateway_nvidia/CMakeLists.txt

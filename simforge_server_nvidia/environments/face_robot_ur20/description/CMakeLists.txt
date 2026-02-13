@@ -13,9 +13,4 @@ install(DIRECTORY meshes
   DESTINATION share/${PROJECT_NAME}
 )
 
-# Install rviz config
-install(DIRECTORY rviz
-  DESTINATION share/${PROJECT_NAME}
-)
-
 ament_package()

@@ -154,7 +154,7 @@ def load_environment(env_name: str) -> EnvironmentConfig:
         description=env.get("description", ""),
         control_package=env["control_package"],
         description_package=env["description_package"],
-        world_collision_config=env.get("world_collision_config", "world_collision.yml"),
+        world_collision_config=env.get("world_collision_config", "valid8_dual_ur5e/world_collision.yml"),
         known_objects=env.get("known_objects", []),
         robot_config=robot_config,
     )

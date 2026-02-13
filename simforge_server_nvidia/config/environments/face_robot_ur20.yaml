@@ -13,8 +13,8 @@ environment:
   control_package: face_robot_ur20_control
   description_package: face_robot_ur20_description
 
-  # cuRobo world collision config (in simforge_gateway_nvidia/config/)
-  world_collision_config: face_robot_ur20_world_collision.yml
+  # cuRobo world collision config (relative to config/ directory)
+  world_collision_config: face_robot_ur20/world_collision.yml
 
   # Known world objects for collision avoidance
   known_objects:
@@ -38,4 +38,4 @@ environment:
       ik_tip_link: tool_tip_link
       base_link: base_link
       home_position: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
-      curobo_config: ur20_curobo.yml
+      curobo_config: face_robot_ur20/ur20_curobo.yml

@@ -47,7 +47,7 @@ except FileNotFoundError:
     KNOWN_OBJECTS = []
     ENV_CONTROL_PACKAGE = ""
     ENV_DESCRIPTION_PACKAGE = ""
-    ENV_WORLD_COLLISION_CONFIG = "world_collision.yml"
+    ENV_WORLD_COLLISION_CONFIG = "valid8_dual_ur5e/world_collision.yml"
     ENV_NAME = ENV_CONFIG_NAME
 
 # ── Mode-switch signal files (shared with start_server.sh) ───

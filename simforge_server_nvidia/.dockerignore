@@ -23,6 +23,9 @@ __pycache__/
 docker-compose.yml
 .dockerignore
 
+# Development-only tools (not needed in production image)
+tools/
+
 # Backups & temp files
 *.bak
 *.orig
