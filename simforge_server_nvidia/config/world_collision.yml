@@ -34,10 +34,11 @@ cuboid:
     pose: [0.0, 0.0, -0.05, 1, 0, 0, 0]
 
   # Face fixture — test subject head (approximated as box)
-  # URDF collision: sphere r=0.1 at face_link
+  # URDF collision: sphere r=0.1 at face_link → 0.20 m cube matches
+  # the 0.2 m diameter.  Previous 0.25 value blocked valid tool poses.
   # face_link at (0.1742, 0, 1.6) in shop_floor with 90° yaw
   face:
-    dims: [0.25, 0.25, 0.25]
+    dims: [0.20, 0.20, 0.20]
     pose: [0.1742, 0.0, 1.6, 0.7071, 0, 0, 0.7071]
 
   # Robot mount blocks (small collision geometry for safety)

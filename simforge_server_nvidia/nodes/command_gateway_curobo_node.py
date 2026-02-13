@@ -143,6 +143,10 @@ class CommandGatewayNode(Node):
         urdf = self._get_urdf_from_topic()
         self._planner.init(urdf)
 
+        # Wire planner into executor so execute_home can use
+        # cuRobo collision-aware joint planning
+        self._executor.set_planner(self._planner)
+
         # ── Subsystem: Protocol Executor ─────────────────────────
         self._proto_exec = ProtocolExecutor(
             self, self._planner, self._executor, self._js_mgr,

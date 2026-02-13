@@ -132,9 +132,10 @@ class CuroboPlanner:
                     trajopt_tsteps=32,
                     collision_checker_type="PRIMITIVE",
                     use_cuda_graph=True,
-                    num_trajopt_seeds=4,
-                    num_graph_seeds=4,
-                    num_ik_seeds=30,
+                    num_trajopt_seeds=12,
+                    num_graph_seeds=12,
+                    num_ik_seeds=100,
+                    collision_activation_distance=0.01,
                     maximum_trajectory_dt=None,
                     interpolation_type=InterpolateType.CUBIC,
                 )
@@ -196,7 +197,8 @@ class CuroboPlanner:
                 qw, qx, qy, qz,
             ])
             plan_cfg = MotionGenPlanConfig(
-                max_attempts=10,
+                max_attempts=50,
+                timeout=30.0,
                 enable_graph=True, enable_opt=True,
                 enable_finetune_trajopt=True,
                 partial_ik_opt=False, parallel_finetune=True,
@@ -215,9 +217,11 @@ class CuroboPlanner:
                     f"duration={dur:.2f}s, dt={result.interpolation_dt:.4f}s"
                 )
                 return result
+            status = getattr(result, 'status', 'unknown')
             self._log.warn(
-                f"cuRobo planning failed for {robot_name}: "
-                f"{getattr(result, 'status', 'unknown')}"
+                f"cuRobo planning failed for {robot_name}: {status} "
+                f"(pos={target_position}, "
+                f"orient=[{qx:.3f},{qy:.3f},{qz:.3f},{qw:.3f}])"
             )
             return None
         except Exception as e:
@@ -252,7 +256,8 @@ class CuroboPlanner:
                 joint_names=cfg["joints"],
             )
             plan_cfg = MotionGenPlanConfig(
-                max_attempts=10, enable_graph=True, enable_opt=True,
+                max_attempts=50, timeout=30.0,
+                enable_graph=True, enable_opt=True,
                 enable_finetune_trajopt=True,
                 time_dilation_factor=min(
                     velocity_scaling or self.max_velocity_scaling, 0.99

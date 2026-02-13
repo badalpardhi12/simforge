@@ -39,10 +39,17 @@ class TrajectoryExecutor:
         self._rtde = rtde_controllers or {}
         self._stop_check_fn = stop_check_fn
         self._js_mgr = joint_state_manager  # for position publishing
+        self._planner = None  # set via set_planner() after init
 
         # FollowJointTrajectory action clients (sim)
         self._traj_clients: Dict[str, ActionClient] = {}
         self._rebuild_traj_clients()
+
+    # ── Planner injection ────────────────────────────────────────
+
+    def set_planner(self, planner):
+        """Wire in the cuRobo planner (called after both are created)."""
+        self._planner = planner
 
     # ── Mode query ───────────────────────────────────────────────
 
@@ -66,39 +73,114 @@ class TrajectoryExecutor:
     async def execute_home(
         self, robot_name: str, velocity_scaling: float = 0.5,
     ) -> bool:
-        """Move a robot to its home position.
+        """Move a robot to its home position via cuRobo-planned trajectory.
 
-        Real mode → RTDE moveJ.  Sim mode → cuRobo plan + ROS2 execute.
+        Uses cuRobo plan_to_joints for collision-aware path planning,
+        then dispatches the trajectory via RTDE servoJ (real) or ROS2
+        action (sim).  Falls back to raw RTDE moveJ only if cuRobo
+        is unavailable.
         """
         cfg = ROBOT_CONFIG[robot_name]
         mode = self._current_mode()
         is_real = mode in ("real", "both")
+        home = list(cfg["home_position"])
 
+        # ── Try cuRobo collision-aware planning first ────────────
+        if self._planner is not None and self._planner.has_robot(robot_name):
+            # Get current joint positions
+            current = None
+            if is_real and RTDE_AVAILABLE and robot_name in self._rtde:
+                rtde = self._rtde[robot_name]
+                if not rtde.is_connected:
+                    rtde.connect()
+                if rtde.is_connected:
+                    current = rtde.get_actual_q()
+
+            if current is None and self._js_mgr is not None:
+                st = self._js_mgr.robot_states.get(robot_name)
+                if st and st.joint_positions and len(st.joint_positions) == 6:
+                    current = list(st.joint_positions)
+
+            if current is None:
+                current = home  # already at home, nothing to do
+
+            self._log.info(
+                f"Planning collision-aware home path for {robot_name} "
+                f"via cuRobo plan_to_joints"
+            )
+
+            result = await self._planner.plan_to_joints(
+                robot_name,
+                target_joints=home,
+                current_joints=current,
+                velocity_scaling=velocity_scaling,
+            )
+
+            if result is not None:
+                ros_traj = self._planner.result_to_ros_trajectory(
+                    result, robot_name,
+                )
+                if ros_traj is not None:
+                    self._log.info(
+                        f"Executing cuRobo-planned home trajectory "
+                        f"for {robot_name}"
+                    )
+                    ok = await self.execute(robot_name, ros_traj)
+                    if ok:
+                        # Reconnect RTDE receive after trajectory
+                        if is_real and RTDE_AVAILABLE and robot_name in self._rtde:
+                            rtde = self._rtde[robot_name]
+                            loop = asyncio.get_event_loop()
+                            for attempt in range(3):
+                                await loop.run_in_executor(
+                                    None, rtde.reconnect_receive,
+                                )
+                                if rtde._recv_healthy:
+                                    await asyncio.sleep(1.0)
+                                    test_q = await loop.run_in_executor(
+                                        None, rtde.get_actual_q,
+                                    )
+                                    if test_q is not None:
+                                        break
+                                    self._log.info(
+                                        f"RTDE recv for {robot_name} "
+                                        f"died again (attempt "
+                                        f"{attempt + 1}/3), retrying..."
+                                    )
+                        return True
+                    self._log.warn(
+                        f"cuRobo-planned home trajectory execution "
+                        f"failed for {robot_name}"
+                    )
+                    return False
+
+            self._log.warn(
+                f"cuRobo joint planning failed for home — "
+                f"falling back to RTDE moveJ for {robot_name}"
+            )
+
+        # ── Fallback: raw RTDE moveJ (no collision avoidance) ────
         if is_real and RTDE_AVAILABLE and robot_name in self._rtde:
             rtde = self._rtde[robot_name]
             if not rtde.is_connected:
                 rtde.connect()
             if rtde.is_connected:
-                self._log.info(
-                    f"Moving {robot_name} home via RTDE moveJ"
+                self._log.warn(
+                    f"Moving {robot_name} home via RTDE moveJ "
+                    f"(NO collision avoidance — cuRobo unavailable)"
                 )
                 loop = asyncio.get_event_loop()
                 ok = await loop.run_in_executor(
                     None,
                     lambda: rtde.move_j(
-                        cfg["home_position"], speed=0.5, acceleration=0.5
+                        home, speed=0.5, acceleration=0.5
                     ),
                 )
-                # moveJ can leave the receive interface dead —
-                # reconnect so the 50 Hz timer can read positions.
-                # The recv can die again ~2 s after moveJ, so we
-                # do a short wait + verify loop (max 3 attempts).
                 for attempt in range(3):
                     await loop.run_in_executor(
                         None, rtde.reconnect_receive,
                     )
                     if rtde._recv_healthy:
-                        # Wait a moment and re-verify
                         await asyncio.sleep(1.0)
                         test_q = await loop.run_in_executor(
                             None, rtde.get_actual_q,
