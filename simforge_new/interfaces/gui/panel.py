@@ -276,229 +276,233 @@ class SessionController:
         await self._session.send_command(command)
 
 
-class RobotControlFrame(wx.Frame):
-    """Main wxPython frame presenting joint and Cartesian controls."""
+if HAS_WX:
+    class RobotControlFrame(wx.Frame):
+        """Main wxPython frame presenting joint and Cartesian controls."""
 
-    def __init__(self, controller: SessionController, debug: bool = False):
-        super().__init__(
-            parent=None,
-            title="Simforge Robot Control",
-            size=(600, 700),
-            style=wx.DEFAULT_FRAME_STYLE & ~(wx.RESIZE_BORDER | wx.MAXIMIZE_BOX),
-        )
-        self.controller = controller
-        self.logger = controller.logger
-        self.debug = debug
-        self.joint_sliders: Dict[str, List[SliderType]] = {}
-        self.cart_fields: Dict[str, List[TextCtrlType]] = {}
-        self.cart_frame_choice: Dict[str, ChoiceType] = {}
-        self.cart_frame_map: Dict[str, Dict[str, str]] = {}
-        self._building = True
-        self._running = True
-
-        self._setup_gui()
-        self.timer = wx.Timer(self)
-        self.Bind(wx.EVT_TIMER, self._on_timer, self.timer)
-        self.timer.Start(UPDATE_INTERVAL_MS)
-        self.Bind(wx.EVT_CLOSE, self._on_close)
-        self._building = False
-        self.logger.info("Simforge GUI initialised")
-
-    # ------------------------------------------------------------------
-    # GUI assembly helpers
-    # ------------------------------------------------------------------
-    def _setup_gui(self) -> None:
-        panel = wx.Panel(self)
-        vbox = wx.BoxSizer(wx.VERTICAL)
-
-        self.status_bar = self.CreateStatusBar()
-        self.status_bar.SetStatusText("Ready")
-
-        self.notebook = wx.Notebook(panel)
-        vbox.Add(self.notebook, 1, wx.EXPAND | wx.ALL, 5)
-
-        for robot_name in self.controller.robot_names():
-            self._create_robot_tab(robot_name)
-
-        panel.SetSizer(vbox)
-        self.Show()
-        self.Raise()
-
-    def _create_robot_tab(self, robot_name: str) -> None:
-        tab = wx.Panel(self.notebook)
-        tab_sizer = wx.BoxSizer(wx.VERTICAL)
-
-        joint_box = wx.StaticBoxSizer(wx.VERTICAL, tab, "Joint Control (degrees)")
-        sliders: List[SliderType] = []
-        joint_count = self.controller.joint_count(robot_name)
-        home = self.controller.home_joints(robot_name)
-
-        for joint_idx in range(joint_count):
-            row = wx.BoxSizer(wx.HORIZONTAL)
-            label = wx.StaticText(tab, label=f"J{joint_idx + 1}:")
-            label.SetMinSize((30, -1))
-            row.Add(label, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 5)
-
-            slider = wx.Slider(
-                tab,
-                value=int(home[joint_idx]) if joint_idx < len(home) else 0,
-                minValue=JOINT_SLIDER_MIN,
-                maxValue=JOINT_SLIDER_MAX,
-                style=wx.SL_HORIZONTAL | wx.SL_VALUE_LABEL,
-                size=(300, -1),
+        def __init__(self, controller: SessionController, debug: bool = False):
+            super().__init__(
+                parent=None,
+                title="Simforge Robot Control",
+                size=(600, 700),
+                style=wx.DEFAULT_FRAME_STYLE & ~(wx.RESIZE_BORDER | wx.MAXIMIZE_BOX),
             )
-            slider.Bind(
-                wx.EVT_SLIDER,
-                lambda evt, rn=robot_name, idx=joint_idx: self._on_joint_slider(rn, idx, evt),
-            )
-            row.Add(slider, 1, wx.EXPAND | wx.RIGHT, 10)
+            self.controller = controller
+            self.logger = controller.logger
+            self.debug = debug
+            self.joint_sliders: Dict[str, List[SliderType]] = {}
+            self.cart_fields: Dict[str, List[TextCtrlType]] = {}
+            self.cart_frame_choice: Dict[str, ChoiceType] = {}
+            self.cart_frame_map: Dict[str, Dict[str, str]] = {}
+            self._building = True
+            self._running = True
 
-            value_text = wx.StaticText(tab, label=f"{slider.GetValue()}°")
-            value_text.SetMinSize((50, -1))
-            row.Add(value_text, 0, wx.ALIGN_CENTER_VERTICAL)
+            self._setup_gui()
+            self.timer = wx.Timer(self)
+            self.Bind(wx.EVT_TIMER, self._on_timer, self.timer)
+            self.timer.Start(UPDATE_INTERVAL_MS)
+            self.Bind(wx.EVT_CLOSE, self._on_close)
+            self._building = False
+            self.logger.info("Simforge GUI initialised")
 
-            joint_box.Add(row, 0, wx.EXPAND | wx.ALL, 3)
-            sliders.append(slider)
+        # ------------------------------------------------------------------
+        # GUI assembly helpers
+        # ------------------------------------------------------------------
+        def _setup_gui(self) -> None:
+            panel = wx.Panel(self)
+            vbox = wx.BoxSizer(wx.VERTICAL)
 
-        self.joint_sliders[robot_name] = sliders
-        tab_sizer.Add(joint_box, 0, wx.EXPAND | wx.ALL, 5)
+            self.status_bar = self.CreateStatusBar()
+            self.status_bar.SetStatusText("Ready")
 
-        cart_box = wx.StaticBoxSizer(wx.VERTICAL, tab, "Cartesian Control")
-        cart_grid = wx.FlexGridSizer(rows=3, cols=4, hgap=15, vgap=12)
-        cart_grid.AddGrowableCol(1, 1)
-        cart_grid.AddGrowableCol(3, 1)
+            self.notebook = wx.Notebook(panel)
+            vbox.Add(self.notebook, 1, wx.EXPAND | wx.ALL, 5)
 
-        pos_fields: List[TextCtrlType] = []
-        ori_fields: List[TextCtrlType] = []
+            for robot_name in self.controller.robot_names():
+                self._create_robot_tab(robot_name)
 
-        for idx, (pos_label, ori_label, default_pos, default_ori) in enumerate(
-            zip(
-                ("X (m):", "Y (m):", "Z (m):"),
-                ("Roll (°):", "Pitch (°):", "Yaw (°):"),
-                DEFAULT_CART_POSITION,
-                DEFAULT_CART_ORIENTATION,
-            )
-        ):
-            pos_lbl = wx.StaticText(tab, label=pos_label)
-            pos_lbl.SetMinSize((60, -1))
-            pos_field = wx.TextCtrl(tab, value=f"{default_pos:.3f}", size=(100, -1))
+            panel.SetSizer(vbox)
+            self.Show()
+            self.Raise()
 
-            ori_lbl = wx.StaticText(tab, label=ori_label)
-            ori_lbl.SetMinSize((70, -1))
-            ori_field = wx.TextCtrl(tab, value=f"{default_ori:.1f}", size=(100, -1))
+        def _create_robot_tab(self, robot_name: str) -> None:
+            tab = wx.Panel(self.notebook)
+            tab_sizer = wx.BoxSizer(wx.VERTICAL)
 
-            cart_grid.Add(pos_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALIGN_RIGHT)
-            cart_grid.Add(pos_field, 1, wx.EXPAND)
-            cart_grid.Add(ori_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALIGN_RIGHT)
-            cart_grid.Add(ori_field, 1, wx.EXPAND)
+            joint_box = wx.StaticBoxSizer(wx.VERTICAL, tab, "Joint Control (degrees)")
+            sliders: List[SliderType] = []
+            joint_count = self.controller.joint_count(robot_name)
+            home = self.controller.home_joints(robot_name)
 
-            pos_fields.append(pos_field)
-            ori_fields.append(ori_field)
+            for joint_idx in range(joint_count):
+                row = wx.BoxSizer(wx.HORIZONTAL)
+                label = wx.StaticText(tab, label=f"J{joint_idx + 1}:")
+                label.SetMinSize((30, -1))
+                row.Add(label, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 5)
 
-        cart_box.Add(cart_grid, 0, wx.EXPAND | wx.ALL, 15)
+                slider = wx.Slider(
+                    tab,
+                    value=int(home[joint_idx]) if joint_idx < len(home) else 0,
+                    minValue=JOINT_SLIDER_MIN,
+                    maxValue=JOINT_SLIDER_MAX,
+                    style=wx.SL_HORIZONTAL | wx.SL_VALUE_LABEL,
+                    size=(300, -1),
+                )
+                slider.Bind(
+                    wx.EVT_SLIDER,
+                    lambda evt, rn=robot_name, idx=joint_idx: self._on_joint_slider(rn, idx, evt),
+                )
+                row.Add(slider, 1, wx.EXPAND | wx.RIGHT, 10)
 
-        frame_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        frame_label = wx.StaticText(tab, label="Reference Frame:")
-        frame_label.SetMinSize((120, -1))
-        frames = self.controller.get_reference_frames(robot_name)
-        frame_choice = wx.Choice(tab, choices=[label for _, label in frames] or ["Robot Base"])
-        if frame_choice.GetCount() > 0:
-            frame_choice.SetSelection(0)
-        self.cart_frame_choice[robot_name] = frame_choice
-        self.cart_frame_map[robot_name] = {label: key for key, label in frames} if frames else {"Robot Base": "base"}
-        frame_sizer.Add(frame_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
-        frame_sizer.Add(frame_choice, 0, wx.ALIGN_CENTER_VERTICAL)
-        cart_box.Add(frame_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 10)
+                value_text = wx.StaticText(tab, label=f"{slider.GetValue()}°")
+                value_text.SetMinSize((50, -1))
+                row.Add(value_text, 0, wx.ALIGN_CENTER_VERTICAL)
 
-        button_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        move_btn = wx.Button(tab, label="🎯 Move to Pose", size=(150, 35))
-        move_btn.SetFont(wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
-        move_btn.SetBackgroundColour(wx.Colour(70, 130, 180))
-        move_btn.SetForegroundColour(wx.Colour(255, 255, 255))
-        move_btn.Bind(wx.EVT_BUTTON, lambda evt, rn=robot_name: self._on_move_cartesian(rn))
-        button_sizer.AddStretchSpacer()
-        button_sizer.Add(move_btn, 0, wx.ALIGN_CENTER)
-        button_sizer.AddStretchSpacer()
-        cart_box.Add(button_sizer, 0, wx.EXPAND | wx.ALL, 10)
+                joint_box.Add(row, 0, wx.EXPAND | wx.ALL, 3)
+                sliders.append(slider)
 
-        self.cart_fields[robot_name] = pos_fields + ori_fields
-        tab_sizer.Add(cart_box, 0, wx.EXPAND | wx.ALL, 5)
+            self.joint_sliders[robot_name] = sliders
+            tab_sizer.Add(joint_box, 0, wx.EXPAND | wx.ALL, 5)
 
-        tab.SetSizer(tab_sizer)
-        self.notebook.AddPage(tab, robot_name)
+            cart_box = wx.StaticBoxSizer(wx.VERTICAL, tab, "Cartesian Control")
+            cart_grid = wx.FlexGridSizer(rows=3, cols=4, hgap=15, vgap=12)
+            cart_grid.AddGrowableCol(1, 1)
+            cart_grid.AddGrowableCol(3, 1)
 
-    # ------------------------------------------------------------------
-    # Event handlers
-    # ------------------------------------------------------------------
-    def _on_joint_slider(self, robot_name: str, joint_idx: int, event: EventType) -> None:
-        if self._building:
-            return
-        value_deg = float(event.GetInt())
-        self.status_bar.SetStatusText(f"{robot_name} J{joint_idx + 1}: {value_deg:.1f}°")
-        threading.Thread(
-            target=self.controller.set_joint_position,
-            args=(robot_name, joint_idx, value_deg),
-            kwargs={"duration": 0.05},
-            daemon=True,
-        ).start()
+            pos_fields: List[TextCtrlType] = []
+            ori_fields: List[TextCtrlType] = []
 
-    def _on_move_cartesian(self, robot_name: str) -> None:
-        fields = self.cart_fields[robot_name]
-        try:
-            values = []
-            for idx, field in enumerate(fields):
-                raw = field.GetValue().strip()
-                if not raw:
-                    default_vals = (*DEFAULT_CART_POSITION, *DEFAULT_CART_ORIENTATION)
-                    values.append(default_vals[idx])
-                else:
-                    values.append(float(raw))
-        except ValueError:
-            wx.MessageBox("Invalid Cartesian input", "Input Error", wx.OK | wx.ICON_ERROR)
-            return
+            for idx, (pos_label, ori_label, default_pos, default_ori) in enumerate(
+                zip(
+                    ("X (m):", "Y (m):", "Z (m):"),
+                    ("Roll (°):", "Pitch (°):", "Yaw (°):"),
+                    DEFAULT_CART_POSITION,
+                    DEFAULT_CART_ORIENTATION,
+                )
+            ):
+                pos_lbl = wx.StaticText(tab, label=pos_label)
+                pos_lbl.SetMinSize((60, -1))
+                pos_field = wx.TextCtrl(tab, value=f"{default_pos:.3f}", size=(100, -1))
 
-        position = tuple(values[:3])
-        orientation = tuple(values[3:])
+                ori_lbl = wx.StaticText(tab, label=ori_label)
+                ori_lbl.SetMinSize((70, -1))
+                ori_field = wx.TextCtrl(tab, value=f"{default_ori:.1f}", size=(100, -1))
 
-        frame_key = "base"
-        frame_choice = self.cart_frame_choice.get(robot_name)
-        frame_map = self.cart_frame_map.get(robot_name, {})
-        if frame_choice and frame_choice.GetCount() > 0:
-            if frame_choice.GetSelection() == wx.NOT_FOUND:
+                cart_grid.Add(pos_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALIGN_RIGHT)
+                cart_grid.Add(pos_field, 1, wx.EXPAND)
+                cart_grid.Add(ori_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALIGN_RIGHT)
+                cart_grid.Add(ori_field, 1, wx.EXPAND)
+
+                pos_fields.append(pos_field)
+                ori_fields.append(ori_field)
+
+            cart_box.Add(cart_grid, 0, wx.EXPAND | wx.ALL, 15)
+
+            frame_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            frame_label = wx.StaticText(tab, label="Reference Frame:")
+            frame_label.SetMinSize((120, -1))
+            frames = self.controller.get_reference_frames(robot_name)
+            frame_choice = wx.Choice(tab, choices=[label for _, label in frames] or ["Robot Base"])
+            if frame_choice.GetCount() > 0:
                 frame_choice.SetSelection(0)
-            selected_label = frame_choice.GetStringSelection()
-            frame_key = frame_map.get(selected_label, frame_key)
+            self.cart_frame_choice[robot_name] = frame_choice
+            self.cart_frame_map[robot_name] = {label: key for key, label in frames} if frames else {"Robot Base": "base"}
+            frame_sizer.Add(frame_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
+            frame_sizer.Add(frame_choice, 0, wx.ALIGN_CENTER_VERTICAL)
+            cart_box.Add(frame_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 10)
 
-        self.status_bar.SetStatusText(
-            f"{robot_name} moving to {position} {orientation} (frame={frame_key})"
-        )
-        threading.Thread(
-            target=self.controller.move_cartesian,
-            args=(robot_name, position, orientation, frame_key),
-            daemon=True,
-        ).start()
+            button_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            move_btn = wx.Button(tab, label="🎯 Move to Pose", size=(150, 35))
+            move_btn.SetFont(wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
+            move_btn.SetBackgroundColour(wx.Colour(70, 130, 180))
+            move_btn.SetForegroundColour(wx.Colour(255, 255, 255))
+            move_btn.Bind(wx.EVT_BUTTON, lambda evt, rn=robot_name: self._on_move_cartesian(rn))
+            button_sizer.AddStretchSpacer()
+            button_sizer.Add(move_btn, 0, wx.ALIGN_CENTER)
+            button_sizer.AddStretchSpacer()
+            cart_box.Add(button_sizer, 0, wx.EXPAND | wx.ALL, 10)
 
-    def _on_timer(self, event: EventType) -> None:
-        if not self._running:
-            return
-        for robot_name, sliders in self.joint_sliders.items():
-            positions = self.controller.get_joint_positions(robot_name)
-            if not positions:
-                continue
-            for idx, slider in enumerate(sliders):
-                if idx >= len(positions):
+            self.cart_fields[robot_name] = pos_fields + ori_fields
+            tab_sizer.Add(cart_box, 0, wx.EXPAND | wx.ALL, 5)
+
+            tab.SetSizer(tab_sizer)
+            self.notebook.AddPage(tab, robot_name)
+
+        # ------------------------------------------------------------------
+        # Event handlers
+        # ------------------------------------------------------------------
+        def _on_joint_slider(self, robot_name: str, joint_idx: int, event: EventType) -> None:
+            if self._building:
+                return
+            value_deg = float(event.GetInt())
+            self.status_bar.SetStatusText(f"{robot_name} J{joint_idx + 1}: {value_deg:.1f}°")
+            threading.Thread(
+                target=self.controller.set_joint_position,
+                args=(robot_name, joint_idx, value_deg),
+                kwargs={"duration": 0.05},
+                daemon=True,
+            ).start()
+
+        def _on_move_cartesian(self, robot_name: str) -> None:
+            fields = self.cart_fields[robot_name]
+            try:
+                values = []
+                for idx, field in enumerate(fields):
+                    raw = field.GetValue().strip()
+                    if not raw:
+                        default_vals = (*DEFAULT_CART_POSITION, *DEFAULT_CART_ORIENTATION)
+                        values.append(default_vals[idx])
+                    else:
+                        values.append(float(raw))
+            except ValueError:
+                wx.MessageBox("Invalid Cartesian input", "Input Error", wx.OK | wx.ICON_ERROR)
+                return
+
+            position = tuple(values[:3])
+            orientation = tuple(values[3:])
+
+            frame_key = "base"
+            frame_choice = self.cart_frame_choice.get(robot_name)
+            frame_map = self.cart_frame_map.get(robot_name, {})
+            if frame_choice and frame_choice.GetCount() > 0:
+                if frame_choice.GetSelection() == wx.NOT_FOUND:
+                    frame_choice.SetSelection(0)
+                selected_label = frame_choice.GetStringSelection()
+                frame_key = frame_map.get(selected_label, frame_key)
+
+            self.status_bar.SetStatusText(
+                f"{robot_name} moving to {position} {orientation} (frame={frame_key})"
+            )
+            threading.Thread(
+                target=self.controller.move_cartesian,
+                args=(robot_name, position, orientation, frame_key),
+                daemon=True,
+            ).start()
+
+        def _on_timer(self, event: EventType) -> None:
+            if not self._running:
+                return
+            for robot_name, sliders in self.joint_sliders.items():
+                positions = self.controller.get_joint_positions(robot_name)
+                if not positions:
                     continue
-                new_val = int(round(positions[idx]))
-                if slider.GetValue() != new_val:
-                    slider.SetValue(new_val)
+                for idx, slider in enumerate(sliders):
+                    if idx >= len(positions):
+                        continue
+                    new_val = int(round(positions[idx]))
+                    if slider.GetValue() != new_val:
+                        slider.SetValue(new_val)
 
-    def _on_close(self, event: EventType) -> None:
-        self._running = False
-        try:
-            if hasattr(self, "timer") and self.timer.IsRunning():
-                self.timer.Stop()
-        finally:
-            self.Destroy()
+        def _on_close(self, event: EventType) -> None:
+            self._running = False
+            try:
+                if hasattr(self, "timer") and self.timer.IsRunning():
+                    self.timer.Stop()
+            finally:
+                self.Destroy()
+else:
+    # Stub class when wx is not available
+    RobotControlFrame = None  # type: ignore
 
 
 def run_gui(
