@@ -19,6 +19,7 @@ from builtin_interfaces.msg import Duration
 from .config import (
     ROBOT_CONFIG, CUROBO_AVAILABLE, CUROBO_IMPORT_ERROR, RobotStateInfo,
 )
+from .collision_matrix import compute_self_collision_ignore
 
 if CUROBO_AVAILABLE:
     import torch
@@ -119,6 +120,35 @@ class CuroboPlanner:
                     robot_cfg_dict["robot_cfg"]["kinematics"]["urdf_path"] = urdf_path
                 else:
                     robot_cfg_dict["kinematics"]["urdf_path"] = urdf_path
+
+                # ── Compute self_collision_ignore from sphere geometry ──
+                # This replaces any hardcoded self_collision_ignore in the
+                # config with one derived from cuRobo's own collision
+                # spheres.  We sample random joint configs, compute FK,
+                # and check which sphere pairs actually collide.
+                kin_section = robot_cfg_dict
+                if "robot_cfg" in robot_cfg_dict:
+                    kin_section = robot_cfg_dict["robot_cfg"]
+                if "kinematics" in kin_section:
+                    kin_section = kin_section["kinematics"]
+
+                self._log.info(
+                    f"Computing self-collision matrix for {robot_name} "
+                    f"(sampling 5000 random configs)..."
+                )
+                computed_ignore = compute_self_collision_ignore(
+                    robot_cfg_dict,
+                    num_samples=5000,
+                    collision_threshold=0.0,
+                    always_fraction=0.98,
+                )
+                if computed_ignore:
+                    kin_section["self_collision_ignore"] = computed_ignore
+                    self._log.info(
+                        f"Self-collision matrix for {robot_name}: "
+                        f"{sum(len(v) for v in computed_ignore.values())} "
+                        f"ignored pairs"
+                    )
 
                 robot_world_cfg = _transform_world_to_robot_frame(
                     world_cfg_dict, robot_name
