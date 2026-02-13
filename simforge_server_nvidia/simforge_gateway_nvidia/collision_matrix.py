@@ -143,6 +143,7 @@ def compute_self_collision_ignore(
 
     collision_link_names: List[str] = kin_cfg.get("collision_link_names", [])
     collision_spheres: dict = kin_cfg.get("collision_spheres", {})
+    self_collision_buffer: dict = kin_cfg.get("self_collision_buffer", {})
 
     if not collision_link_names or not collision_spheres:
         log.warning(
@@ -223,6 +224,27 @@ def compute_self_collision_ignore(
             f"(indices {sphere_indices})"
         )
 
+    # ── Build per-link buffer map (from self_collision_buffer) ───
+    # cuRobo inflates sphere radii by self_collision_buffer at runtime.
+    # We must account for this when computing distances so that pairs
+    # flagged as "never collides" without the buffer don't become
+    # false collisions when the buffer is applied.
+    link_buffer: Dict[str, float] = {}
+    for link_name in collision_link_names:
+        link_buffer[link_name] = float(
+            self_collision_buffer.get(link_name, 0.0)
+        )
+    total_buffer = sum(link_buffer.values())
+    if total_buffer > 0:
+        log.info(
+            f"Self-collision buffer active — inflating sphere radii: "
+            + ", ".join(
+                f"{k}=+{v}m"
+                for k, v in link_buffer.items()
+                if v > 0
+            )
+        )
+
     # ── Sample random joint configs ──────────────────────────────
     log.info(
         f"Sampling {num_samples} random configs to build collision matrix "
@@ -284,14 +306,19 @@ def compute_self_collision_ignore(
                 continue
 
             # For each sample in this batch, check if ANY sphere pair
-            # between these two links collides
+            # between these two links collides.
+            # Include self_collision_buffer in the effective radius
+            # so that the ignore decision accounts for the same
+            # inflation that cuRobo uses at runtime.
+            buf_a = link_buffer.get(pair_a, 0.0)
+            buf_b = link_buffer.get(pair_b, 0.0)
             colliding_any = np.zeros(bs, dtype=bool)
             for ia in idx_a:
                 for ib in idx_b:
                     pos_a = spheres_np[:, ia, :3]  # (batch, 3)
                     pos_b = spheres_np[:, ib, :3]
-                    rad_a = spheres_np[:, ia, 3]   # (batch,)
-                    rad_b = spheres_np[:, ib, 3]
+                    rad_a = spheres_np[:, ia, 3] + buf_a  # (batch,)
+                    rad_b = spheres_np[:, ib, 3] + buf_b
                     dist = np.linalg.norm(pos_a - pos_b, axis=1)
                     surface_dist = dist - rad_a - rad_b
                     colliding_any |= (surface_dist < collision_threshold)

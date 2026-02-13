@@ -170,7 +170,7 @@ class CuroboPlanner:
                     use_cuda_graph=True,
                     num_trajopt_seeds=12,
                     num_graph_seeds=12,
-                    num_ik_seeds=100,
+                    num_ik_seeds=200,
                     collision_activation_distance=0.025,
                     maximum_trajectory_dt=None,
                     interpolation_type=InterpolateType.CUBIC,
