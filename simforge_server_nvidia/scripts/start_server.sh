@@ -156,24 +156,44 @@ echo "Waiting for ROS2 stack to initialise..."
 sleep 10
 
 # ── Start the cuRobo Command Gateway independently ──
-echo "Starting cuRobo Command Gateway..."
-ros2 run simforge_gateway_nvidia command_gateway_curobo_node.py \
-    --ros-args \
-    -p websocket_port:=8766 \
-    -p websocket_host:=0.0.0.0 \
-    -p max_clients:=5 \
-    -p max_velocity_scaling:=${MAX_VELOCITY_SCALING:-0.25} \
-    -p max_acceleration_scaling:=${MAX_ACCELERATION_SCALING:-0.25} \
-    -p interpolation_dt:=${INTERPOLATION_DT:-0.02} &
-GATEWAY_PID=$!
-echo "Gateway PID: $GATEWAY_PID"
+start_gateway() {
+    echo "Starting cuRobo Command Gateway..."
+    ros2 run simforge_gateway_nvidia command_gateway_curobo_node.py \
+        --ros-args \
+        -p websocket_port:=8766 \
+        -p websocket_host:=0.0.0.0 \
+        -p max_clients:=5 \
+        -p max_velocity_scaling:=${MAX_VELOCITY_SCALING:-0.25} \
+        -p max_acceleration_scaling:=${MAX_ACCELERATION_SCALING:-0.25} \
+        -p interpolation_dt:=${INTERPOLATION_DT:-0.02} &
+    GATEWAY_PID=$!
+    echo "Gateway PID: $GATEWAY_PID"
+}
+
+start_gateway
+
+GATEWAY_CRASH_COUNT=0
+MAX_GATEWAY_CRASHES=5
 
 # ── Main loop: watch for mode switch requests ──
 echo "Server running. Watching for mode switch requests..."
 while true; do
     if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
-        echo "Gateway process died, exiting..."
-        exit 1
+        GATEWAY_CRASH_COUNT=$((GATEWAY_CRASH_COUNT + 1))
+        echo "Gateway process died (crash #${GATEWAY_CRASH_COUNT}/${MAX_GATEWAY_CRASHES})"
+
+        if [ "$GATEWAY_CRASH_COUNT" -ge "$MAX_GATEWAY_CRASHES" ]; then
+            echo "Gateway crashed too many times — exiting."
+            exit 1
+        fi
+
+        # Back off before restarting (2s, 4s, 8s, 16s, ...)
+        BACKOFF=$((2 ** GATEWAY_CRASH_COUNT))
+        echo "Restarting gateway in ${BACKOFF}s..."
+        sleep "$BACKOFF"
+
+        # ROS2 stack should still be running — just restart gateway
+        start_gateway
     fi
 
     if [ -f "$MODE_SWITCH_FILE" ]; then

@@ -91,8 +91,15 @@ class URRTDEController:
         """Reconnect the RTDE receive interface (non-blocking, with timeout).
 
         The receive interface often dies during servoJ streaming.  This
-        method creates a fresh RTDEReceiveInterface to restore the
+        method creates a **fresh** RTDEReceiveInterface to restore the
         50 Hz joint-state reads.
+
+        IMPORTANT: We never call `self._recv.reconnect()` because the
+        C++ RTDE library can segfault when calling `.reconnect()` on an
+        object whose internal connection state was corrupted during
+        servoJ streaming.  A segfault in a thread kills the entire
+        process.  Instead we dispose of the old object and create a
+        brand-new one.
         """
         if not RTDE_AVAILABLE:
             return False
@@ -103,22 +110,31 @@ class URRTDEController:
                 f"{self.robot_name}..."
             )
 
-        result_holder = [False]
+        # Dispose of the old receive interface first.
+        # Do NOT call .reconnect() on it — the C++ internals can
+        # segfault after servoJ corrupts the connection state.
+        # We intentionally leak the old object rather than calling
+        # .disconnect() or letting the destructor run, because the
+        # C++ destructor can also segfault on a corrupted object.
+        # The leaked memory (~few KB) is reclaimed when the process
+        # exits and is far preferable to a process-killing segfault.
+        old_recv = self._recv
+        self._recv = None
+        self._recv_healthy = False
+        if old_recv is not None:
+            try:
+                old_recv.disconnect()
+            except Exception:
+                pass
+            # Do not 'del old_recv' — let it leak if disconnect failed.
+            # A C++ destructor on corrupted state can segfault.
+
+        result_holder = [None]  # will hold the new interface or None
 
         def _do_reconnect():
             try:
-                # Try reconnecting existing object first
-                if self._recv is not None:
-                    try:
-                        self._recv.reconnect()
-                        result_holder[0] = True
-                        return
-                    except Exception:
-                        pass
-
-                # Create a brand-new receive interface
-                self._recv = rtde_receive.RTDEReceiveInterface(self.ip)
-                result_holder[0] = True
+                new_recv = rtde_receive.RTDEReceiveInterface(self.ip)
+                result_holder[0] = new_recv
             except Exception as e:
                 if self.logger:
                     self.logger.warn(
@@ -144,6 +160,9 @@ class URRTDEController:
                 )
             self._recv_healthy = False
             return False
+
+        # Install the new interface
+        self._recv = result_holder[0]
 
         # Verify it actually works
         try:
