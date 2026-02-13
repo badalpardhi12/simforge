@@ -5,13 +5,23 @@
 # ee_link: tool_tip_link (iPhone camera tip)
 # base_link: base_link
 #
-# Collision spheres scaled for UR20 link geometry:
-#   - UR20 links are ~2x longer than UR5e
-#   - shoulder_link: radius ~0.08 (vs 0.06 for UR5e)
-#   - upper_arm_link: length 0.862m, radius ~0.075
-#   - forearm_link: length 0.7287m, radius ~0.065
-#   - wrist links: radius ~0.055
-#   - tool_base_link: same iPhone tool as nakul
+# Collision spheres derived from NVIDIA's official UR10e cuRobo
+# config (Lula-generated), scaled proportionally for UR20 link
+# lengths:
+#   - UR20 upper_arm: 0.862m (vs UR10e 0.613m → scale ~1.41x)
+#   - UR20 forearm:   0.7287m (vs UR10e 0.571m → scale ~1.28x)
+#   - UR20 wrist offsets d4/d5/d6: 0.201/0.159/0.154m
+#     (vs UR10e d4/d5/d6: 0.128/0.116/0.092m → ~1.5x)
+#   - Sphere radii scaled ~1.2x to account for larger link cross
+#     sections on the UR20
+#
+# The tool_base_link spheres use the same iPhone tool layout as
+# nakul_ur5e: 3 rows × 5 spheres at r=0.04, with
+# self_collision_buffer=0.01 inflating to effective r=0.05 for
+# self-collision checks.
+#
+# collision_sphere_buffer: 0.005 (cuRobo default) adds 5mm
+# padding to all spheres for world collision distance.
 # ──────────────────────────────────────────────────────────────
 robot_cfg:
   kinematics:
@@ -33,104 +43,157 @@ robot_cfg:
       - "wrist_3_link"
       - "tool_base_link"
 
+    # Collision spheres scaled from NVIDIA UR10e Lula-generated spheres
+    # for the UR20's larger link geometry.
     collision_spheres:
       shoulder_link:
+        # UR20 shoulder housing is larger than UR10e/UR5e
         - center: [0.0, 0.0, 0.0]
-          radius: 0.08
-        - center: [0.0, 0.0, -0.05]
-          radius: 0.08
+          radius: 0.06
 
       upper_arm_link:
-        # UR20 upper arm is 0.862m long (along -X in link frame)
-        # with visual offset at z=0.26
-        - center: [0.0, 0.0, 0.26]
-          radius: 0.08
-        - center: [0.0, 0.0, 0.0]
-          radius: 0.075
-        - center: [-0.15, 0.0, 0.18]
-          radius: 0.07
-        - center: [-0.30, 0.0, 0.18]
-          radius: 0.065
-        - center: [-0.45, 0.0, 0.18]
-          radius: 0.065
-        - center: [-0.60, 0.0, 0.18]
-          radius: 0.065
-        - center: [-0.75, 0.0, 0.18]
-          radius: 0.07
+        # UR20 upper arm: 0.862m along -X, elbow offset at z≈0.176
+        # Scaled from UR10e's 8 spheres (0.613m arm)
+        # Scale factor: 0.862/0.613 ≈ 1.406
+        - center: [0.0, 0.0, 0.176]
+          radius: 0.11
+        - center: [-0.144, 0.0, 0.176]
+          radius: 0.06
+        - center: [-0.288, 0.0, 0.176]
+          radius: 0.06
+        - center: [-0.432, 0.0, 0.176]
+          radius: 0.06
+        - center: [-0.576, 0.0, 0.176]
+          radius: 0.06
+        - center: [-0.720, 0.0, 0.176]
+          radius: 0.06
+        - center: [-0.862, 0.0, 0.176]
+          radius: 0.085
 
       forearm_link:
-        # UR20 forearm is 0.7287m long (along -X in link frame)
-        - center: [0.0, 0.0, 0.0]
-          radius: 0.065
-        - center: [-0.12, 0.0, 0.02]
+        # UR20 forearm: 0.7287m along -X, wrist offset at z≈0.03
+        # Scaled from UR10e's 8 spheres (0.571m arm)
+        # Scale factor: 0.7287/0.571 ≈ 1.276
+        - center: [0.0, 0.0, 0.03]
           radius: 0.06
-        - center: [-0.24, 0.0, 0.02]
-          radius: 0.055
-        - center: [-0.36, 0.0, 0.02]
-          radius: 0.055
-        - center: [-0.48, 0.0, 0.02]
-          radius: 0.055
-        - center: [-0.60, 0.0, 0.02]
+        - center: [-0.104, 0.0, 0.03]
+          radius: 0.06
+        - center: [-0.208, 0.0, 0.03]
+          radius: 0.06
+        - center: [-0.312, 0.0, 0.03]
+          radius: 0.06
+        - center: [-0.416, 0.0, 0.03]
+          radius: 0.06
+        - center: [-0.520, 0.0, 0.03]
+          radius: 0.06
+        - center: [-0.624, 0.0, 0.03]
+          radius: 0.06
+        - center: [-0.729, 0.0, 0.03]
           radius: 0.06
 
       wrist_1_link:
+        # UR20 d4=0.201m — larger than UR10e's 0.128m
         - center: [0.0, 0.0, 0.0]
-          radius: 0.055
-        - center: [0.0, 0.035, 0.0]
-          radius: 0.055
+          radius: 0.06
 
       wrist_2_link:
+        # UR20 d5=0.1593m
         - center: [0.0, 0.0, 0.0]
-          radius: 0.055
-        - center: [0.0, -0.035, 0.0]
-          radius: 0.055
+          radius: 0.06
 
       wrist_3_link:
-        - center: [0.0, 0.0, -0.035]
-          radius: 0.05
+        # UR20 d6=0.1543m
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.06
+        - center: [0.0, 0.0, 0.06]
+          radius: 0.085
 
       tool_base_link:
-        # Same iPhone tool geometry as nakul
-        - center: [0.085, 0.0, 0.05]
-          radius: 0.065
-        - center: [0.025, 0.0, 0.05]
-          radius: 0.065
-        - center: [-0.035, 0.0, 0.05]
-          radius: 0.065
-        - center: [-0.095, 0.0, 0.05]
-          radius: 0.065
-        - center: [-0.155, 0.0, 0.05]
-          radius: 0.065
-        - center: [-0.215, 0.0, 0.05]
-          radius: 0.065
-        - center: [0.085, 0.0, -0.01]
-          radius: 0.065
-        - center: [0.025, 0.0, -0.01]
-          radius: 0.065
-        - center: [-0.035, 0.0, -0.01]
-          radius: 0.065
-        - center: [-0.095, 0.0, -0.01]
-          radius: 0.065
-        - center: [-0.155, 0.0, -0.01]
-          radius: 0.065
-        - center: [-0.215, 0.0, -0.01]
-          radius: 0.065
+        # iPhone tool collision box in tool_base_link frame:
+        #   URDF box size: 0.3 × 0.16 × 0.08 m
+        #   URDF origin: (-0.065, 0, 0.02), rpy=(1.5708, 0, 0)
+        #
+        # 90° X rotation swaps Y↔Z of the box. Effective extents
+        # in tool_base_link coordinates:
+        #   X: [-0.215 … +0.085]  (0.30 m along tool arm)
+        #   Y: [-0.04  … +0.04 ]  (0.08 m — phone thickness)
+        #   Z: [-0.06  … +0.10 ]  (0.16 m — phone width)
+        #
+        # Sphere layout: 3 rows along Z, 5 spheres each along X.
+        # Smaller radii (0.04) keep base spheres clear of wrist_2
+        # at home position. self_collision_buffer=0.01 on this link
+        # inflates to effective r=0.05 for self-collision checks.
+        #
+        # Row 1 (Z=+0.07): upper edge of tool
+        - center: [0.065, 0.0, 0.07]
+          radius: 0.04
+        - center: [-0.005, 0.0, 0.07]
+          radius: 0.04
+        - center: [-0.075, 0.0, 0.07]
+          radius: 0.04
+        - center: [-0.145, 0.0, 0.07]
+          radius: 0.04
+        - center: [-0.215, 0.0, 0.07]
+          radius: 0.04
+        # Row 2 (Z=+0.02): center of tool
+        - center: [0.065, 0.0, 0.02]
+          radius: 0.04
+        - center: [-0.005, 0.0, 0.02]
+          radius: 0.04
+        - center: [-0.075, 0.0, 0.02]
+          radius: 0.04
+        - center: [-0.145, 0.0, 0.02]
+          radius: 0.04
+        - center: [-0.215, 0.0, 0.02]
+          radius: 0.04
+        # Row 3 (Z=-0.03): lower edge of tool
+        - center: [0.065, 0.0, -0.03]
+          radius: 0.04
+        - center: [-0.005, 0.0, -0.03]
+          radius: 0.04
+        - center: [-0.075, 0.0, -0.03]
+          radius: 0.04
+        - center: [-0.145, 0.0, -0.03]
+          radius: 0.04
+        - center: [-0.215, 0.0, -0.03]
+          radius: 0.04
 
-    collision_sphere_buffer: 0.0
+    collision_sphere_buffer: 0.005
     extra_collision_spheres: {}
 
-    self_collision_ignore: {}
+    # Explicit self_collision_ignore for pairs that should never be
+    # checked.  Follows the same pattern as NVIDIA's official UR10e
+    # config.  The collision_matrix.py sampler will merge additional
+    # discovered pairs on top of these at startup.
+    #
+    # CRITICAL: wrist_2 ↔ tool_base is NOT in this list — cuRobo
+    # must check that pair for real collision avoidance during
+    # trajectory planning.
+    self_collision_ignore:
+      "shoulder_link": ["tool_base_link"]
+      "upper_arm_link": ["forearm_link", "shoulder_link", "tool_base_link"]
+      "forearm_link": ["wrist_1_link", "wrist_2_link", "wrist_3_link"]
+      "wrist_1_link": ["wrist_2_link", "wrist_3_link", "tool_base_link"]
+      "wrist_2_link": ["wrist_3_link"]
+      "wrist_3_link": ["tool_base_link"]
 
     self_collision_buffer:
+      shoulder_link: 0.08
       upper_arm_link: 0
       forearm_link: 0
       wrist_1_link: 0
       wrist_2_link: 0
       wrist_3_link: 0
-      tool_base_link: 0.005
+      tool_base_link: 0.01
 
     use_global_cumul: True
-    mesh_link_names: null
+    mesh_link_names:
+      - "shoulder_link"
+      - "upper_arm_link"
+      - "forearm_link"
+      - "wrist_1_link"
+      - "wrist_2_link"
+      - "wrist_3_link"
 
     cspace:
       joint_names:
@@ -140,7 +203,7 @@ robot_cfg:
         - "wrist_1_joint"
         - "wrist_2_joint"
         - "wrist_3_joint"
-      retract_config: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
+      retract_config: [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]
       null_space_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
       cspace_distance_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
       max_jerk: 500.0

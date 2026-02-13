@@ -179,7 +179,7 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
       <collision>
         <origin xyz="-0.065 0 0.02" rpy="1.5708 0 0"/>
         <geometry>
-          <box size="0.3 0.13 0.08"/>
+          <box size="0.3 0.16 0.08"/>
         </geometry>
       </collision>
       <inertial>

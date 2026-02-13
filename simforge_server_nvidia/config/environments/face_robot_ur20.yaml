@@ -37,5 +37,5 @@ environment:
       ee_link: tool0
       ik_tip_link: tool_tip_link
       base_link: base_link
-      home_position: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
+      home_position: [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]
       curobo_config: face_robot_ur20/ur20_curobo.yml

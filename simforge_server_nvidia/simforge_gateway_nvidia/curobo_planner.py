@@ -128,15 +128,19 @@ class CuroboPlanner:
                     robot_cfg_dict["kinematics"]["urdf_path"] = urdf_path
 
                 # ── Compute self_collision_ignore from sphere geometry ──
-                # This replaces any hardcoded self_collision_ignore in the
-                # config with one derived from cuRobo's own collision
-                # spheres.  We sample random joint configs, compute FK,
-                # and check which sphere pairs actually collide.
+                # Start with any hardcoded pairs from the YAML config
+                # (e.g. wrist_3 ↔ tool_base for deliberate overlaps),
+                # then merge in pairs discovered by random sampling.
                 kin_section = robot_cfg_dict
                 if "robot_cfg" in robot_cfg_dict:
                     kin_section = robot_cfg_dict["robot_cfg"]
                 if "kinematics" in kin_section:
                     kin_section = kin_section["kinematics"]
+
+                # Preserve hardcoded ignore pairs from config
+                hardcoded_ignore = dict(
+                    kin_section.get("self_collision_ignore", {}) or {}
+                )
 
                 self._log.info(
                     f"Computing self-collision matrix for {robot_name} "
@@ -148,13 +152,27 @@ class CuroboPlanner:
                     collision_threshold=0.0,
                     ros_logger=self._log,
                 )
-                if computed_ignore:
-                    kin_section["self_collision_ignore"] = computed_ignore
-                    self._log.info(
-                        f"Self-collision matrix for {robot_name}: "
-                        f"{sum(len(v) for v in computed_ignore.values())} "
-                        f"ignored pairs"
-                    )
+
+                # Merge: hardcoded pairs take priority, computed pairs
+                # are added on top.  This ensures deliberately-ignored
+                # pairs (like tool mount overlaps) are always included
+                # even if sampling doesn't detect them.
+                merged_ignore = dict(hardcoded_ignore)
+                for link, others in computed_ignore.items():
+                    if link in merged_ignore:
+                        existing = set(merged_ignore[link])
+                        existing.update(others)
+                        merged_ignore[link] = sorted(existing)
+                    else:
+                        merged_ignore[link] = others
+                kin_section["self_collision_ignore"] = merged_ignore
+                self._log.info(
+                    f"Self-collision matrix for {robot_name}: "
+                    f"{sum(len(v) for v in merged_ignore.values())} "
+                    f"total ignored pairs "
+                    f"({sum(len(v) for v in hardcoded_ignore.values())} "
+                    f"hardcoded + computed)"
+                )
 
                 robot_world_cfg = _transform_world_to_robot_frame(
                     world_cfg_dict, robot_name
