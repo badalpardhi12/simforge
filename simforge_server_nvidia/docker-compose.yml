@@ -18,15 +18,25 @@
 #     ROBOT_IP_NAKUL_UR5E, ROBOT_IP_SAHADEV_UR5E  (dual UR5e)
 #     ROBOT_IP_UR20                                 (single UR20)
 #
-# Usage:
-#   Simulation:  docker compose --profile sim up
-#   Production:  docker compose --profile prod up
+# Platforms:
+#   x86_64 (AMD/Intel + NVIDIA GPU):
+#     Simulation:  docker compose --profile sim up
+#     Production:  docker compose --profile prod up
+#
+#   Jetson Thor (JetPack 7, aarch64):
+#     Simulation:  docker compose --profile jetson-sim up
+#     Production:  docker compose --profile jetson-prod up
 #
 #   Face robot:  ENV_CONFIG=face_robot_ur20 docker compose --profile sim up
 #
 # GPU requirements:
-#   - NVIDIA driver 535+ with CUDA 12.2 support
-#   - NVIDIA Container Toolkit (nvidia-container-toolkit)
+#   x86_64:
+#     - NVIDIA driver 535+ with CUDA 12.2 support
+#     - NVIDIA Container Toolkit (nvidia-container-toolkit)
+#   Jetson Thor:
+#     - JetPack 7.0 with CUDA 13.x
+#     - NVIDIA Container Toolkit (default-runtime: nvidia)
+#     - Must build natively on device (no cross-compilation)
 # ──────────────────────────────────────────────────────────────
 
 services:
@@ -129,3 +139,96 @@ services:
     command: /start_server.sh --real
     profiles:
       - prod
+
+  # ── Jetson Thor — Simulation Mode ──────────────────────────
+  # JetPack 7 (Ubuntu 24.04, CUDA 13, ROS2 Jazzy)
+  # Build natively on the Jetson Thor device.
+  simforge-server-jetson-sim:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.jetson
+    container_name: simforge-server-jetson-sim
+    hostname: simforge-server-jetson-sim
+    environment:
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - ENV_CONFIG=${ENV_CONFIG:-valid8_dual_ur5e}
+      - ROBOT_IP_NAKUL_UR5E=${ROBOT_IP_NAKUL_UR5E:-192.168.1.9}
+      - ROBOT_IP_SAHADEV_UR5E=${ROBOT_IP_SAHADEV_UR5E:-192.168.1.16}
+      - ROBOT_IP_UR20=${ROBOT_IP_UR20:-0.0.0.0}
+      - NAKUL_ROBOT_IP=${NAKUL_ROBOT_IP:-192.168.1.9}
+      - SAHADEV_ROBOT_IP=${SAHADEV_ROBOT_IP:-192.168.1.16}
+      - MAX_VELOCITY_SCALING=${MAX_VELOCITY_SCALING:-0.25}
+      - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-0.25}
+      - INTERPOLATION_DT=${INTERPOLATION_DT:-0.02}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    network_mode: host
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    cap_add:
+      - SYS_NICE
+    ulimits:
+      rtprio:
+        soft: 99
+        hard: 99
+      memlock:
+        soft: 102400
+        hard: 102400
+    stdin_open: true
+    tty: true
+    command: /start_server.sh --sim
+    profiles:
+      - jetson-sim
+
+  # ── Jetson Thor — Real Robot Mode ──────────────────────────
+  simforge-server-jetson:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.jetson
+    container_name: simforge-server-jetson
+    hostname: simforge-server-jetson
+    environment:
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - ENV_CONFIG=${ENV_CONFIG:-valid8_dual_ur5e}
+      - ROBOT_IP_NAKUL_UR5E=${ROBOT_IP_NAKUL_UR5E:-192.168.1.9}
+      - ROBOT_IP_SAHADEV_UR5E=${ROBOT_IP_SAHADEV_UR5E:-192.168.1.16}
+      - ROBOT_IP_UR20=${ROBOT_IP_UR20:-0.0.0.0}
+      - NAKUL_ROBOT_IP=${NAKUL_ROBOT_IP:-192.168.1.9}
+      - SAHADEV_ROBOT_IP=${SAHADEV_ROBOT_IP:-192.168.1.16}
+      - MAX_VELOCITY_SCALING=${MAX_VELOCITY_SCALING:-0.25}
+      - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-0.25}
+      - INTERPOLATION_DT=${INTERPOLATION_DT:-0.02}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    network_mode: host
+    privileged: true
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    cap_add:
+      - SYS_NICE
+    ulimits:
+      rtprio:
+        soft: 99
+        hard: 99
+      memlock:
+        soft: 102400
+        hard: 102400
+    stdin_open: true
+    tty: true
+    command: /start_server.sh --real
+    profiles:
+      - jetson-prod
