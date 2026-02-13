@@ -140,7 +140,7 @@ class CuroboPlanner:
                     robot_cfg_dict,
                     num_samples=5000,
                     collision_threshold=0.0,
-                    always_fraction=0.98,
+                    ros_logger=self._log,
                 )
                 if computed_ignore:
                     kin_section["self_collision_ignore"] = computed_ignore
@@ -165,7 +165,7 @@ class CuroboPlanner:
                     num_trajopt_seeds=12,
                     num_graph_seeds=12,
                     num_ik_seeds=100,
-                    collision_activation_distance=0.01,
+                    collision_activation_distance=0.025,
                     maximum_trajectory_dt=None,
                     interpolation_type=InterpolateType.CUBIC,
                 )

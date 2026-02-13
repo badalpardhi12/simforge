@@ -9,12 +9,19 @@ geometry may collide constantly in sphere geometry.
 
 This module generates the self_collision_ignore list by sampling random
 joint configurations and checking sphere-sphere distances for every link
-pair.  Pairs that are **always** in collision (at *every* sampled config)
-or **never** in collision are added to self_collision_ignore.  Only pairs
-that collide in *some* configurations (i.e., the robot can move into and
-out of collision) are left for cuRobo to check at runtime.
+pair.  Pairs that are **never** in collision are added to
+self_collision_ignore together with kinematically adjacent pairs.
 
-This matches MoveIt's algorithm but applied to cuRobo's sphere geometry.
+IMPORTANT: We do NOT ignore "always in collision" pairs.  Uniform random
+sampling is biased toward folded-arm configurations.  A pair that collides
+in 98%+ of random configs may be collision-free in the exact workspace
+region that the robot operates in.  If we ignore such a pair, cuRobo will
+happily plan trajectories that cause real physical self-collisions.
+
+Instead, only **adjacent** and **never-collides** pairs are ignored.  If a
+pair truly collides in every reachable configuration (e.g. overlapping
+spheres on the same physical body), it must be handled by adjusting sphere
+geometry rather than silently ignoring it.
 
 Usage at startup
 ----------------
@@ -26,9 +33,35 @@ needed.
 
 import copy
 import logging
-from typing import Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+class _LogAdapter:
+    """Wraps either a ROS2 logger or Python logger into a uniform API."""
+
+    def __init__(self, ros_logger=None):
+        self._ros = ros_logger
+        self._py = logging.getLogger(__name__)
+
+    def info(self, msg: str):
+        if self._ros:
+            self._ros.info(msg)
+        else:
+            self._py.info(msg)
+
+    def warning(self, msg: str):
+        if self._ros:
+            self._ros.warn(msg)
+        else:
+            self._py.warning(msg)
+
+    def error(self, msg: str):
+        if self._ros:
+            self._ros.error(msg)
+        else:
+            self._py.error(msg)
 
 try:
     import torch
@@ -47,10 +80,11 @@ def compute_self_collision_ignore(
     collision_threshold: float = 0.0,
     never_fraction: float = 0.0,
     always_fraction: float = 0.98,
+    ros_logger: Optional[Any] = None,
 ) -> Dict[str, List[str]]:
     """Generate self_collision_ignore from cuRobo's own sphere geometry.
 
-    Algorithm (matching MoveIt Setup Assistant logic):
+    Algorithm:
     1. Build the cuRobo kinematic model (no collision checking — just FK).
     2. Sample ``num_samples`` random joint configurations within limits.
     3. For each sample, run FK to get sphere world positions.
@@ -59,10 +93,19 @@ def compute_self_collision_ignore(
     5. Classify each pair:
        - **Adjacent**: parent–child in kinematic chain → always ignore
        - **Never**: collides in 0% of samples → ignore (can't collide)
-       - **Always**: collides in ≥98% of samples → ignore (always in
-         collision — checking would make all configs infeasible)
-       - **Sometimes**: collides in some samples → DO NOT ignore (cuRobo
-         should check these at runtime)
+       - **Sometimes/Always**: collides in some or all samples → DO NOT
+         ignore (cuRobo must check these at runtime)
+
+    IMPORTANT: We intentionally do NOT ignore "always in collision" pairs.
+    Uniform random sampling is biased — it overwhelmingly produces folded
+    arm configurations.  A pair that collides in 99% of random configs may
+    be collision-free in the robot's operational workspace.  Ignoring such
+    a pair allows cuRobo to plan trajectories that pass through the rare
+    collision-free region and then re-enter collision, causing real
+    physical self-collisions.
+
+    The ``always_fraction`` parameter is accepted for API compatibility
+    but is NOT used.
 
     Parameters
     ----------
@@ -75,15 +118,20 @@ def compute_self_collision_ignore(
     never_fraction : float
         Maximum collision fraction to classify as "never" (default 0.0).
     always_fraction : float
-        Minimum collision fraction to classify as "always" (default 0.98).
+        IGNORED — kept for API compatibility.  "Always in collision"
+        pairs are now checked at runtime rather than ignored.
+    ros_logger : optional
+        ROS2 logger (``node.get_logger()``) for visible log output.
+        Falls back to Python logging if not provided.
 
     Returns
     -------
     Dict[str, List[str]]
         The self_collision_ignore dict ready for cuRobo config.
     """
+    log = _LogAdapter(ros_logger)
     if not _CUROBO_AVAILABLE:
-        logger.warning("cuRobo not available — returning empty ignore list")
+        log.warning("cuRobo not available — returning empty ignore list")
         return {}
 
     # ── Extract config fields ────────────────────────────────────
@@ -97,7 +145,7 @@ def compute_self_collision_ignore(
     collision_spheres: dict = kin_cfg.get("collision_spheres", {})
 
     if not collision_link_names or not collision_spheres:
-        logger.warning(
+        log.warning(
             "No collision_link_names or collision_spheres in config "
             "— returning empty ignore list"
         )
@@ -126,7 +174,7 @@ def compute_self_collision_ignore(
         robot_config = RobotConfig.from_dict(cfg_copy)
         kin_model = CudaRobotModel(robot_config.kinematics)
     except Exception as e:
-        logger.error(f"Failed to build kinematic model: {e}")
+        log.error(f"Failed to build kinematic model: {e}")
         return {}
 
     # ── Get joint limits ─────────────────────────────────────────
@@ -148,15 +196,11 @@ def compute_self_collision_ignore(
         ]))
         adjacent_pairs.add(pair)
 
-    logger.info(f"Adjacent pairs (always ignored): {len(adjacent_pairs)}")
+    log.info(f"Adjacent pairs (always ignored): {len(adjacent_pairs)}")
     for a, b in sorted(adjacent_pairs):
-        logger.info(f"  Adjacent: {a} ↔ {b}")
+        log.info(f"  Adjacent: {a} ↔ {b}")
 
     # ── Map link names to sphere indices in the flat tensor ──────
-    # CudaRobotModel stores sphere-to-link mapping in kinematics_config.
-    # link_sphere_idx_map: (total_spheres,) — each element is the link
-    # index that sphere belongs to.
-    # link_name_to_idx_map: Dict[str, int] — link name → link index.
     kc = kin_model.kinematics_config
     link_name_to_idx: Dict[str, int] = kc.link_name_to_idx_map
     sphere_idx_map = kc.link_sphere_idx_map.cpu()  # (total_spheres,)
@@ -164,7 +208,7 @@ def compute_self_collision_ignore(
     link_to_sphere_indices: Dict[str, List[int]] = {}
     for link_name in collision_link_names:
         if link_name not in link_name_to_idx:
-            logger.warning(
+            log.warning(
                 f"Link '{link_name}' not in link_name_to_idx_map — "
                 f"available: {list(link_name_to_idx.keys())}"
             )
@@ -174,13 +218,13 @@ def compute_self_collision_ignore(
             sphere_idx_map == link_idx
         ).view(-1).tolist()
         link_to_sphere_indices[link_name] = sphere_indices
-        logger.info(
+        log.info(
             f"  Link {link_name}: {len(sphere_indices)} sphere(s) "
             f"(indices {sphere_indices})"
         )
 
     # ── Sample random joint configs ──────────────────────────────
-    logger.info(
+    log.info(
         f"Sampling {num_samples} random configs to build collision matrix "
         f"({len(collision_link_names)} links, {n_dof} DOF)"
     )
@@ -210,7 +254,7 @@ def compute_self_collision_ignore(
             if pair not in adjacent_pairs:
                 pairs_to_check.append((a, b))
 
-    logger.info(f"Non-adjacent pairs to check: {len(pairs_to_check)}")
+    log.info(f"Non-adjacent pairs to check: {len(pairs_to_check)}")
 
     # ── Run FK in batches and count per-sample collisions ────────
     collision_counts: Dict[Tuple[str, str], int] = {
@@ -255,41 +299,42 @@ def compute_self_collision_ignore(
             collision_counts[(pair_a, pair_b)] += int(colliding_any.sum())
 
     # ── Classify pairs ───────────────────────────────────────────
+    # ONLY ignore adjacent pairs and never-collides pairs.
+    # "Always in collision" pairs are NOT ignored — uniform random
+    # sampling is biased toward folded configurations.  A pair that
+    # collides in 99% of random samples may be collision-free in the
+    # robot's actual operating workspace.  If we ignore it, cuRobo
+    # will happily plan through configurations where the pair
+    # transitions from non-colliding to colliding, causing real
+    # physical self-collisions.
     ignore_pairs: Set[Tuple[str, str]] = set()
 
     # 1. Adjacent pairs: always ignore
     for pair in adjacent_pairs:
         ignore_pairs.add(pair)
 
-    # 2. Never/Always pairs from sampling
+    # 2. Only Never-collides pairs from sampling → ignore
     for (a, b), count in collision_counts.items():
         fraction = count / total_samples
         pair = tuple(sorted([a, b]))
 
         if fraction <= never_fraction:
             ignore_pairs.add(pair)
-            logger.info(
+            log.info(
                 f"  Never collides: {a} ↔ {b} "
                 f"({count}/{total_samples} = {fraction:.1%}) → IGNORE"
             )
-        elif fraction >= always_fraction:
-            # Always in collision — must ignore or cuRobo will reject
-            # all configurations.  The spheres permanently overlap.
-            ignore_pairs.add(pair)
-            logger.info(
-                f"  Always collides: {a} ↔ {b} "
-                f"({count}/{total_samples} = {fraction:.1%}) → IGNORE "
-                f"(spheres permanently overlap)"
-            )
         else:
-            logger.info(
-                f"  Sometimes collides: {a} ↔ {b} "
+            # Any pair that collides in ANY sample must be checked.
+            # This includes pairs that collide in 99%+ of samples —
+            # the remaining 1% might be exactly the robot's operating
+            # workspace, and trajectories could enter/exit collision.
+            log.info(
+                f"  Collides: {a} ↔ {b} "
                 f"({count}/{total_samples} = {fraction:.1%}) → CHECK"
             )
 
     # ── Build the output dict ────────────────────────────────────
-    # Format: { linkA: [linkB, linkC], ... } — each pair listed once
-    # under the link that comes first in collision_link_names order.
     result: Dict[str, List[str]] = {}
     seen: Set[Tuple[str, str]] = set()
 
@@ -310,7 +355,7 @@ def compute_self_collision_ignore(
     checked = len(pairs_to_check) - len(
         [p for p in pairs_to_check if tuple(sorted(p)) in ignore_pairs]
     )
-    logger.info(
+    log.info(
         f"Self-collision matrix complete: "
         f"{len(ignore_pairs)} ignored pairs, {checked} checked pairs"
     )
