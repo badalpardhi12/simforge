@@ -164,6 +164,11 @@ class SimforgeClient:
         self._pending_requests: Dict[str, asyncio.Future] = {}
         self._request_id: int = 0
 
+        # Activity events — pulsed on every rpc_feedback / error for a
+        # request_id so that call_rpc can use an *inactivity* timeout
+        # instead of a fixed total timeout.
+        self._activity_events: Dict[str, asyncio.Event] = {}
+
     @property
     def server_uri(self) -> str:
         """Get the WebSocket URI."""
@@ -443,8 +448,16 @@ class SimforgeClient:
         pass
 
     def _handle_rpc_feedback(self, msg: Dict[str, Any]):
-        """Handle RPC feedback (progress updates during long operations)."""
-        # For now, just log - can be extended with callbacks
+        """Handle RPC feedback (progress updates during long operations).
+
+        Pulses the activity event for the request so that
+        :meth:`call_rpc` resets its inactivity deadline.
+        """
+        request_id = msg.get("request_id")
+        if request_id:
+            evt = self._activity_events.get(request_id)
+            if evt is not None:
+                evt.set()
         logger.debug(f"RPC feedback: {msg}")
 
     def _handle_error(self, msg: Dict[str, Any]):
@@ -459,6 +472,10 @@ class SimforgeClient:
             future = self._pending_requests.pop(request_id)
             if not future.done():
                 future.set_exception(RuntimeError(error_msg))
+            # Pulse activity event so the wait loop wakes up
+            evt = self._activity_events.get(request_id)
+            if evt is not None:
+                evt.set()
         elif request_id:
             logger.warning(
                 f"Error for unknown request_id {request_id} "
@@ -734,47 +751,140 @@ class SimforgeClient:
         method: str,
         params: Dict[str, Any],
         timeout: float = 60.0,
+        inactivity_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """
-        Call a generic RPC method on the server.
-        
+        """Call a generic RPC method on the server.
+
+        Two timeout modes are supported:
+
+        * **Fixed total timeout** (``timeout``, default 60 s) —
+          the call must complete within this wall-clock budget.
+          Suitable for short / non-streaming RPCs.
+
+        * **Activity-based inactivity timeout** (``inactivity_timeout``) —
+          the deadline resets every time the server sends an
+          ``rpc_feedback`` message for this request.  The call can
+          take an arbitrarily long time as long as the server keeps
+          reporting progress within each inactivity window.
+          Ideal for long-running operations like multi-pose
+          protocol execution where cuRobo planning and trajectory
+          execution times are unpredictable.
+
+        If *both* are given, ``inactivity_timeout`` takes precedence.
+
         Args:
-            method: RPC method name (e.g., 'get_environment_info', 'run_proto_sim')
+            method: RPC method name (e.g., 'get_environment_info',
+                'run_proto_sim')
             params: Parameters to pass to the method
-            timeout: Maximum time to wait for result
-            
+            timeout: Maximum *total* time to wait for result (used when
+                ``inactivity_timeout`` is ``None``).
+            inactivity_timeout: Maximum *silence* time — resets on every
+                server feedback message.  ``None`` ⇒ use ``timeout``
+                instead.
+
         Returns:
             Dictionary with RPC result
         """
         if not self.is_connected:
             raise RuntimeError("Not connected to server")
-        
+
         # Generate request ID
         self._request_id += 1
         request_id = f"{self.config.client_id}_{self._request_id}"
-        
+
         request = {
             "type": "rpc",
             "request_id": request_id,
             "method": method,
             "params": params,
         }
-        
+
         # Create future for result
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future = loop.create_future()
         self._pending_requests[request_id] = future
-        
+
+        # Activity event — pulsed by _handle_rpc_feedback
+        activity_event = asyncio.Event()
+        self._activity_events[request_id] = activity_event
+
         try:
-            # Send request
             await self._ws.send(json.dumps(request))
-            
-            # Wait for result with timeout
-            result = await asyncio.wait_for(future, timeout=timeout)
-            return result
-            
+
+            if inactivity_timeout is not None:
+                return await self._wait_with_activity(
+                    future, activity_event, request_id, method,
+                    inactivity_timeout,
+                )
+            else:
+                # Legacy fixed-total-timeout path
+                result = await asyncio.wait_for(future, timeout=timeout)
+                return result
+
         except asyncio.TimeoutError:
             self._pending_requests.pop(request_id, None)
-            raise TimeoutError(f"RPC call '{method}' timed out after {timeout}s")
+            if inactivity_timeout is not None:
+                raise TimeoutError(
+                    f"RPC '{method}' timed out: no server activity "
+                    f"for {inactivity_timeout}s"
+                )
+            raise TimeoutError(
+                f"RPC call '{method}' timed out after {timeout}s"
+            )
+        finally:
+            self._activity_events.pop(request_id, None)
+
+    async def _wait_with_activity(
+        self,
+        future: asyncio.Future,
+        activity_event: asyncio.Event,
+        request_id: str,
+        method: str,
+        inactivity_timeout: float,
+    ) -> Dict[str, Any]:
+        """Wait for *future* using an activity-based inactivity timeout.
+
+        Each time *activity_event* fires (set by ``_handle_rpc_feedback``)
+        the inactivity deadline resets.  The call only times out if the
+        server is completely silent for *inactivity_timeout* seconds.
+        """
+        while True:
+            activity_event.clear()
+
+            # Build two awaitables:
+            #   1. The result future (shielded so wait_for won't cancel it)
+            #   2. The activity heartbeat event
+            shield = asyncio.ensure_future(asyncio.shield(future))
+            heartbeat = asyncio.ensure_future(activity_event.wait())
+
+            done, pending = await asyncio.wait(
+                {shield, heartbeat},
+                timeout=inactivity_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # Clean up whichever task didn't finish
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            # If the result arrived, return it
+            if future.done():
+                return future.result()
+
+            # If the activity event fired, the server is alive — loop
+            if activity_event.is_set():
+                continue
+
+            # Neither fired within the window → true inactivity timeout
+            self._pending_requests.pop(request_id, None)
+            raise TimeoutError(
+                f"RPC '{method}' timed out: no server activity "
+                f"for {inactivity_timeout}s"
+            )
 
     def _handle_rpc_result(self, msg: Dict[str, Any]):
         """Handle RPC result message."""
@@ -783,6 +893,10 @@ class SimforgeClient:
             future = self._pending_requests.pop(request_id)
             if not future.done():
                 future.set_result(msg)
+            # Also pulse the activity event so the wait loop wakes up
+            evt = self._activity_events.get(request_id)
+            if evt is not None:
+                evt.set()
 
 
 # Convenience function for simple usage

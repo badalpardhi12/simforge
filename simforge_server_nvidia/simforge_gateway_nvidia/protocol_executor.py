@@ -139,7 +139,16 @@ class ProtocolExecutor:
                                   "planning",
                                   f"Planning trajectory through {total} "
                                   f"poses (cuRobo GPU)…")
-
+        # Progress callback — sends per-segment feedback so the client’s
+        # inactivity timer keeps resetting during long planning runs.
+        async def _planning_progress(seg_idx, seg_total, pose_name):
+            pct = ((seg_idx + 1) / seg_total) * 50.0  # planning = 0–50 %
+            await self._send_feedback(
+                client, request_id, seg_idx, total, pct,
+                "planning",
+                f"Planned segment {seg_idx + 1}/{seg_total} "
+                f"({pose_name})",
+            )
         current = self._js_mgr.robot_states[robot_name].joint_positions
         if not current or len(current) != 6:
             current = list(cfg["home_position"])
@@ -149,6 +158,7 @@ class ProtocolExecutor:
             current_joints=current,
             velocity_scaling=move_speed,
             idle_time=idle_time,
+            progress_callback=_planning_progress,
         )
 
         if plan_result is None:

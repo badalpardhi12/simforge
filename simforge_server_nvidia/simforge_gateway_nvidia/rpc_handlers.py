@@ -259,7 +259,13 @@ class RPCHandlers:
         requested_speed = params.get(
             "move_speed", self._node.max_velocity_scaling
         )
-        move_speed = min(self._node.max_velocity_scaling, requested_speed)
+        move_speed = max(0.01, min(self._node.max_velocity_scaling, requested_speed))
+        if requested_speed > self._node.max_velocity_scaling:
+            self._node.get_logger().warn(
+                f"Requested speed {requested_speed:.2f} exceeds server "
+                f"max_velocity_scaling {self._node.max_velocity_scaling:.2f}, "
+                f"clamped to {move_speed:.2f}"
+            )
 
         if robot_name not in ROBOT_CONFIG:
             await self._send_error(

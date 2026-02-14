@@ -11,7 +11,7 @@ import math
 import tempfile
 import time
 import traceback
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
@@ -399,9 +399,17 @@ class CuroboPlanner:
         current_joints: List[float],
         velocity_scaling: Optional[float] = None,
         idle_time: float = 0.0,
+        progress_callback: Optional[Callable] = None,
     ) -> Optional[tuple]:
         """Plan trajectories through multiple poses, concatenated with
         optional dwell periods.
+
+        Parameters
+        ----------
+        progress_callback : Optional[Callable[[int, int, str], Awaitable[None]]]
+            ``async callback(segment_index, total_segments, pose_name)``
+            called after each segment is planned so callers (e.g. the
+            protocol executor) can relay progress to the client.
 
         Returns ``(trajectory_wrapper, pose_times, valid_indices)`` or
         ``None``.
@@ -437,6 +445,14 @@ class CuroboPlanner:
                 current_joints=list(current),
                 velocity_scaling=vel_scale,
             )
+
+            # Notify caller about planning progress (keeps client alive)
+            if progress_callback is not None:
+                try:
+                    await progress_callback(i, len(poses), pose_name)
+                except Exception:
+                    pass  # best-effort; don't abort planning
+
             if result is None:
                 failed_names.append(pose_name)
                 self._log.warn(

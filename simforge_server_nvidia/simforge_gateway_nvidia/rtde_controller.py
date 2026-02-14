@@ -568,6 +568,18 @@ class URRTDEController:
             cb_interval = max(1, int(self._frequency / 50.0))  # 10
             cb_logged = False  # log first callback only
 
+            # ── Timing diagnostics ──────────────────────────────────
+            wall_start = _time.monotonic()
+            timing_samples = []  # (iteration, elapsed_wall, expected_time)
+            timing_log_interval = max(1, n_servo // 5)  # log 5 times
+
+            # ── Python-native timing loop ───────────────────────────
+            # ur_rtde's initPeriod()/waitPeriod() uses C++ steady_clock
+            # which malfunctions on aarch64 (Jetson), achieving only
+            # ~7 Hz instead of 500 Hz.  Python time.sleep() achieves
+            # ~486 Hz reliably on the same hardware.
+            loop_epoch = _time.monotonic()
+
             for si in range(n_servo):
                 if stop_check_fn and stop_check_fn():
                     if logger:
@@ -653,29 +665,29 @@ class URRTDEController:
                         return False
 
                 # TCP-level disconnect check (link fully lost).
-                try:
-                    ctrl_connected = self._ctrl.isConnected()
-                except Exception:
-                    ctrl_connected = False
-                if not ctrl_connected:
-                    msg = (
-                        f"RTDE control interface lost during servoJ "
-                        f"on {self.robot_name} at cmd {si}/{n_servo}"
-                    )
-                    self.last_error = msg
-                    if logger:
-                        logger.warn(msg)
-                    self._teardown_ctrl()
-                    self.reconnect_receive()
-                    return False
+                # Only check at 50 Hz to reduce overhead.
+                if si % cb_interval == 0:
+                    try:
+                        ctrl_connected = self._ctrl.isConnected()
+                    except Exception:
+                        ctrl_connected = False
+                    if not ctrl_connected:
+                        msg = (
+                            f"RTDE control interface lost during servoJ "
+                            f"on {self.robot_name} at cmd {si}/{n_servo}"
+                        )
+                        self.last_error = msg
+                        if logger:
+                            logger.warn(msg)
+                        self._teardown_ctrl()
+                        self.reconnect_receive()
+                        return False
 
                 try:
-                    t_start = self._ctrl.initPeriod()
                     servo_ok = self._ctrl.servoJ(
                         q_target, 0.0, 0.0, servo_dt,
                         lookahead_time, gain,
                     )
-                    self._ctrl.waitPeriod(t_start)
                 except Exception as servo_exc:
                     msg = (
                         f"RTDE servoJ exception on "
@@ -717,6 +729,33 @@ class URRTDEController:
                     except Exception:
                         pass  # never let callback errors kill the loop
 
+                # ── Python-native rate control ──────────────────────
+                # Sleep until the target time for the NEXT iteration.
+                # Uses absolute time from loop_epoch to prevent drift
+                # accumulation.
+                next_target = loop_epoch + (si + 1) * servo_dt
+                remaining = next_target - _time.monotonic()
+                if remaining > 0:
+                    _time.sleep(remaining)
+
+                # ── Timing sample ───────────────────────────────────
+                if si % timing_log_interval == 0 or si == n_servo - 1:
+                    wall_elapsed = _time.monotonic() - wall_start
+                    expected = si * servo_dt
+                    drift = wall_elapsed - expected
+                    if logger:
+                        logger.info(
+                            f"servoJ timing [{self.robot_name}] "
+                            f"cmd {si}/{n_servo}: "
+                            f"wall={wall_elapsed:.3f}s, "
+                            f"expected={expected:.3f}s, "
+                            f"drift={drift:+.3f}s "
+                            f"({drift/expected*100:+.1f}%)"
+                            if expected > 0 else
+                            f"servoJ timing [{self.robot_name}] "
+                            f"cmd 0/{n_servo}: start"
+                        )
+
             # Clean stop — control interface may already be dead
             try:
                 self._ctrl.servoStop()
@@ -731,9 +770,17 @@ class URRTDEController:
             self.reconnect_receive()
 
             self.last_error = ""
+
+            # ── Timing summary ──────────────────────────────────────
+            wall_total = _time.monotonic() - wall_start
+            drift_total = wall_total - total_time
             if logger:
+                actual_rate = n_servo / wall_total if wall_total > 0 else 0
                 logger.info(
-                    f"RTDE servoJ complete for {self.robot_name} ✓"
+                    f"RTDE servoJ complete for {self.robot_name} ✓  "
+                    f"wall={wall_total:.2f}s vs planned={total_time:.2f}s  "
+                    f"drift={drift_total:+.2f}s  "
+                    f"actual_rate={actual_rate:.0f}Hz"
                 )
             return True
 

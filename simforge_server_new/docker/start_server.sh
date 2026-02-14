@@ -187,8 +187,8 @@ ros2 run simforge_gateway command_gateway_node.py \
     -p websocket_port:=8766 \
     -p websocket_host:=0.0.0.0 \
     -p max_clients:=5 \
-    -p max_velocity_scaling:=${MAX_VELOCITY_SCALING:-0.2} \
-    -p max_acceleration_scaling:=${MAX_ACCELERATION_SCALING:-0.2} &
+    -p max_velocity_scaling:=${MAX_VELOCITY_SCALING:-1.0} \
+    -p max_acceleration_scaling:=${MAX_ACCELERATION_SCALING:-1.0} &
 GATEWAY_PID=$!
 echo "Gateway PID: $GATEWAY_PID"
 

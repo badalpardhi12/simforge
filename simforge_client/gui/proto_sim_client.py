@@ -72,8 +72,8 @@ class ProtoSimParameters:
     idle_time: float = 2.0
     # Randomize order
     randomize: bool = False
-    # Velocity scaling for real robot (0.0–1.0)
-    move_speed: float = 0.1
+    # Velocity scaling for real robot (0.01–1.0)
+    move_speed: float = 0.25
 
 
 @dataclass
@@ -349,10 +349,10 @@ class ProtoSimClientFrame(wx.Frame):
         options_sizer.AddSpacer(15)
 
         options_sizer.Add(wx.StaticText(panel, label="Speed:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
-        self.speed_ctrl = wx.SpinCtrlDouble(panel, min=0.01, max=0.5, initial=0.1, inc=0.05)
+        self.speed_ctrl = wx.SpinCtrlDouble(panel, min=0.01, max=1.0, initial=0.25, inc=0.05)
         self.speed_ctrl.SetDigits(2)
         options_sizer.Add(self.speed_ctrl, 0, wx.ALL, 5)
-        self.speed_pct_label = wx.StaticText(panel, label="(10 %)")
+        self.speed_pct_label = wx.StaticText(panel, label="(25 %)")
         options_sizer.Add(self.speed_pct_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         
         options_sizer.AddStretchSpacer()
@@ -1107,13 +1107,21 @@ class ProtoSimClientFrame(wx.Frame):
             # Convert WorldPose objects to dicts for JSON serialization
             poses_data = [pose.to_dict() for pose in world_poses]
             
-            # Calculate timeout — scale movement time by inverse of speed
-            move_speed = getattr(params, 'move_speed', 0.1)
-            move_time_per_pose = 3.0 / max(move_speed, 0.01)  # slower → longer
-            timeout_per_pose = params.idle_time + move_time_per_pose
-            timeout = max(120.0, total_poses * timeout_per_pose + 60.0)
+            # Use activity-based inactivity timeout instead of a fixed
+            # total budget.  The server sends periodic rpc_feedback
+            # messages during planning and execution; as long as those
+            # keep arriving within the inactivity window the call stays
+            # alive — no matter how long cuRobo planning or trajectory
+            # execution takes.  The timeout only fires if the server
+            # goes completely silent (crash, network partition, etc.).
+            INACTIVITY_TIMEOUT = 120.0   # seconds of server silence
             
-            self._log(f"Sending poses to server (speed={move_speed}, timeout: {timeout:.0f}s)")
+            move_speed = getattr(params, 'move_speed', 0.25)
+            
+            self._log(
+                f"Sending {total_poses} poses to server "
+                f"(speed={move_speed}, inactivity_timeout={INACTIVITY_TIMEOUT:.0f}s)"
+            )
             
             # Send pre-computed poses to server
             response = await self._client.call_rpc("run_proto_sim", {
@@ -1124,7 +1132,7 @@ class ProtoSimClientFrame(wx.Frame):
                 "move_speed": move_speed,
                 "go_home_before": True,
                 "go_home_after": True,
-            }, timeout=timeout)
+            }, inactivity_timeout=INACTIVITY_TIMEOUT)
             
             if response.get("success"):
                 completed = response.get('completed', 0)

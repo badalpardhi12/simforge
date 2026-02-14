@@ -60,8 +60,8 @@ services:
       - NAKUL_ROBOT_IP=${NAKUL_ROBOT_IP:-192.168.1.9}
       - SAHADEV_ROBOT_IP=${SAHADEV_ROBOT_IP:-192.168.1.16}
       # Motion planning
-      - MAX_VELOCITY_SCALING=${MAX_VELOCITY_SCALING:-0.25}
-      - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-0.25}
+      - MAX_VELOCITY_SCALING=${MAX_VELOCITY_SCALING:-1.0}
+      - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-1.0}
       - INTERPOLATION_DT=${INTERPOLATION_DT:-0.02}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -110,8 +110,8 @@ services:
       - NAKUL_ROBOT_IP=${NAKUL_ROBOT_IP:-192.168.1.9}
       - SAHADEV_ROBOT_IP=${SAHADEV_ROBOT_IP:-192.168.1.16}
       # Motion planning
-      - MAX_VELOCITY_SCALING=${MAX_VELOCITY_SCALING:-0.25}
-      - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-0.25}
+      - MAX_VELOCITY_SCALING=${MAX_VELOCITY_SCALING:-1.0}
+      - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-1.0}
       - INTERPOLATION_DT=${INTERPOLATION_DT:-0.02}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -140,38 +140,34 @@ services:
     profiles:
       - prod
 
-  # ── Jetson Thor — Simulation Mode ──────────────────────────
-  # JetPack 7 (Ubuntu 24.04, CUDA 13, ROS2 Jazzy)
-  # Build natively on the Jetson Thor device.
-  simforge-server-jetson-sim:
+  # ── Jetson Thor Simulation Mode ────────────────────────────
+  # JetPack 7 / aarch64, ros2_control mock hardware, cuRobo iGPU
+  simforge-server-nvidia-jetson-sim:
     build:
       context: .
       dockerfile: docker/Dockerfile.jetson
-    container_name: simforge-server-jetson-sim
-    hostname: simforge-server-jetson-sim
+    container_name: simforge-server-nvidia-jetson-sim
+    hostname: simforge-server-nvidia-jetson-sim
     environment:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
       - ENV_CONFIG=${ENV_CONFIG:-valid8_dual_ur5e}
+      # Robot IPs (used in real mode, harmless in sim)
       - ROBOT_IP_NAKUL_UR5E=${ROBOT_IP_NAKUL_UR5E:-192.168.1.9}
       - ROBOT_IP_SAHADEV_UR5E=${ROBOT_IP_SAHADEV_UR5E:-192.168.1.16}
       - ROBOT_IP_UR20=${ROBOT_IP_UR20:-0.0.0.0}
+      # Legacy compat
       - NAKUL_ROBOT_IP=${NAKUL_ROBOT_IP:-192.168.1.9}
       - SAHADEV_ROBOT_IP=${SAHADEV_ROBOT_IP:-192.168.1.16}
-      - MAX_VELOCITY_SCALING=${MAX_VELOCITY_SCALING:-0.25}
-      - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-0.25}
+      # Motion planning
+      - MAX_VELOCITY_SCALING=${MAX_VELOCITY_SCALING:-1.0}
+      - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-1.0}
       - INTERPOLATION_DT=${INTERPOLATION_DT:-0.02}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     network_mode: host
     runtime: nvidia
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    # Real-time scheduling for RTDE 500 Hz loop
     cap_add:
       - SYS_NICE
     ulimits:
@@ -187,37 +183,34 @@ services:
     profiles:
       - jetson-sim
 
-  # ── Jetson Thor — Real Robot Mode ──────────────────────────
-  simforge-server-jetson:
+  # ── Jetson Thor Real Robot Mode ────────────────────────────
+  # JetPack 7 / aarch64, ur_rtde direct control, cuRobo iGPU
+  simforge-server-nvidia-jetson:
     build:
       context: .
       dockerfile: docker/Dockerfile.jetson
-    container_name: simforge-server-jetson
-    hostname: simforge-server-jetson
+    container_name: simforge-server-nvidia-jetson
+    hostname: simforge-server-nvidia-jetson
     environment:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
       - ENV_CONFIG=${ENV_CONFIG:-valid8_dual_ur5e}
+      # Robot IPs
       - ROBOT_IP_NAKUL_UR5E=${ROBOT_IP_NAKUL_UR5E:-192.168.1.9}
       - ROBOT_IP_SAHADEV_UR5E=${ROBOT_IP_SAHADEV_UR5E:-192.168.1.16}
       - ROBOT_IP_UR20=${ROBOT_IP_UR20:-0.0.0.0}
+      # Legacy compat
       - NAKUL_ROBOT_IP=${NAKUL_ROBOT_IP:-192.168.1.9}
       - SAHADEV_ROBOT_IP=${SAHADEV_ROBOT_IP:-192.168.1.16}
-      - MAX_VELOCITY_SCALING=${MAX_VELOCITY_SCALING:-0.25}
-      - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-0.25}
+      # Motion planning
+      - MAX_VELOCITY_SCALING=${MAX_VELOCITY_SCALING:-1.0}
+      - MAX_ACCELERATION_SCALING=${MAX_ACCELERATION_SCALING:-1.0}
       - INTERPOLATION_DT=${INTERPOLATION_DT:-0.02}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     network_mode: host
     privileged: true
     runtime: nvidia
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     cap_add:
       - SYS_NICE
     ulimits:

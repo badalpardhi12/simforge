@@ -181,7 +181,13 @@ cause jerky motion.
         </sensor>
 
         <gpio name="${tf_prefix}speed_scaling">
-          <state_interface name="speed_scaling_factor"/>
+          <state_interface name="speed_scaling_factor">
+            <!-- GenericSystem (mock hardware) reads initial_value to seed
+                 this state interface.  Without it the default is 0.0, which
+                 causes ScaledJointTrajectoryController to crash with
+                 "abnormal scale in rclcpp::Duration" on Jazzy. -->
+            <param name="initial_value">1.0</param>
+          </state_interface>
           <param name="initial_speed_scaling_factor">1</param>
           <command_interface name="target_speed_fraction_cmd"/>
           <command_interface name="target_speed_fraction_async_success"/>

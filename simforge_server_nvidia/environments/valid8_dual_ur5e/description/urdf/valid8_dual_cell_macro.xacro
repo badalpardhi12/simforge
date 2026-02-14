@@ -129,7 +129,6 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
     <!-- ================================================================ -->
     <!-- NAKUL UR5e Robot (first robot)                                   -->
     <!-- tf_prefix: nakul_ to distinguish from sahadev                    -->
-    <!-- generate_ros2_control_tag: false - controlled URDF adds this     -->
     <!-- ================================================================ -->
     <xacro:ur_robot
       name="nakul_ur5e"
@@ -139,7 +138,6 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
       kinematics_parameters_file="${nakul_kinematics_parameters_file}"
       physical_parameters_file="${nakul_physical_parameters_file}"
       visual_parameters_file="${nakul_visual_parameters_file}"
-      generate_ros2_control_tag="false"
     >
       <origin xyz="0 0 0" rpy="0 0 0"/>
     </xacro:ur_robot>
@@ -147,7 +145,6 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
     <!-- ================================================================ -->
     <!-- SAHADEV UR5e Robot (second robot)                                -->
     <!-- tf_prefix: sahadev_ to distinguish from nakul                    -->
-    <!-- generate_ros2_control_tag: false - controlled URDF adds this     -->
     <!-- ================================================================ -->
     <xacro:ur_robot
       name="sahadev_ur5e"
@@ -157,7 +154,6 @@ Based on Universal Robots ROS2 Dual Robot Tutorial.
       kinematics_parameters_file="${sahadev_kinematics_parameters_file}"
       physical_parameters_file="${sahadev_physical_parameters_file}"
       visual_parameters_file="${sahadev_visual_parameters_file}"
-      generate_ros2_control_tag="false"
     >
       <origin xyz="0 0 0" rpy="0 0 0"/>
     </xacro:ur_robot>

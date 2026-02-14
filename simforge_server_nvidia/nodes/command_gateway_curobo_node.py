@@ -57,8 +57,8 @@ class CommandGatewayNode(Node):
         self.declare_parameter("websocket_port", 8766)
         self.declare_parameter("websocket_host", "0.0.0.0")
         self.declare_parameter("max_clients", 5)
-        self.declare_parameter("max_velocity_scaling", 0.25)
-        self.declare_parameter("max_acceleration_scaling", 0.25)
+        self.declare_parameter("max_velocity_scaling", 1.0)
+        self.declare_parameter("max_acceleration_scaling", 1.0)
         self.declare_parameter("config_dir", str(CONFIG_DIR))
         self.declare_parameter("interpolation_dt", 0.02)
 
