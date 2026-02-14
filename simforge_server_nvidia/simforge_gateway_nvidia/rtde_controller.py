@@ -327,12 +327,26 @@ class URRTDEController:
             return False
 
         # Create the control interface directly in-process.
+        # FLAG_NO_WAIT: prevents servoJ() / moveJ() from internally
+        # blocking via the C++ steady_clock wait after each command.
+        # On aarch64 (Jetson), the C++ steady_clock / nanosleep
+        # malfunctions — causing each servoJ() call to block for
+        # ~20-50 ms instead of <1 ms, dropping the 500 Hz streaming
+        # rate to 21-56 Hz.  With FLAG_NO_WAIT, servoJ() returns
+        # immediately and our Python timing loop handles pacing.
+        # moveJ() still blocks correctly via its own isSteady() loop.
         try:
-            self._ctrl = rtde_control.RTDEControlInterface(self.ip)
+            _flags = (
+                rtde_control.RTDEControlInterface.FLAG_UPLOAD_SCRIPT
+                | rtde_control.RTDEControlInterface.FLAG_NO_WAIT
+            )
+            self._ctrl = rtde_control.RTDEControlInterface(
+                self.ip, frequency=-1.0, flags=_flags,
+            )
             if self.logger:
                 self.logger.info(
                     f"RTDE control interface created for "
-                    f"{self.robot_name}"
+                    f"{self.robot_name} (FLAG_NO_WAIT)"
                 )
             return True
         except Exception as e:
