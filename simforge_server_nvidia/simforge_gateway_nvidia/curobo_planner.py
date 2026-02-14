@@ -7,6 +7,7 @@ Wraps NVIDIA cuRobo's MotionGen for per-robot GPU-accelerated:
   • Collision checking (signed distance fields on CUDA)
 """
 
+import asyncio
 import math
 import tempfile
 import time
@@ -221,7 +222,7 @@ class CuroboPlanner:
 
     # ── Planning ─────────────────────────────────────────────────
 
-    async def plan_to_pose(
+    def _plan_to_pose_sync(
         self,
         robot_name: str,
         target_position: List[float],
@@ -229,7 +230,7 @@ class CuroboPlanner:
         current_joints: List[float],
         velocity_scaling: Optional[float] = None,
     ) -> Optional[Any]:
-        """Plan a collision-free trajectory to a Cartesian pose.
+        """Synchronous collision-free planning (blocks on CUDA).
 
         ``target_orientation`` is [qx, qy, qz, qw] (client convention).
         """
@@ -285,14 +286,35 @@ class CuroboPlanner:
             )
             return None
 
-    async def plan_to_joints(
+    async def plan_to_pose(
+        self,
+        robot_name: str,
+        target_position: List[float],
+        target_orientation: List[float],
+        current_joints: List[float],
+        velocity_scaling: Optional[float] = None,
+    ) -> Optional[Any]:
+        """Plan a collision-free trajectory to a Cartesian pose.
+
+        Runs the blocking CUDA computation in a background thread so
+        the asyncio event loop stays responsive during planning.
+
+        ``target_orientation`` is [qx, qy, qz, qw] (client convention).
+        """
+        return await asyncio.to_thread(
+            self._plan_to_pose_sync,
+            robot_name, target_position, target_orientation,
+            current_joints, velocity_scaling,
+        )
+
+    def _plan_to_joints_sync(
         self,
         robot_name: str,
         target_joints: List[float],
         current_joints: List[float],
         velocity_scaling: Optional[float] = None,
     ) -> Optional[Any]:
-        """Plan to target joint positions."""
+        """Synchronous joint planning (blocks on CUDA)."""
         mg = self._motion_gens.get(robot_name)
         if mg is None:
             self._log.error(f"No cuRobo MotionGen for {robot_name}")
@@ -337,6 +359,23 @@ class CuroboPlanner:
                 f"{traceback.format_exc()}"
             )
             return None
+
+    async def plan_to_joints(
+        self,
+        robot_name: str,
+        target_joints: List[float],
+        current_joints: List[float],
+        velocity_scaling: Optional[float] = None,
+    ) -> Optional[Any]:
+        """Plan to target joint positions.
+
+        Runs the blocking CUDA computation in a background thread.
+        """
+        return await asyncio.to_thread(
+            self._plan_to_joints_sync,
+            robot_name, target_joints, current_joints,
+            velocity_scaling,
+        )
 
     # ── Trajectory conversion ────────────────────────────────────
 
