@@ -86,13 +86,14 @@ class ProtocolExecutor:
 
     # ── Inner implementation ─────────────────────────────────────
 
+
     async def _run_inner(
         self, client, request_id, robot_name, poses,
         idle_time, mode, move_speed, cfg, total,
         go_home_before, go_home_after,
     ):
         self._log.info(
-            f"Proto-sim START (cuRobo pipelined): {total} poses on "
+            f"Proto-sim START (cuRobo sequential): {total} poses on "
             f"{robot_name} (mode={mode}, speed={move_speed}, "
             f"idle={idle_time}s, home_before={go_home_before}, "
             f"home_after={go_home_after})"
@@ -144,14 +145,18 @@ class ProtocolExecutor:
                 )
                 return
 
-        # ── Pipelined plan-execute ───────────────────────────────
-        # Producer plans segments via cuRobo (CUDA in background thread)
-        # Consumer executes planned segments via ROS2/RTDE.
-        # Because plan_to_pose now uses asyncio.to_thread(), the event
-        # loop stays free so the consumer can drive the robot while the
-        # producer plans the next segment.
+        # ── Sequential plan-execute per segment ──────────────────
+        # IMPORTANT: Planning and execution must NEVER overlap!
+        # Both run in separate OS threads (asyncio.to_thread /
+        # run_in_executor).  If they run concurrently, Python GIL
+        # contention starves the servoJ 500 Hz loop down to ~12 Hz,
+        # causing extremely jerky robot motion.
+        #
+        # Sequence per pose:
+        #   1. Plan  (CUDA in background thread, event loop free)
+        #   2. Execute (servoJ in executor thread, event loop free)
+        #   3. Dwell  (asyncio.sleep, event loop free)
 
-        segment_queue = asyncio.Queue()  # unbounded — avoids deadlocks
         hw_abort = False
         completed = 0
         ik_failed = 0
@@ -163,170 +168,120 @@ class ProtocolExecutor:
         if not current_joints or len(current_joints) != 6:
             current_joints = list(cfg["home_position"])
 
-        await self._send_feedback(
-            client, request_id, 0, total, 0, "planning",
-            f"Starting pipelined plan-execute for {total} poses "
-            f"(cuRobo GPU)…",
-        )
+        for i, pose_data in enumerate(poses):
+            if self.stop_requested:
+                break
 
-        async def producer():
-            """Plan each segment; push to queue for the consumer."""
-            joints = list(current_joints)
+            pose_name = pose_data.get("name", f"pose_{i}")
+            position = pose_data.get("position", [0, 0, 0])
+            orientation = pose_data.get("orientation", [0, 0, 0, 1])
+
+            # ── Hardware fault check ─────────────────────────────
+            hw_issues = self._detect_hardware_issues()
+            if hw_issues:
+                hw_abort = True
+                self._log.error(
+                    f"Hardware fault: {', '.join(hw_issues)} "
+                    f"\u2014 aborting"
+                )
+                await self._send_feedback(
+                    client, request_id, i, total,
+                    (i / max(total, 1)) * 100, "error",
+                    message=(
+                        f"\u26a0 HARDWARE FAULT: "
+                        f"{', '.join(hw_issues)}. "
+                        f"Robot stopped \u2014 aborting protocol."
+                    ),
+                )
+                self.stop_requested = True
+                break
+
+            # ── Plan ─────────────────────────────────────────────
+            pct = (i / total) * 100
+            await self._send_feedback(
+                client, request_id, i, total, pct,
+                "planning",
+                f"Planning {i+1}/{total}: {pose_name}",
+            )
+
+            t0 = time.monotonic()
             try:
-                for i, pose_data in enumerate(poses):
-                    if self.stop_requested:
-                        break
-                    pose_name = pose_data.get("name", f"pose_{i}")
-                    position = pose_data.get("position", [0, 0, 0])
-                    orientation = pose_data.get(
-                        "orientation", [0, 0, 0, 1]
-                    )
-
-                    pct = (i / total) * 50.0
-                    await self._send_feedback(
-                        client, request_id, i, total, pct,
-                        "planning",
-                        f"Planning {i+1}/{total}: {pose_name}",
-                    )
-
-                    t0 = time.monotonic()
-                    try:
-                        result = await self._planner.plan_to_pose(
-                            robot_name, position, orientation,
-                            current_joints=joints,
-                            velocity_scaling=move_speed,
-                        )
-                    except Exception as e:
-                        self._log.error(
-                            f"Planning exception for {pose_name}: {e}"
-                        )
-                        result = None
-                    dt = time.monotonic() - t0
-
-                    if result is None:
-                        self._log.warn(
-                            f"  [{i+1}/{total}] ✗ plan failed "
-                            f"{pose_name} ({dt:.1f}s)"
-                        )
-                        await segment_queue.put({
-                            "action": "skip",
-                            "index": i,
-                            "pose_name": pose_name,
-                        })
-                        continue
-
-                    ros_traj = self._planner.result_to_ros_trajectory(
-                        result, robot_name,
-                    )
-
-                    # Final joints for the next segment's start state
-                    last_pt = ros_traj.joint_trajectory.points[-1]
-                    joints = list(last_pt.positions)
-
-                    self._log.info(
-                        f"  [{i+1}/{total}] planned "
-                        f"{pose_name} ({dt:.1f}s)"
-                    )
-                    await segment_queue.put({
-                        "action": "execute",
-                        "index": i,
-                        "pose_name": pose_name,
-                        "trajectory": ros_traj,
-                    })
+                result = await self._planner.plan_to_pose(
+                    robot_name, position, orientation,
+                    current_joints=current_joints,
+                    velocity_scaling=move_speed,
+                )
             except Exception as e:
                 self._log.error(
-                    f"Producer error: {e}\n"
-                    f"{traceback.format_exc()}"
+                    f"Planning exception for {pose_name}: {e}"
                 )
-            finally:
-                # Sentinel — tells the consumer no more segments
-                await segment_queue.put(None)
+                result = None
+            plan_dt = time.monotonic() - t0
 
-        async def consumer():
-            """Execute planned segments as they arrive."""
-            nonlocal completed, ik_failed, exec_failed, hw_abort
+            if result is None:
+                ik_failed += 1
+                self._log.warn(
+                    f"  [{i+1}/{total}] \u2717 plan failed "
+                    f"{pose_name} ({plan_dt:.1f}s)"
+                )
+                continue
 
-            while True:
-                item = await segment_queue.get()
-                if item is None:
-                    break
-                if self.stop_requested:
-                    break
+            ros_traj = self._planner.result_to_ros_trajectory(
+                result, robot_name,
+            )
+            if ros_traj is None:
+                ik_failed += 1
+                continue
 
-                if item["action"] == "skip":
-                    ik_failed += 1
-                    continue
+            # Update start joints for next segment
+            last_pt = ros_traj.joint_trajectory.points[-1]
+            current_joints = list(last_pt.positions)
 
-                i = item["index"]
-                pose_name = item["pose_name"]
-                ros_traj = item["trajectory"]
+            self._log.info(
+                f"  [{i+1}/{total}] planned "
+                f"{pose_name} ({plan_dt:.1f}s)"
+            )
 
-                # Hardware fault check
-                hw_issues = self._detect_hardware_issues()
-                if hw_issues:
-                    hw_abort = True
-                    self._log.error(
-                        f"Hardware fault: {', '.join(hw_issues)} "
-                        f"— aborting"
-                    )
-                    await self._send_feedback(
-                        client, request_id, i, total,
-                        50 + (completed / max(total, 1)) * 50,
-                        "error",
-                        message=(
-                            f"⚠ HARDWARE FAULT: "
-                            f"{', '.join(hw_issues)}. "
-                            f"Robot stopped — aborting protocol."
-                        ),
-                    )
-                    self.stop_requested = True
-                    break
+            # ── Execute ──────────────────────────────────────────
+            await self._send_feedback(
+                client, request_id, i, total, pct,
+                "moving", current_pose_name=pose_name,
+            )
 
-                pct = 50 + (completed / max(total, 1)) * 50
+            pts = ros_traj.joint_trajectory.points
+            traj_dur = (
+                pts[-1].time_from_start.sec
+                + pts[-1].time_from_start.nanosec * 1e-9
+            ) if pts else 5.0
+            exec_timeout = max(traj_dur * 2.0, 30.0)
+
+            ok = await self._executor.execute(
+                robot_name, ros_traj, timeout=exec_timeout,
+            )
+
+            if ok:
+                completed += 1
+                self._log.info(
+                    f"  [{i+1}/{total}] \u2713 {pose_name}"
+                )
                 await self._send_feedback(
-                    client, request_id, i, total, pct,
-                    "moving", current_pose_name=pose_name,
+                    client, request_id, i, total,
+                    ((i + 1) / total) * 100,
+                    "reached", current_pose_name=pose_name,
                 )
-
-                # Compute per-segment execution timeout
-                pts = ros_traj.joint_trajectory.points
-                traj_dur = (
-                    pts[-1].time_from_start.sec
-                    + pts[-1].time_from_start.nanosec * 1e-9
-                ) if pts else 5.0
-                exec_timeout = max(traj_dur * 2.0, 30.0)
-
-                ok = await self._executor.execute(
-                    robot_name, ros_traj, timeout=exec_timeout,
+                # Dwell
+                if idle_time > 0 and i < len(poses) - 1:
+                    await asyncio.sleep(idle_time)
+            else:
+                exec_failed += 1
+                self._log.error(
+                    f"  [{i+1}/{total}] \u2717 exec failed "
+                    f"{pose_name}"
                 )
-
-                if ok:
-                    completed += 1
-                    self._log.info(
-                        f"  [{i+1}/{total}] ✓ {pose_name}"
-                    )
-                    await self._send_feedback(
-                        client, request_id, i, total,
-                        50 + (completed / max(total, 1)) * 50,
-                        "reached", current_pose_name=pose_name,
-                    )
-                    if idle_time > 0 and i < len(poses) - 1:
-                        await asyncio.sleep(idle_time)
-                else:
-                    exec_failed += 1
-                    self._log.error(
-                        f"  [{i+1}/{total}] ✗ exec failed {pose_name}"
-                    )
-
-        # Run producer and consumer concurrently.
-        # plan_to_pose uses asyncio.to_thread() so CUDA planning
-        # runs in a background thread — the consumer can execute
-        # trajectories on the event loop at the same time.
-        await asyncio.gather(producer(), consumer())
 
         # ── Optional home-after ──────────────────────────────────
         if go_home_after and completed > 0 and not self.stop_requested:
-            self._log.info(f"Returning {robot_name} to home…")
+            self._log.info(f"Returning {robot_name} to home\u2026")
             home_ok, home_err = await self._home_if_needed(
                 robot_name, cfg, mode,
             )
@@ -339,7 +294,7 @@ class ProtocolExecutor:
 
         # ── Build result ─────────────────────────────────────────
         summary_parts = [
-            f"Completed {completed}/{total} poses (cuRobo pipelined)"
+            f"Completed {completed}/{total} poses (cuRobo sequential)"
         ]
         if ik_failed:
             summary_parts.append(f"{ik_failed} IK/plan failed")
@@ -349,7 +304,7 @@ class ProtocolExecutor:
         hardware_issues = self._detect_hardware_issues()
         if hardware_issues:
             summary_parts.append(
-                f"⚠ Hardware: {', '.join(hardware_issues)}"
+                f"\u26a0 Hardware: {', '.join(hardware_issues)}"
             )
 
         summary = " | ".join(summary_parts)
