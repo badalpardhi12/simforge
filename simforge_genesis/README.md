@@ -40,14 +40,15 @@ simforge_genesis/
 From the **repository root**:
 
 ```bash
-# Install in development mode
+# Install in development mode (core only)
 pip install -e .
 
 # Optional dependency groups
-pip install -e ".[planning]"  # OMPL motion planning
-pip install -e ".[gui]"       # wxPython GUI
-pip install -e ".[drake]"     # Advanced IK solving
-pip install -e ".[dev]"       # pytest + ruff
+pip install -e ".[collision]"  # Pinocchio + FCL collision checking
+pip install -e ".[planning]"   # OMPL motion planning
+pip install -e ".[gui]"        # wxPython GUI
+pip install -e ".[all]"        # All optional features
+pip install -e ".[dev]"        # pytest + ruff
 ```
 
 ## Usage

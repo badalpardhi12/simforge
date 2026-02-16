@@ -15,28 +15,29 @@ dependencies = [
   "numpy>=1.24",
   "PyYAML>=6.0",
   "pydantic>=2.0",
-  "xxhash",
-  "pin",
-  "python-fcl>=0.7",
-  "trimesh>=3.0",
-  "ompl>=1.6",
-  "wxpython>=4.1",
-  "drake",
-  "torch"
+  "torch",
 ]
 
 [project.urls]
-Homepage = "https://example.com/simforge_genesis"
+Homepage = "https://github.com/badalpardhi12/simforge"
 
 [project.scripts]
 simforge_genesis = "simforge_genesis:main"
 
 [project.optional-dependencies]
+collision = ["pin", "python-fcl>=0.7", "trimesh>=3.0"]
 planning = ["ompl>=1.6"]
-qt = ["PySide6>=6.6"]
 gui = ["wxpython>=4.1"]
+qt = ["PySide6>=6.6"]
 drake = ["drake>=1.0"]
 dev = ["pytest>=7.0", "ruff>=0.5.0"]
+all = [
+  "pin",
+  "python-fcl>=0.7",
+  "trimesh>=3.0",
+  "ompl>=1.6",
+  "wxpython>=4.1",
+]
 
 [tool.setuptools.packages.find]
 include = ["simforge_genesis*"]
