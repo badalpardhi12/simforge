@@ -90,29 +90,98 @@ simforge_server_nvidia/
 
 ## Quick Start
 
-### Simulation (Mock Hardware)
+All commands should be run from `simforge_server_nvidia/`.
+
+### Platform Profiles
+
+| Profile | Platform | Mode | Command prefix |
+|---|---|---|---|
+| `sim` | x86_64 (NVIDIA GPU) | Simulation (mock HW) | `docker compose --profile sim` |
+| `prod` | x86_64 (NVIDIA GPU) | Real robot (ur_rtde) | `docker compose --profile prod` |
+| `jetson-sim` | Jetson Thor (aarch64) | Simulation (mock HW) | `sudo docker compose --profile jetson-sim` |
+| `jetson-prod` | Jetson Thor (aarch64) | Real robot (ur_rtde) | `sudo docker compose --profile jetson-prod` |
+
+> **Note:** On Jetson, Docker requires `sudo`. On x86_64 systems where your user is
+> in the `docker` group, `sudo` is not needed.
+
+### Starting a Container
+
+The `ENV_CONFIG` variable selects the robot environment. Default is `valid8_dual_ur5e`.
 
 ```bash
-docker compose --profile sim up --build
+# Dual UR5e cell — simulation (default environment)
+docker compose --profile sim up -d --build
+
+# Face robot UR20 — simulation
+ENV_CONFIG=face_robot_ur20 docker compose --profile sim up -d --build
+
+# Jetson Thor — dual UR5e simulation (default)
+sudo docker compose --profile jetson-sim up -d --build
+
+# Jetson Thor — face robot UR20 simulation
+sudo ENV_CONFIG=face_robot_ur20 docker compose --profile jetson-sim up -d --build
 ```
 
-### Real Robot (UR5e Dual Cell)
+### Stopping a Container
+
+Stop whichever profile you started — you **must** specify the same profile:
 
 ```bash
-ROBOT_IP_NAKUL_UR5E=192.168.1.9 \
-ROBOT_IP_SAHADEV_UR5E=192.168.1.16 \
-  docker compose --profile prod up --build
+# x86_64
+docker compose --profile sim down
+
+# Jetson
+sudo docker compose --profile jetson-sim down
 ```
 
 ### Switching Environments
 
-```bash
-# Face robot UR20 (simulation)
-ENV_CONFIG=face_robot_ur20 docker compose --profile sim up --build
+To switch from one environment to another, stop the running container first,
+then start with the new `ENV_CONFIG`:
 
-# Face robot UR20 (real)
+```bash
+# Stop the current environment
+sudo docker compose --profile jetson-sim down
+
+# Start with a different environment
+sudo ENV_CONFIG=face_robot_ur20 docker compose --profile jetson-sim up -d
+```
+
+> **Tip:** You can check which environment a running container is using:
+> ```bash
+> sudo docker exec simforge-server-nvidia-jetson-sim printenv ENV_CONFIG
+> ```
+
+### Real Robot Mode
+
+```bash
+# Dual UR5e (x86_64)
+ROBOT_IP_NAKUL_UR5E=192.168.1.9 \
+ROBOT_IP_SAHADEV_UR5E=192.168.1.16 \
+  docker compose --profile prod up -d --build
+
+# Face robot UR20 (x86_64)
 ENV_CONFIG=face_robot_ur20 ROBOT_IP_UR20=10.0.0.1 \
-  docker compose --profile prod up --build
+  docker compose --profile prod up -d --build
+
+# Jetson — dual UR5e
+sudo ROBOT_IP_NAKUL_UR5E=192.168.1.9 \
+     ROBOT_IP_SAHADEV_UR5E=192.168.1.16 \
+  docker compose --profile jetson-prod up -d --build
+
+# Jetson — face robot UR20
+sudo ENV_CONFIG=face_robot_ur20 ROBOT_IP_UR20=10.0.0.1 \
+  docker compose --profile jetson-prod up -d --build
+```
+
+### Viewing Logs
+
+```bash
+# Follow live logs
+sudo docker logs -f simforge-server-nvidia-jetson-sim
+
+# Last 50 lines
+sudo docker logs --tail 50 simforge-server-nvidia-jetson-sim
 ```
 
 ### Running Tests
@@ -127,9 +196,9 @@ python tests/test_curobo_gateway.py --server <SERVER_IP>
 
 ## GPU Requirements
 
-- NVIDIA GPU with CUDA 12.2+ support
-- NVIDIA Container Toolkit (`nvidia-container-toolkit`)
-- Tested on NVIDIA RTX Pro 6000 (x86_64)
+- **x86_64**: NVIDIA GPU with CUDA 12.2+ support, NVIDIA Container Toolkit
+- **Jetson Thor**: JetPack 7.0 with CUDA 13.x, NVIDIA Container Toolkit (default-runtime: nvidia)
+- Tested on NVIDIA RTX Pro 6000 (x86_64) and NVIDIA Jetson AGX Thor (aarch64)
 
 ## Configuration
 
@@ -162,21 +231,21 @@ INTERPOLATION_DT=0.01   # 100 Hz waypoints (smoother)
 ┌──────────────┐     WebSocket :8766     ┌──────────────────────────┐
 │ simforge_     │ ◄─────────────────────►│ command_gateway_curobo   │
 │ client (GUI)  │                        │                          │
-└──────────────┘                        │  rpc_handlers            │
-                                        │       │                   │
-┌──────────────┐     WebSocket :9090    │  curobo_planner (GPU)    │
-│ Foxglove     │ ◄── foxglove_bridge    │       │                   │
-│ Studio       │                        │  trajectory_executor     │
-└──────────────┘                        │    ┌──────┴──────┐        │
-                                        │    │             │        │
-                                        │  (sim)        (real)     │
-                                        └────┼─────────────┼────────┘
-                                             │             │
-                                     FollowJoint     ur_rtde servoJ
-                                     Trajectory       (500 Hz RTDE)
-                                             │
-                                   ┌─────────▼──────────┐
-                                   │ ros2_control_node   │
-                                   │ (UR driver / mock)  │
-                                   └────────────────────┘
+└──────────────┘                         │  rpc_handlers            │
+                                         │       │                  │
+┌──────────────┐     WebSocket :9090     │  curobo_planner (GPU)    │
+│ Foxglove     │ ◄── foxglove_bridge     │       │                  │
+│ Studio       │                         │  trajectory_executor     │
+└──────────────┘                         │    ┌──────┴──────┐       │
+                                         │    │             │       │
+                                         │  (sim)        (real)     │
+                                         └────┼─────────────┼───────┘
+                                              │             │
+                                      FollowJoint     ur_rtde servoJ
+                                      Trajectory       (500 Hz RTDE)
+                                              │
+                                    ┌─────────▼──────────┐
+                                    │ ros2_control_node  │
+                                    │ (UR driver / mock) │
+                                    └────────────────────┘
 ```
