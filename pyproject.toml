@@ -3,12 +3,12 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "simforge_new"
+name = "simforge_genesis"
 version = "0.1.0"
 description = "Genesis-powered robot simulator with joint and Cartesian control"
-readme = "README.md"
+readme = "simforge_genesis/README.md"
 requires-python = ">=3.10"
-authors = [{name = "simforge_new Team"}]
+authors = [{name = "simforge_genesis Team"}]
 license = {text = "Proprietary"}
 dependencies = [
   "genesis-world>=0.3.3",
@@ -26,10 +26,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://example.com/simforge_new"
+Homepage = "https://example.com/simforge_genesis"
 
 [project.scripts]
-simforge_new = "simforge_new:main"
+simforge_genesis = "simforge_genesis:main"
 
 [project.optional-dependencies]
 planning = ["ompl>=1.6"]
@@ -39,4 +39,4 @@ drake = ["drake>=1.0"]
 dev = ["pytest>=7.0", "ruff>=0.5.0"]
 
 [tool.setuptools.packages.find]
-include = ["simforge_new*"]
+include = ["simforge_genesis*"]

@@ -2,7 +2,7 @@
 Spherical pose generation for proto-sim workflow.
 
 This module contains the geometry helpers and pose sampling logic ported from
-simforge_new/control/proto_simulation.py. It generates camera/tool poses in
+simforge_genesis/control/proto_simulation.py. It generates camera/tool poses in
 spherical coordinates relative to a target object's reference frame.
 
 The pose generation follows the SpatialScout sampling pipeline:

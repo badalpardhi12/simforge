@@ -12,7 +12,7 @@ Architecture:
 - Server executes poses with collision checking (rejects unsafe poses)
 
 Features:
-- Protocol parameter input (pose sampling) matching simforge_new exactly
+- Protocol parameter input (pose sampling) matching simforge_genesis exactly
 - Robot selection
 - Object/reference frame selection
 - Simulation vs Real Robot toggle
@@ -54,7 +54,7 @@ class ProtoSimParameters:
     """
     Parameters for protocol simulation pose generation.
     
-    Matches simforge_new/control/proto_simulation.py ProtoSimParameters exactly.
+    Matches simforge_genesis/control/proto_simulation.py ProtoSimParameters exactly.
     """
     # Horizontal shift from object center (mm)
     horiz: List[float]
@@ -172,10 +172,10 @@ class ProtoSimClientFrame(wx.Frame):
     Main wxPython frame for protocol simulation client.
     
     This runs on macOS and communicates with the server via WebSocket.
-    Parameters match simforge_new/interfaces/gui/proto_sim.py exactly.
+    Parameters match simforge_genesis/interfaces/gui/proto_sim.py exactly.
     """
     
-    # Parameter definitions matching simforge_new
+    # Parameter definitions matching simforge_genesis
     PARAMETERS = (
         {"name": "horiz", "label": "Horiz Shift", "unit": "mm", "mode": "List", "default": "0"},
         {"name": "vert", "label": "Vert Shift", "unit": "mm", "mode": "List", "default": "0"},
@@ -312,7 +312,7 @@ class ProtoSimClientFrame(wx.Frame):
         
         main_sizer.Add(object_sizer, 0, wx.EXPAND | wx.ALL, 10)
         
-        # === Protocol Parameters (matching simforge_new) ===
+        # === Protocol Parameters (matching simforge_genesis) ===
         params_box = wx.StaticBox(panel, label="Movement Parameters")
         params_sizer = wx.StaticBoxSizer(params_box, wx.VERTICAL)
         
@@ -1223,7 +1223,7 @@ class ProtoSimClientFrame(wx.Frame):
             "A distributed robot control interface for\n"
             "protocol definition and execution.\n\n"
             "Part of the Simforge distributed architecture.\n\n"
-            "Parameters match simforge_new/interfaces/gui/proto_sim.py",
+            "Parameters match simforge_genesis/interfaces/gui/proto_sim.py",
             "About",
             wx.OK | wx.ICON_INFORMATION,
         )
