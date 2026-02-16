@@ -19,7 +19,7 @@ from typing import Dict
 import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import SingleThreadedExecutor
 
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
@@ -426,20 +426,38 @@ async def main():
     rclpy.init()
 
     node = CommandGatewayNode()
-    executor = MultiThreadedExecutor(num_threads=4)
-    executor.add_node(node)
+
+    # Use SingleThreadedExecutor driven cooperatively from the asyncio
+    # loop.  The previous MultiThreadedExecutor.spin() ran in a
+    # background thread and BUSY-POLLED with 4 threads, starving the
+    # Python GIL so badly that cuRobo planning (which alternates
+    # between CUDA kernels and Python orchestration) slowed from
+    # 0.2 s to 32 s per plan.
+    #
+    # Now we call spin_once(timeout_sec=0) every 1 ms from an asyncio
+    # task.  This processes ROS2 callbacks cooperatively and yields
+    # the GIL between iterations, giving cuRobo planning threads
+    # fair access.
+    ros_executor = SingleThreadedExecutor()
+    ros_executor.add_node(node)
 
     await node.start_websocket_server()
 
-    loop = asyncio.get_event_loop()
-    ros_task = loop.run_in_executor(None, executor.spin)
+    async def _spin_ros2():
+        """Cooperatively spin ROS2 inside the asyncio event loop."""
+        while rclpy.ok():
+            ros_executor.spin_once(timeout_sec=0)
+            await asyncio.sleep(0.001)  # 1 ms yield → ~1000 callbacks/s
+
+    spin_task = asyncio.create_task(_spin_ros2())
 
     try:
         await asyncio.Future()
     except asyncio.CancelledError:
         pass
     finally:
-        executor.shutdown()
+        spin_task.cancel()
+        ros_executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 

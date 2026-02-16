@@ -20,7 +20,7 @@ world:
       pose_orientation_rpy: [0.0, 0.0, 0.0]
 robots:
   - name: TX2_60_1
-    urdf: ../../../assets/tx2_60/tx2_60.urdf
+    urdf: ../../assets/tx2_60/tx2_60.urdf
     end_effector_link: link_6
     base_pose:
       position: [0.0, 0.0, 0.0]

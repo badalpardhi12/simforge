@@ -14,7 +14,7 @@ def _build_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the face robot demo via proto_sim")
     parser.add_argument(
         "--config",
-        default=Path("simforge_new/environment/presets/face_robot.yaml"),
+        default=Path(__file__).resolve().parent.parent / "environment" / "presets" / "face_robot.yaml",
         type=Path,
         help="Environment preset to load",
     )

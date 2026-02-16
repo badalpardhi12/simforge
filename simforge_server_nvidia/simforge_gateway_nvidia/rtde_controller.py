@@ -6,7 +6,7 @@ the ur_rtde library, bypassing the ROS2 control stack.
 
 Key methods:
   - move_j()                    — blocking joint move (for homing)
-  - execute_trajectory_servoj() — 500 Hz streaming for smooth trajectories
+  - execute_trajectory_servoj() — streaming via servoJ at native trajectory rate
 """
 
 import threading
@@ -22,10 +22,6 @@ if RTDE_AVAILABLE:
 
 class URRTDEController:
     """Low-level wrapper around ur_rtde for a single UR arm."""
-
-    # RTDE servo rate and period
-    _frequency = 500.0
-    _dt = 1.0 / _frequency
 
     def __init__(self, robot_name: str, ip: str, logger=None):
         self.robot_name = robot_name
@@ -508,12 +504,14 @@ class URRTDEController:
         logger=None,
         position_callback: Optional[Callable[[str, List[float]], None]] = None,
     ) -> bool:
-        """Stream a trajectory using servoJ at the robot's native rate.
+        """Stream a trajectory using servoJ at the trajectory's native rate.
 
-        The trajectory is upsampled via linear interpolation to the RTDE
-        servo rate (500 Hz).  When *timestamps* is provided the
-        interpolation respects per-waypoint timing (including dwell
-        pauses); otherwise a uniform *dt* is assumed.
+        Sends each trajectory waypoint directly via servoJ without
+        upsampling to 500 Hz.  On aarch64 (Jetson AGX Thor) the
+        Python→C++ servoJ() call overhead is ~25-150 ms, making 500 Hz
+        impossible.  Instead we send waypoints at whatever rate the
+        system can sustain (typically 15-50 Hz) and rely on servoJ's
+        ``lookahead_time`` for smooth interpolation on the robot side.
 
         Parameters
         ----------
@@ -529,10 +527,7 @@ class URRTDEController:
             Return True to abort.
         logger : optional ROS2 logger.
         position_callback : callable(robot_name, q_target), optional
-            Called every ~20 ms (50 Hz) with the interpolated joint
-            position currently being commanded.  Used by the joint-state
-            manager to publish ``/joint_states`` in real time while the
-            RTDE receive interface is unavailable.
+            Called at ~50 Hz with the commanded joint position.
         """
         if not self.is_connected:
             if logger:
@@ -558,9 +553,7 @@ class URRTDEController:
             i * dt for i in range(n_pts)
         ]
 
-        servo_dt = self._dt
         total_time = wp_times[-1]
-        n_servo = int(total_time / servo_dt) + 1
 
         # Mark recv unhealthy immediately so the 50 Hz RTDE timer
         # does not try to read (and publish stale data) for this
@@ -570,31 +563,36 @@ class URRTDEController:
         if logger:
             logger.info(
                 f"RTDE servoJ streaming {self.robot_name}: "
-                f"{n_pts} waypoints → "
-                f"{n_servo} servo commands @ {self._frequency:.0f}Hz, "
-                f"duration={total_time:.2f}s"
+                f"{n_pts} waypoints, duration={total_time:.2f}s "
+                f"(native rate, no 500 Hz upsample)"
             )
 
-        try:
-            seg_idx = 0
+        # Force higher lookahead for smoother motion given our
+        # variable command rate (15-50 Hz actual on Jetson).
+        effective_lookahead = max(lookahead_time, 0.2)
 
-            # Publish every 10th iteration → 50 Hz callback rate
-            cb_interval = max(1, int(self._frequency / 50.0))  # 10
-            cb_logged = False  # log first callback only
+        try:
+            # Publish every Nth waypoint to hit ~50 Hz.
+            # With trajectory dt=0.02 (50 Hz), publish every point.
+            traj_dt = wp_times[1] - wp_times[0] if n_pts > 1 else 0.02
+            cb_interval = max(1, int(0.02 / max(traj_dt, 0.001)))
+            cb_logged = False
+
+            # Safety-check every M waypoints (~5 Hz to minimize overhead)
+            safety_interval = max(1, int(0.2 / max(traj_dt, 0.001)))
 
             # ── Timing diagnostics ──────────────────────────────────
             wall_start = _time.monotonic()
-            timing_samples = []  # (iteration, elapsed_wall, expected_time)
-            timing_log_interval = max(1, n_servo // 5)  # log 5 times
+            timing_log_interval = max(1, n_pts // 5)
 
-            # ── Python-native timing loop ───────────────────────────
-            # ur_rtde's initPeriod()/waitPeriod() uses C++ steady_clock
-            # which malfunctions on aarch64 (Jetson), achieving only
-            # ~7 Hz instead of 500 Hz.  Python time.sleep() achieves
-            # ~486 Hz reliably on the same hardware.
-            loop_epoch = _time.monotonic()
+            # ── Native-rate servoJ loop ─────────────────────────────
+            # Instead of upsampling to 500 Hz (impossible on aarch64),
+            # send original trajectory waypoints at whatever rate
+            # Python + ur_rtde can sustain.  The robot's servoJ handles
+            # smooth interpolation via lookahead_time.
+            prev_cmd_time = _time.monotonic()
 
-            for si in range(n_servo):
+            for wi in range(n_pts):
                 if stop_check_fn and stop_check_fn():
                     if logger:
                         logger.info("RTDE servoJ aborted by stop request")
@@ -606,42 +604,12 @@ class URRTDEController:
                     self.reconnect_receive()
                     return False
 
-                t = si * servo_dt
+                q_target = positions[wi]
 
-                # Advance segment cursor
-                while seg_idx < n_pts - 2 and wp_times[seg_idx + 1] <= t:
-                    seg_idx += 1
-
-                idx0 = seg_idx
-                idx1 = min(idx0 + 1, n_pts - 1)
-
-                seg_dur = wp_times[idx1] - wp_times[idx0]
-                if seg_dur > 0:
-                    alpha = max(0.0, min(1.0,
-                        (t - wp_times[idx0]) / seg_dur))
-                else:
-                    alpha = 1.0
-
-                q_target = [
-                    positions[idx0][j] * (1.0 - alpha)
-                    + positions[idx1][j] * alpha
-                    for j in range(6)
-                ]
-
-                # ── Safety checks ──────────────────────────────────
-                # Check for protective stop / e-stop / script death.
-                #
-                # The recv interface is usually dead during servoJ
-                # (marked unhealthy + EOF errors), so we cannot rely
-                # on it.  Instead use the CONTROL interface's
-                # isProgramRunning() — this returns False when the UR
-                # control script dies (e.g. protective stop).  Also
-                # check the servoJ return value below.
-                if si % cb_interval == 0:  # check at ~50 Hz, not 500 Hz
-                    # Primary check: is the UR control script alive?
+                # ── Safety checks (at ~5 Hz) ────────────────────────
+                if wi % safety_interval == 0:
                     try:
                         if not self._ctrl.isProgramRunning():
-                            # Script died — determine why
                             reason = "PROGRAM STOPPED"
                             try:
                                 if (self._recv is not None
@@ -651,10 +619,10 @@ class URRTDEController:
                                         and self._recv.isEmergencyStopped()):
                                     reason = "EMERGENCY STOP"
                             except Exception:
-                                pass  # recv dead; we still know script died
+                                pass
                             msg = (
                                 f"{reason} on {self.robot_name} "
-                                f"at cmd {si}/{n_servo} — aborting servoJ"
+                                f"at wp {wi}/{n_pts} — aborting servoJ"
                             )
                             self.last_error = msg
                             if logger:
@@ -663,13 +631,10 @@ class URRTDEController:
                             self.reconnect_receive()
                             return False
                     except Exception:
-                        # ctrl itself is dead — tear it down immediately
-                        # to prevent the C++ auto-reconnect thread from
-                        # looping and eventually segfaulting.
                         msg = (
                             f"RTDE control interface dead during "
                             f"servoJ safety check on {self.robot_name} "
-                            f"at cmd {si}/{n_servo}"
+                            f"at wp {wi}/{n_pts}"
                         )
                         self.last_error = msg
                         if logger:
@@ -678,9 +643,7 @@ class URRTDEController:
                         self.reconnect_receive()
                         return False
 
-                # TCP-level disconnect check (link fully lost).
-                # Only check at 50 Hz to reduce overhead.
-                if si % cb_interval == 0:
+                    # TCP disconnect check
                     try:
                         ctrl_connected = self._ctrl.isConnected()
                     except Exception:
@@ -688,7 +651,7 @@ class URRTDEController:
                     if not ctrl_connected:
                         msg = (
                             f"RTDE control interface lost during servoJ "
-                            f"on {self.robot_name} at cmd {si}/{n_servo}"
+                            f"on {self.robot_name} at wp {wi}/{n_pts}"
                         )
                         self.last_error = msg
                         if logger:
@@ -697,15 +660,29 @@ class URRTDEController:
                         self.reconnect_receive()
                         return False
 
+                # ── Compute adaptive servo_dt ───────────────────────
+                # Tell the robot how long until the next command.
+                # Use the ACTUAL measured interval between commands
+                # (clamped) so the robot's internal servo matches
+                # our real update rate.
+                now = _time.monotonic()
+                measured_dt = now - prev_cmd_time
+                # For the first command, use a nominal value
+                if wi == 0:
+                    servo_dt_cmd = 0.02
+                else:
+                    # Clamp to [8 ms, 200 ms] — reasonable for servoJ
+                    servo_dt_cmd = max(0.008, min(0.2, measured_dt))
+
                 try:
                     servo_ok = self._ctrl.servoJ(
-                        q_target, 0.0, 0.0, servo_dt,
-                        lookahead_time, gain,
+                        q_target, 0.0, 0.0, servo_dt_cmd,
+                        effective_lookahead, gain,
                     )
                 except Exception as servo_exc:
                     msg = (
                         f"RTDE servoJ exception on "
-                        f"{self.robot_name} at cmd {si}/{n_servo}: "
+                        f"{self.robot_name} at wp {wi}/{n_pts}: "
                         f"{servo_exc}"
                     )
                     self.last_error = msg
@@ -715,11 +692,12 @@ class URRTDEController:
                     self.reconnect_receive()
                     return False
 
-                # servoJ returns False when the control script is dead
+                prev_cmd_time = _time.monotonic()
+
                 if not servo_ok:
                     msg = (
                         f"servoJ returned False on {self.robot_name} "
-                        f"at cmd {si}/{n_servo} — UR control script "
+                        f"at wp {wi}/{n_pts} — UR control script "
                         f"not running (likely protective stop)"
                     )
                     self.last_error = msg
@@ -729,72 +707,71 @@ class URRTDEController:
                     self.reconnect_receive()
                     return False
 
-                # Publish commanded position at ~50 Hz
-                if position_callback and si % cb_interval == 0:
+                # Publish commanded position
+                if position_callback and wi % cb_interval == 0:
                     try:
                         position_callback(self.robot_name, q_target)
                         if not cb_logged and logger:
                             logger.info(
                                 f"servoJ position callback active for "
-                                f"{self.robot_name} (publishing at "
-                                f"~{self._frequency / cb_interval:.0f} Hz)"
+                                f"{self.robot_name}"
                             )
                             cb_logged = True
                     except Exception:
-                        pass  # never let callback errors kill the loop
+                        pass
 
-                # ── Python-native rate control ──────────────────────
-                # Sleep until the target time for the NEXT iteration.
-                # Uses absolute time from loop_epoch to prevent drift
-                # accumulation.
-                next_target = loop_epoch + (si + 1) * servo_dt
-                remaining = next_target - _time.monotonic()
-                if remaining > 0:
-                    _time.sleep(remaining)
+                # ── Rate pacing ─────────────────────────────────────
+                # Sleep until the target time for the NEXT waypoint.
+                # This keeps motion at real-time speed when the system
+                # can sustain the trajectory rate.  When it can't, the
+                # sleep is skipped and commands are sent as fast as
+                # possible — the motion stretches but stays smooth.
+                if wi + 1 < n_pts:
+                    target_wall = wall_start + wp_times[wi + 1]
+                    remaining = target_wall - _time.monotonic()
+                    if remaining > 0.001:
+                        _time.sleep(remaining)
 
                 # ── Timing sample ───────────────────────────────────
-                if si % timing_log_interval == 0 or si == n_servo - 1:
+                if wi % timing_log_interval == 0 or wi == n_pts - 1:
                     wall_elapsed = _time.monotonic() - wall_start
-                    expected = si * servo_dt
+                    expected = wp_times[wi]
                     drift = wall_elapsed - expected
                     if logger:
                         logger.info(
                             f"servoJ timing [{self.robot_name}] "
-                            f"cmd {si}/{n_servo}: "
-                            f"wall={wall_elapsed:.3f}s, "
-                            f"expected={expected:.3f}s, "
-                            f"drift={drift:+.3f}s "
-                            f"({drift/expected*100:+.1f}%)"
-                            if expected > 0 else
-                            f"servoJ timing [{self.robot_name}] "
-                            f"cmd 0/{n_servo}: start"
+                            f"wp {wi}/{n_pts}: "
+                            + (
+                                f"wall={wall_elapsed:.3f}s, "
+                                f"expected={expected:.3f}s, "
+                                f"drift={drift:+.3f}s "
+                                f"({drift/expected*100:+.1f}%)"
+                                if expected > 0 else "start"
+                            )
                         )
 
-            # Clean stop — control interface may already be dead
+            # Clean stop
             try:
                 self._ctrl.servoStop()
             except Exception:
                 pass
             _time.sleep(0.5)
 
-            # Tear down the control interface (stopScript + disconnect)
             self._teardown_ctrl()
-
-            # Reconnect receive interface (it dies during servoJ)
             self.reconnect_receive()
-
             self.last_error = ""
 
             # ── Timing summary ──────────────────────────────────────
             wall_total = _time.monotonic() - wall_start
             drift_total = wall_total - total_time
             if logger:
-                actual_rate = n_servo / wall_total if wall_total > 0 else 0
+                actual_rate = n_pts / wall_total if wall_total > 0 else 0
                 logger.info(
                     f"RTDE servoJ complete for {self.robot_name} ✓  "
                     f"wall={wall_total:.2f}s vs planned={total_time:.2f}s  "
                     f"drift={drift_total:+.2f}s  "
-                    f"actual_rate={actual_rate:.0f}Hz"
+                    f"actual_rate={actual_rate:.0f}Hz "
+                    f"({n_pts} waypoints, no upsample)"
                 )
             return True
 
@@ -808,7 +785,6 @@ class URRTDEController:
             except Exception:
                 pass
             self._teardown_ctrl()
-            # Still try to restore receive interface
             self.reconnect_receive()
             return False
 

@@ -27,7 +27,7 @@ world:
       collision_enabled: true
 robots:
   - name: MECA500_1
-    urdf: ../../../assets/meca500/meca.urdf
+    urdf: ../../assets/meca500/meca.urdf
     end_effector_link: meca_axis_6_link
     base_pose:
       position: [0.8, -0.8, 0.0]
@@ -36,7 +36,7 @@ robots:
     initial_joint_positions_deg: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     tool:
       name: meca_simple_tool
-      urdf_override: ../../../assets/tools/simple_tool.urdf
+      urdf_override: ../../assets/tools/simple_tool.urdf
       attach_pose: [0.0, 0.0, 0.0, 0.0, 90.0, 0.0]
     control:
       mode: cartesian

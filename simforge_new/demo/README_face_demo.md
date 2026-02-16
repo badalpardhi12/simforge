@@ -14,7 +14,7 @@ cd /home/badal/simforge
 Then run the demo:
 
 ```bash
-python demo_scripts/face_robot_demo.py
+python -m simforge_new.demo.face_robot_demo
 ```
 
 ## Movement Completion Detection

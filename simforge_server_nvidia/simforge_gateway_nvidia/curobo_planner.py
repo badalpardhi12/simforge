@@ -187,9 +187,9 @@ class CuroboPlanner:
                     trajopt_tsteps=32,
                     collision_checker_type="PRIMITIVE",
                     use_cuda_graph=True,
-                    num_trajopt_seeds=12,
-                    num_graph_seeds=12,
-                    num_ik_seeds=200,
+                    num_trajopt_seeds=4,
+                    num_graph_seeds=4,
+                    num_ik_seeds=32,
                     collision_activation_distance=0.025,
                     maximum_trajectory_dt=None,
                     interpolation_type=InterpolateType.CUBIC,
@@ -252,8 +252,8 @@ class CuroboPlanner:
                 qw, qx, qy, qz,
             ])
             plan_cfg = MotionGenPlanConfig(
-                max_attempts=50,
-                timeout=30.0,
+                max_attempts=4,
+                timeout=5.0,
                 enable_graph=True, enable_opt=True,
                 enable_finetune_trajopt=True,
                 partial_ik_opt=False, parallel_finetune=True,
@@ -332,7 +332,7 @@ class CuroboPlanner:
                 joint_names=cfg["joints"],
             )
             plan_cfg = MotionGenPlanConfig(
-                max_attempts=50, timeout=30.0,
+                max_attempts=4, timeout=5.0,
                 enable_graph=True, enable_opt=True,
                 enable_finetune_trajopt=True,
                 time_dilation_factor=min(

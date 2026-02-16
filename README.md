@@ -2,6 +2,23 @@
 
 Genesis-powered robot simulator with joint and Cartesian control, inverse kinematics, motion planning, and collision checking.
 
+## Repository Structure
+
+```
+simforge/
+├── simforge_new/          # Genesis simulator + control stack
+│   ├── assets/            # Robot URDFs and meshes
+│   ├── environment/       # Presets and loader
+│   ├── control/           # Session, joint/Cartesian controllers
+│   ├── core/              # Config schema, transforms
+│   ├── demo/              # Demo scripts (face robot, etc.)
+│   ├── services/          # IK, planning, collision
+│   └── interfaces/        # CLI entry points
+├── simforge_client/       # Cross-platform WebSocket client + GUI
+├── simforge_server_nvidia/ # cuRobo GPU motion planning server (ROS2)
+└── macara_plans/          # Multi-pose protocol plan files (JSON)
+```
+
 ## Features
 
 - **Multi-Robot Support**: Configure multiple robots in a single simulation
@@ -42,7 +59,7 @@ pip install -e ".[dev]"       # For development tools
 
 ```bash
 # Run with GUI using a configuration file
-simforge_new run --config env_configs/ur5e_env.yaml
+simforge_new run --config simforge_new/environment/presets/ur5e_env.yaml
 
 # Launch the prototype protocol simulation workspace
 simforge_new proto_sim --config simforge_new/environment/presets/face_robot.yaml
@@ -138,7 +155,7 @@ source .simforge_new/bin/activate  # or your venv path
 pytest
 
 # Run the application
-simforge_new run --config env_configs/ur5e_env.yaml
+simforge_new run --config simforge_new/environment/presets/ur5e_env.yaml
 ```
 
 ## Troubleshooting

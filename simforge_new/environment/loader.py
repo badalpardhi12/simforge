@@ -236,8 +236,11 @@ def _resolve_path(path: Optional[str], base_dir: Path) -> Optional[str]:
     # Search roots: base_dir parents, package root, cwd
     search_roots = [base_dir, *base_dir.parents]
     
-    # Also try from the simforge_new package root (workspace root)
-    package_root = Path(__file__).resolve().parents[2]  # simforge_new's parent = /home/badal/simforge
+    # Also try from the simforge_new package root
+    package_root = Path(__file__).resolve().parents[2]  # simforge_new → repo root
+    simforge_new_root = Path(__file__).resolve().parents[1]  # simforge_new/
+    if simforge_new_root not in search_roots:
+        search_roots.append(simforge_new_root)
     if package_root not in search_roots:
         search_roots.append(package_root)
     

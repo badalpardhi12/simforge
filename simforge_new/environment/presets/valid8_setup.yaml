@@ -16,22 +16,22 @@ world:
       pose_position: [0.0, 0.0, 0.0]
     - type: urdf
       name: optical_table
-      urdf: ../../../assets/tools/optical_table.urdf
+      urdf: ../../assets/tools/optical_table.urdf
       pose_position: [0.0, 0.0, 1.0]
       pose_orientation_rpy: [0.0, 0.0, 0.0]
       collision_enabled: true
       dynamic: false
     - type: urdf
       name: face_link
-      urdf: ../../../assets/non_pii_face/non_pii_face_valid8.urdf
-      # urdf: ../../../assets/non_pii_face/non_pii_face.urdf
+      urdf: ../../assets/non_pii_face/non_pii_face_valid8.urdf
+      # urdf: ../../assets/non_pii_face/non_pii_face.urdf
       pose_position: [0.1742, 0.0, 1.6]
       pose_orientation_rpy: [0.0, 0.0, 90.0]
       collision_enabled: true
       dynamic: false
 robots:
   - name: nakul_ur5e
-    urdf: ../../../assets/ur5e/ur5e.urdf
+    urdf: ../../assets/ur5e/ur5e.urdf
     end_effector_link: wrist_3_link
     base_pose:
       position: [-0.6758, 0.0, 1.03]
@@ -47,9 +47,9 @@ robots:
       genesis_plan_waypoints_max: "400"
     tool:
       name: iphone_tool
-      # urdf_override: ../../../assets/tools/simple_tool.urdf
+      # urdf_override: ../../assets/tools/simple_tool.urdf
       # attach_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-      urdf_override: ../../../assets/tools/iphone.urdf
+      urdf_override: ../../assets/tools/iphone.urdf
       attach_pose: [-0.08, 0.0, 0.0, 0.0, 0.0, 0.0]
     control:
       mode: cartesian
