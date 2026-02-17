@@ -195,13 +195,17 @@ class RPCHandlers:
                 }
 
             # Connect RTDE controllers
+            # connect() is a blocking call (up to 10 s timeout per robot).
+            # Run each connection in a thread so the async event loop
+            # stays responsive for heartbeats and other clients.
             connected, failed = [], []
             for rn, rtde in self._executor._rtde.items():
                 if rtde.is_connected:
                     connected.append(rn)
                     continue
                 self._log.info(f"Connecting RTDE to {rn}...")
-                if rtde.connect():
+                ok = await asyncio.to_thread(rtde.connect)
+                if ok:
                     connected.append(rn)
                 else:
                     failed.append(rn)

@@ -35,39 +35,73 @@ class URRTDEController:
 
     # ── Connection ───────────────────────────────────────────────
 
-    def connect(self) -> bool:
-        """Connect both the control and receive RTDE interfaces."""
+    def connect(self, timeout: float = 10.0) -> bool:
+        """Connect the RTDE receive interface.
+
+        Args:
+            timeout: Maximum seconds to wait for the TCP connection
+                     before giving up.  Default 10 s (vs the Linux
+                     TCP default of ~130 s).
+        """
         if not RTDE_AVAILABLE:
             if self.logger:
                 self.logger.error("ur_rtde not installed")
             return False
-        try:
-            if self.logger:
-                self.logger.info(
-                    f"Connecting RTDE to {self.robot_name} at {self.ip}..."
-                )
-            # Only create the *receive* interface here.
-            # The *control* interface (RTDEControlInterface) is created
-            # on demand in _ensure_ctrl() and torn down immediately
-            # after each move/servoJ — its internal C++ auto-reconnect
-            # thread segfaults when the UR drops the connection while
-            # the object is idle.
-            self._recv = rtde_receive.RTDEReceiveInterface(self.ip)
-            self._connected = True
-            self._recv_healthy = True
-            if self.logger:
-                self.logger.info(
-                    f"RTDE connected to {self.robot_name} at {self.ip} ✓"
-                )
-            return True
-        except Exception as e:
+
+        if self.logger:
+            self.logger.info(
+                f"Connecting RTDE to {self.robot_name} at {self.ip} "
+                f"(timeout {timeout}s)..."
+            )
+
+        # RTDEReceiveInterface() blocks on TCP connect with no
+        # timeout parameter.  Run it in a daemon thread so we can
+        # enforce our own deadline and avoid hanging the gateway
+        # for 2+ minutes when the robot is unreachable.
+        result_holder: list = [None]
+        error_holder: list = [None]
+
+        def _do_connect():
+            try:
+                recv = rtde_receive.RTDEReceiveInterface(self.ip)
+                result_holder[0] = recv
+            except Exception as e:
+                error_holder[0] = e
+
+        t = threading.Thread(target=_do_connect, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+
+        if t.is_alive():
+            # Thread still blocked on connect — treat as failure
             if self.logger:
                 self.logger.error(
-                    f"RTDE connection failed for {self.robot_name}: {e}"
+                    f"RTDE connection timed out for {self.robot_name} "
+                    f"at {self.ip} after {timeout}s — is the robot "
+                    f"powered on and reachable?"
                 )
             self._connected = False
             self._recv_healthy = False
             return False
+
+        if error_holder[0] is not None:
+            if self.logger:
+                self.logger.error(
+                    f"RTDE connection failed for {self.robot_name}: "
+                    f"{error_holder[0]}"
+                )
+            self._connected = False
+            self._recv_healthy = False
+            return False
+
+        self._recv = result_holder[0]
+        self._connected = True
+        self._recv_healthy = True
+        if self.logger:
+            self.logger.info(
+                f"RTDE connected to {self.robot_name} at {self.ip} ✓"
+            )
+        return True
 
     def disconnect(self):
         """Disconnect both RTDE interfaces."""
