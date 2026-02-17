@@ -32,7 +32,7 @@ environment:
     ur20:
       prefix: ""
       ur_type: ur20
-      ip: "0.0.0.0"
+      ip: "192.168.0.40"
       controller: scaled_joint_trajectory_controller
       ee_link: tool0
       ik_tip_link: tool_tip_link

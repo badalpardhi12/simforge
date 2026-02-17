@@ -169,6 +169,10 @@ class SimforgeClient:
         # instead of a fixed total timeout.
         self._activity_events: Dict[str, asyncio.Event] = {}
 
+        # RPC feedback callbacks — invoked with the raw rpc_feedback
+        # message dict so callers can react to progress / status.
+        self._rpc_feedback_callbacks: Dict[str, Callable] = {}
+
     @property
     def server_uri(self) -> str:
         """Get the WebSocket URI."""
@@ -451,13 +455,20 @@ class SimforgeClient:
         """Handle RPC feedback (progress updates during long operations).
 
         Pulses the activity event for the request so that
-        :meth:`call_rpc` resets its inactivity deadline.
+        :meth:`call_rpc` resets its inactivity deadline, and
+        invokes the registered feedback callback (if any).
         """
         request_id = msg.get("request_id")
         if request_id:
             evt = self._activity_events.get(request_id)
             if evt is not None:
                 evt.set()
+            cb = self._rpc_feedback_callbacks.get(request_id)
+            if cb is not None:
+                try:
+                    cb(msg)
+                except Exception as e:
+                    logger.error(f"RPC feedback callback error: {e}")
         logger.debug(f"RPC feedback: {msg}")
 
     def _handle_error(self, msg: Dict[str, Any]):
@@ -752,6 +763,7 @@ class SimforgeClient:
         params: Dict[str, Any],
         timeout: float = 60.0,
         inactivity_timeout: Optional[float] = None,
+        feedback_callback: Optional[Callable] = None,
     ) -> Dict[str, Any]:
         """Call a generic RPC method on the server.
 
@@ -781,6 +793,9 @@ class SimforgeClient:
             inactivity_timeout: Maximum *silence* time — resets on every
                 server feedback message.  ``None`` ⇒ use ``timeout``
                 instead.
+            feedback_callback: Optional callable invoked with the raw
+                ``rpc_feedback`` message dict each time the server
+                reports progress for this request.
 
         Returns:
             Dictionary with RPC result
@@ -808,6 +823,10 @@ class SimforgeClient:
         activity_event = asyncio.Event()
         self._activity_events[request_id] = activity_event
 
+        # Register optional feedback callback
+        if feedback_callback is not None:
+            self._rpc_feedback_callbacks[request_id] = feedback_callback
+
         try:
             await self._ws.send(json.dumps(request))
 
@@ -833,6 +852,7 @@ class SimforgeClient:
             )
         finally:
             self._activity_events.pop(request_id, None)
+            self._rpc_feedback_callbacks.pop(request_id, None)
 
     async def _wait_with_activity(
         self,

@@ -1122,6 +1122,36 @@ class ProtoSimClientFrame(wx.Frame):
                 f"Sending {total_poses} poses to server "
                 f"(speed={move_speed}, inactivity_timeout={INACTIVITY_TIMEOUT:.0f}s)"
             )
+
+            # Feedback callback — updates progress bar & label in real time
+            def _on_feedback(msg):
+                status = msg.get("status", "")
+                pct = msg.get("progress_percent", 0)
+                pose_idx = msg.get("current_pose_index", 0)
+                pose_name = msg.get("current_pose_name", "")
+                message = msg.get("message", "")
+
+                if status == "paused":
+                    label = message or "⏸ Safeguard stop — waiting…"
+                elif status == "resuming":
+                    label = message or "▶ Resuming…"
+                elif status == "planning":
+                    label = message or f"Planning {pose_idx+1}/{total_poses}"
+                elif status == "moving":
+                    label = f"Moving to {pose_name or pose_idx+1}"
+                elif status == "reached":
+                    label = f"Reached {pose_name or pose_idx+1}"
+                elif status == "error":
+                    label = message or "Error"
+                else:
+                    label = message or status or "Working…"
+
+                wx.CallAfter(self.progress_bar.SetValue, int(pct))
+                wx.CallAfter(self.progress_label.SetLabel, label)
+
+                # Log significant events
+                if status in ("paused", "resuming", "error"):
+                    self._log(label)
             
             # Send pre-computed poses to server
             response = await self._client.call_rpc("run_proto_sim", {
@@ -1132,7 +1162,8 @@ class ProtoSimClientFrame(wx.Frame):
                 "move_speed": move_speed,
                 "go_home_before": True,
                 "go_home_after": True,
-            }, inactivity_timeout=INACTIVITY_TIMEOUT)
+            }, inactivity_timeout=INACTIVITY_TIMEOUT,
+               feedback_callback=_on_feedback)
             
             if response.get("success"):
                 completed = response.get('completed', 0)
@@ -1152,28 +1183,69 @@ class ProtoSimClientFrame(wx.Frame):
             # Surface any hardware issues reported by the server
             hw_issues = response.get("hardware_issues", [])
             hw_abort = response.get("hardware_abort", False)
+
+            # Classify issues: safeguard stops are recoverable
+            safeguard_only = (
+                hw_issues
+                and all(iss.endswith(":SAFEGUARD_STOP") for iss in hw_issues)
+            )
+
             if hw_issues:
-                self._log(f"  ⚠ Hardware issues: {', '.join(hw_issues)}")
-            if hw_abort:
-                self._log("  ⛔ Protocol ABORTED due to hardware fault!")
-                # Show a prominent error dialog so the user cannot miss it
-                def _show_hw_error(issues=hw_issues, msg=response.get("message", "")):
-                    detail = (
-                        "The robot hit a protective stop or emergency stop "
-                        "during protocol execution.\n\n"
-                        "Hardware faults:\n"
-                        + "\n".join(f"  • {iss}" for iss in issues)
-                        + "\n\n"
-                        f"Server message:\n  {msg}\n\n"
-                        "Please check the robot teach pendant, clear the "
-                        "fault, and try again."
+                if safeguard_only and not hw_abort:
+                    # Safeguard stops occurred but were auto-resolved
+                    self._log(
+                        f"  ℹ Safeguard stop(s) occurred and auto-cleared: "
+                        f"{', '.join(hw_issues)}"
                     )
-                    wx.MessageDialog(
-                        self, detail,
-                        "Robot Hardware Fault — Protocol Aborted",
-                        wx.OK | wx.ICON_ERROR,
-                    ).ShowModal()
-                wx.CallAfter(_show_hw_error)
+                else:
+                    self._log(f"  ⚠ Hardware issues: {', '.join(hw_issues)}")
+
+            if hw_abort:
+                if safeguard_only:
+                    # Safeguard stop did NOT clear in time
+                    self._log(
+                        "  ⏸ Protocol ABORTED — safeguard stop "
+                        "did not clear within timeout"
+                    )
+                    def _show_sg_error(issues=hw_issues, msg=response.get("message", "")):
+                        detail = (
+                            "The robot paused due to a safeguard stop "
+                            "(laser scanner / safety zone) but the area "
+                            "was not cleared within the timeout.\n\n"
+                            "Safeguard events:\n"
+                            + "\n".join(f"  • {iss}" for iss in issues)
+                            + "\n\n"
+                            f"Server message:\n  {msg}\n\n"
+                            "Clear the safety zone around the robot and "
+                            "try again. The robot will resume automatically "
+                            "once the area is clear."
+                        )
+                        wx.MessageDialog(
+                            self, detail,
+                            "Safeguard Stop — Protocol Paused",
+                            wx.OK | wx.ICON_WARNING,
+                        ).ShowModal()
+                    wx.CallAfter(_show_sg_error)
+                else:
+                    # Fatal fault (protective/emergency stop)
+                    self._log("  ⛔ Protocol ABORTED due to hardware fault!")
+                    def _show_hw_error(issues=hw_issues, msg=response.get("message", "")):
+                        detail = (
+                            "The robot hit a protective stop or emergency "
+                            "stop during protocol execution.\n\n"
+                            "Hardware faults:\n"
+                            + "\n".join(f"  • {iss}" for iss in issues)
+                            + "\n\n"
+                            f"Server message:\n  {msg}\n\n"
+                            "Please check the robot teach pendant, clear "
+                            "the fault, and try again."
+                        )
+                        wx.MessageDialog(
+                            self, detail,
+                            "Robot Hardware Fault — Protocol Aborted",
+                            wx.OK | wx.ICON_ERROR,
+                        ).ShowModal()
+                    wx.CallAfter(_show_hw_error)
             elif response.get("stopped"):
                 self._log("  Protocol was stopped by user")
                 
