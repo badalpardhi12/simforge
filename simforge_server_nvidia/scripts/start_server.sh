@@ -159,11 +159,30 @@ stop_ros_stack() {
 # ── Cleanup on exit ──
 cleanup() {
     echo "Shutting down..."
-    stop_ros_stack
+
+    # Kill gateway first (holds CUDA context)
     if [ -n "$GATEWAY_PID" ] && kill -0 "$GATEWAY_PID" 2>/dev/null; then
-        kill "$GATEWAY_PID" 2>/dev/null || true
+        echo "Stopping gateway (PID $GATEWAY_PID)..."
+        kill -INT "$GATEWAY_PID" 2>/dev/null || true
+        for i in $(seq 1 10); do
+            kill -0 "$GATEWAY_PID" 2>/dev/null || break
+            sleep 0.5
+        done
+        if kill -0 "$GATEWAY_PID" 2>/dev/null; then
+            echo "Force killing gateway..."
+            kill -9 "$GATEWAY_PID" 2>/dev/null || true
+            sleep 1
+        fi
     fi
+
+    stop_ros_stack
+
+    # Kill any remaining Python/CUDA processes from this session
+    pkill -9 -f "command_gateway_curobo" 2>/dev/null || true
+    pkill -9 -f "curobo" 2>/dev/null || true
+
     rm -f "$MODE_SWITCH_FILE" "$CURRENT_MODE_FILE" "$STACK_READY_FILE"
+    echo "Shutdown complete."
     exit 0
 }
 trap cleanup SIGINT SIGTERM EXIT

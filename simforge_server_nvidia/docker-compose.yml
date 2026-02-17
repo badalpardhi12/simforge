@@ -84,6 +84,8 @@ services:
       memlock:
         soft: 102400
         hard: 102400
+    init: true
+    stop_grace_period: 15s
     stdin_open: true
     tty: true
     command: /start_server.sh --sim
@@ -134,6 +136,8 @@ services:
       memlock:
         soft: 102400
         hard: 102400
+    init: true
+    stop_grace_period: 15s
     stdin_open: true
     tty: true
     command: /start_server.sh --real
@@ -177,6 +181,8 @@ services:
       memlock:
         soft: 102400
         hard: 102400
+    init: true
+    stop_grace_period: 15s
     stdin_open: true
     tty: true
     command: /start_server.sh --sim
@@ -220,6 +226,8 @@ services:
       memlock:
         soft: 102400
         hard: 102400
+    init: true
+    stop_grace_period: 15s
     stdin_open: true
     tty: true
     command: /start_server.sh --real
