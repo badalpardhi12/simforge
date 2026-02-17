@@ -317,6 +317,20 @@ class URRTDEController:
                 if self.logger:
                     self.logger.error(msg)
                 return False
+            sm = self.get_safety_mode()
+            if sm in (
+                self.SAFETY_MODE_SAFEGUARD_STOP,
+                self.SAFETY_MODE_AUTO_SAFEGUARD_STOP,
+            ):
+                msg = (
+                    f"Cannot create RTDE control interface — "
+                    f"{self.robot_name} is in SAFEGUARD STOP "
+                    f"(safety_mode={sm}). Wait for area to clear."
+                )
+                self.last_error = msg
+                if self.logger:
+                    self.logger.warn(msg)
+                return False
         except Exception as e:
             msg = (
                 f"Cannot create RTDE control interface — "
@@ -392,6 +406,33 @@ class URRTDEController:
 
     # ── Safety state ─────────────────────────────────────────────
 
+    # UR safety mode constants (from RTDE specification)
+    SAFETY_MODE_NORMAL = 1
+    SAFETY_MODE_REDUCED = 2
+    SAFETY_MODE_PROTECTIVE_STOP = 3
+    SAFETY_MODE_RECOVERY = 4
+    SAFETY_MODE_SAFEGUARD_STOP = 5
+    SAFETY_MODE_SYSTEM_EMERGENCY_STOP = 6
+    SAFETY_MODE_ROBOT_EMERGENCY_STOP = 7
+    SAFETY_MODE_VIOLATION = 8
+    SAFETY_MODE_FAULT = 9
+    SAFETY_MODE_AUTO_SAFEGUARD_STOP = 12
+
+    def get_safety_mode(self) -> int:
+        """Return the UR safety mode integer (-1 if unavailable).
+
+        Uses ``getSafetyMode()`` from ur_rtde.  Constants:
+          1=NORMAL, 2=REDUCED, 3=PROTECTIVE_STOP, 4=RECOVERY,
+          5=SAFEGUARD_STOP, 6=SYS_ESTOP, 7=ROBOT_ESTOP,
+          8=VIOLATION, 9=FAULT, 12=AUTO_SAFEGUARD_STOP
+        """
+        try:
+            if self._recv is not None and self._recv_healthy:
+                return self._recv.getSafetyMode()
+        except Exception:
+            pass
+        return -1
+
     def is_protective_stopped(self) -> bool:
         """Check if the robot is in a protective stop state."""
         try:
@@ -401,6 +442,18 @@ class URRTDEController:
             pass
         return False
 
+    def is_safeguard_stopped(self) -> bool:
+        """Check if the robot is in a safeguard stop (laser scanner, etc.).
+
+        Safeguard stops auto-clear once the safety zone is vacated,
+        unlike protective stops which require manual acknowledgment.
+        """
+        sm = self.get_safety_mode()
+        return sm in (
+            self.SAFETY_MODE_SAFEGUARD_STOP,
+            self.SAFETY_MODE_AUTO_SAFEGUARD_STOP,
+        )
+
     def is_emergency_stopped(self) -> bool:
         """Check if the robot is in an emergency stop state."""
         try:
@@ -408,6 +461,67 @@ class URRTDEController:
                 return self._recv.isEmergencyStopped()
         except Exception:
             pass
+        return False
+
+    def wait_for_safeguard_clear(
+        self,
+        timeout: float = 120.0,
+        poll_interval: float = 0.25,
+        logger=None,
+    ) -> bool:
+        """Block until the safeguard stop clears or *timeout* expires.
+
+        Returns True if the robot returned to NORMAL/REDUCED mode
+        within the timeout, False otherwise.
+        """
+        log = logger or self.logger
+        deadline = _time.monotonic() + timeout
+        logged_once = False
+
+        while _time.monotonic() < deadline:
+            sm = self.get_safety_mode()
+            if sm in (
+                self.SAFETY_MODE_NORMAL,
+                self.SAFETY_MODE_REDUCED,
+            ):
+                if log:
+                    log.info(
+                        f"Safeguard cleared on {self.robot_name} "
+                        f"(safety_mode={sm})"
+                    )
+                return True
+
+            # If it transitioned to a harder fault, bail out
+            if sm in (
+                self.SAFETY_MODE_PROTECTIVE_STOP,
+                self.SAFETY_MODE_SYSTEM_EMERGENCY_STOP,
+                self.SAFETY_MODE_ROBOT_EMERGENCY_STOP,
+                self.SAFETY_MODE_VIOLATION,
+                self.SAFETY_MODE_FAULT,
+            ):
+                if log:
+                    log.error(
+                        f"Safety escalated from safeguard to "
+                        f"mode {sm} on {self.robot_name} — "
+                        f"cannot auto-resume"
+                    )
+                return False
+
+            if not logged_once and log:
+                log.warn(
+                    f"Safeguard stop active on {self.robot_name} "
+                    f"(safety_mode={sm}) — waiting up to "
+                    f"{timeout:.0f}s for clearance…"
+                )
+                logged_once = True
+
+            _time.sleep(poll_interval)
+
+        if log:
+            log.error(
+                f"Safeguard stop did NOT clear on "
+                f"{self.robot_name} within {timeout:.0f}s"
+            )
         return False
 
     def get_robot_mode(self) -> int:
@@ -644,9 +758,18 @@ class URRTDEController:
                 if wi % safety_interval == 0:
                     try:
                         if not self._ctrl.isProgramRunning():
+                            # ── Identify the stop reason ────────────
                             reason = "PROGRAM STOPPED"
+                            is_safeguard = False
                             try:
-                                if (self._recv is not None
+                                sm = self.get_safety_mode()
+                                if sm in (
+                                    self.SAFETY_MODE_SAFEGUARD_STOP,
+                                    self.SAFETY_MODE_AUTO_SAFEGUARD_STOP,
+                                ):
+                                    reason = "SAFEGUARD STOP"
+                                    is_safeguard = True
+                                elif (self._recv is not None
                                         and self._recv.isProtectiveStopped()):
                                     reason = "PROTECTIVE STOP"
                                 elif (self._recv is not None
@@ -654,9 +777,103 @@ class URRTDEController:
                                     reason = "EMERGENCY STOP"
                             except Exception:
                                 pass
+
+                            # ── Safeguard stop → pause & resume ─────
+                            if is_safeguard:
+                                if logger:
+                                    logger.warn(
+                                        f"SAFEGUARD STOP on "
+                                        f"{self.robot_name} at wp "
+                                        f"{wi}/{n_pts} — pausing "
+                                        f"servoJ, waiting for "
+                                        f"clearance…"
+                                    )
+                                # Tear down dead control interface
+                                try:
+                                    self._ctrl.servoStop()
+                                except Exception:
+                                    pass
+                                self._teardown_ctrl()
+                                self.reconnect_receive()
+
+                                # Block until safeguard clears
+                                cleared = self.wait_for_safeguard_clear(
+                                    timeout=120.0,
+                                    poll_interval=0.25,
+                                    logger=logger,
+                                )
+                                if not cleared:
+                                    msg = (
+                                        f"Safeguard did not clear "
+                                        f"on {self.robot_name} — "
+                                        f"aborting servoJ"
+                                    )
+                                    self.last_error = msg
+                                    if logger:
+                                        logger.error(msg)
+                                    return False
+
+                                # Wait for robot mode to return to
+                                # RUNNING (7) — the UR controller
+                                # needs a moment after safeguard
+                                # clearance before accepting commands.
+                                _resume_deadline = (
+                                    _time.monotonic() + 15.0
+                                )
+                                while _time.monotonic() < _resume_deadline:
+                                    rm = self.get_robot_mode()
+                                    if rm == 7:
+                                        break
+                                    _time.sleep(0.25)
+                                else:
+                                    msg = (
+                                        f"Robot mode did not return "
+                                        f"to RUNNING on "
+                                        f"{self.robot_name} after "
+                                        f"safeguard clear (mode="
+                                        f"{self.get_robot_mode()})"
+                                    )
+                                    self.last_error = msg
+                                    if logger:
+                                        logger.error(msg)
+                                    return False
+
+                                # Re-create control interface
+                                if not self._ensure_ctrl():
+                                    msg = (
+                                        f"Cannot recreate RTDE "
+                                        f"control interface on "
+                                        f"{self.robot_name} after "
+                                        f"safeguard clear"
+                                    )
+                                    self.last_error = msg
+                                    if logger:
+                                        logger.error(msg)
+                                    return False
+
+                                if logger:
+                                    logger.info(
+                                        f"Resuming servoJ on "
+                                        f"{self.robot_name} from "
+                                        f"wp {wi}/{n_pts}"
+                                    )
+
+                                # Reset timing so rate-pacing doesn't
+                                # try to "catch up" the paused time.
+                                wall_start = (
+                                    _time.monotonic() - wp_times[wi]
+                                )
+                                prev_cmd_time = _time.monotonic()
+                                # Mark recv unhealthy again — servoJ
+                                # owns position publishing.
+                                self._recv_healthy = False
+                                continue  # retry this waypoint
+
+                            # ── Non-safeguard stop → abort ──────────
                             msg = (
                                 f"{reason} on {self.robot_name} "
-                                f"at wp {wi}/{n_pts} — aborting servoJ"
+                                f"at wp {wi}/{n_pts} — aborting "
+                                f"servoJ"
                             )
                             self.last_error = msg
                             if logger:
@@ -714,6 +931,64 @@ class URRTDEController:
                         effective_lookahead, gain,
                     )
                 except Exception as servo_exc:
+                    # servoJ threw — check if a safeguard stop
+                    if self.is_safeguard_stopped():
+                        if logger:
+                            logger.warn(
+                                f"servoJ exception on "
+                                f"{self.robot_name} at wp "
+                                f"{wi}/{n_pts} due to SAFEGUARD "
+                                f"STOP — pausing…"
+                            )
+                        try:
+                            self._ctrl.servoStop()
+                        except Exception:
+                            pass
+                        self._teardown_ctrl()
+                        self.reconnect_receive()
+
+                        cleared = self.wait_for_safeguard_clear(
+                            timeout=120.0, logger=logger,
+                        )
+                        if not cleared:
+                            self.last_error = (
+                                f"Safeguard did not clear on "
+                                f"{self.robot_name}"
+                            )
+                            return False
+
+                        _rd = _time.monotonic() + 15.0
+                        while _time.monotonic() < _rd:
+                            if self.get_robot_mode() == 7:
+                                break
+                            _time.sleep(0.25)
+                        else:
+                            self.last_error = (
+                                f"Robot mode not RUNNING after "
+                                f"safeguard clear"
+                            )
+                            return False
+
+                        if not self._ensure_ctrl():
+                            self.last_error = (
+                                f"Cannot recreate RTDE ctrl "
+                                f"after safeguard clear"
+                            )
+                            return False
+
+                        if logger:
+                            logger.info(
+                                f"Resuming servoJ on "
+                                f"{self.robot_name} from "
+                                f"wp {wi}/{n_pts}"
+                            )
+                        wall_start = (
+                            _time.monotonic() - wp_times[wi]
+                        )
+                        prev_cmd_time = _time.monotonic()
+                        self._recv_healthy = False
+                        continue  # retry this waypoint
+
                     msg = (
                         f"RTDE servoJ exception on "
                         f"{self.robot_name} at wp {wi}/{n_pts}: "
@@ -729,6 +1004,76 @@ class URRTDEController:
                 prev_cmd_time = _time.monotonic()
 
                 if not servo_ok:
+                    # Check if this is a safeguard stop (auto-clears)
+                    if self.is_safeguard_stopped():
+                        if logger:
+                            logger.warn(
+                                f"servoJ returned False on "
+                                f"{self.robot_name} at wp "
+                                f"{wi}/{n_pts} — SAFEGUARD STOP "
+                                f"detected, pausing…"
+                            )
+                        try:
+                            self._ctrl.servoStop()
+                        except Exception:
+                            pass
+                        self._teardown_ctrl()
+                        self.reconnect_receive()
+
+                        cleared = self.wait_for_safeguard_clear(
+                            timeout=120.0, logger=logger,
+                        )
+                        if not cleared:
+                            msg = (
+                                f"Safeguard did not clear on "
+                                f"{self.robot_name} — aborting"
+                            )
+                            self.last_error = msg
+                            if logger:
+                                logger.error(msg)
+                            return False
+
+                        # Wait for RUNNING mode
+                        _rd = _time.monotonic() + 15.0
+                        while _time.monotonic() < _rd:
+                            if self.get_robot_mode() == 7:
+                                break
+                            _time.sleep(0.25)
+                        else:
+                            msg = (
+                                f"Robot mode not RUNNING after "
+                                f"safeguard clear on "
+                                f"{self.robot_name}"
+                            )
+                            self.last_error = msg
+                            if logger:
+                                logger.error(msg)
+                            return False
+
+                        if not self._ensure_ctrl():
+                            msg = (
+                                f"Cannot recreate RTDE ctrl on "
+                                f"{self.robot_name} after "
+                                f"safeguard clear"
+                            )
+                            self.last_error = msg
+                            if logger:
+                                logger.error(msg)
+                            return False
+
+                        if logger:
+                            logger.info(
+                                f"Resuming servoJ on "
+                                f"{self.robot_name} from "
+                                f"wp {wi}/{n_pts}"
+                            )
+                        wall_start = (
+                            _time.monotonic() - wp_times[wi]
+                        )
+                        prev_cmd_time = _time.monotonic()
+                        self._recv_healthy = False
+                        continue  # retry this waypoint
+
                     msg = (
                         f"servoJ returned False on {self.robot_name} "
                         f"at wp {wi}/{n_pts} — UR control script "

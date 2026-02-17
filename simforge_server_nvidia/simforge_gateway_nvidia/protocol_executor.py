@@ -179,22 +179,66 @@ class ProtocolExecutor:
             # ── Hardware fault check ─────────────────────────────
             hw_issues = self._detect_hardware_issues()
             if hw_issues:
-                hw_abort = True
-                self._log.error(
-                    f"Hardware fault: {', '.join(hw_issues)} "
-                    f"\u2014 aborting"
-                )
-                await self._send_feedback(
-                    client, request_id, i, total,
-                    (i / max(total, 1)) * 100, "error",
-                    message=(
-                        f"\u26a0 HARDWARE FAULT: "
-                        f"{', '.join(hw_issues)}. "
-                        f"Robot stopped \u2014 aborting protocol."
-                    ),
-                )
-                self.stop_requested = True
-                break
+                # Safeguard stops are recoverable — pause & wait
+                if not self._has_fatal_hardware_issue(hw_issues):
+                    self._log.warn(
+                        f"Safeguard stop before pose {i+1}: "
+                        f"{', '.join(hw_issues)} — pausing…"
+                    )
+                    await self._send_feedback(
+                        client, request_id, i, total,
+                        (i / max(total, 1)) * 100, "paused",
+                        message=(
+                            f"⏸ SAFEGUARD STOP: "
+                            f"{', '.join(hw_issues)}. "
+                            f"Waiting for area to clear…"
+                        ),
+                    )
+                    # Wait for all safeguard-stopped robots to clear
+                    all_clear = await self._wait_safeguard_clear_all(
+                        timeout=120.0,
+                    )
+                    if not all_clear:
+                        hw_abort = True
+                        self._log.error(
+                            "Safeguard did not clear — aborting"
+                        )
+                        await self._send_feedback(
+                            client, request_id, i, total,
+                            (i / max(total, 1)) * 100, "error",
+                            message=(
+                                "⚠ Safeguard stop did not clear "
+                                "within timeout — aborting protocol."
+                            ),
+                        )
+                        self.stop_requested = True
+                        break
+                    self._log.info(
+                        "Safeguard cleared — resuming protocol"
+                    )
+                    await self._send_feedback(
+                        client, request_id, i, total,
+                        (i / max(total, 1)) * 100, "resuming",
+                        message="✓ Safeguard cleared — resuming…",
+                    )
+                else:
+                    # Fatal (protective/emergency stop) — abort
+                    hw_abort = True
+                    self._log.error(
+                        f"Hardware fault: {', '.join(hw_issues)} "
+                        f"— aborting"
+                    )
+                    await self._send_feedback(
+                        client, request_id, i, total,
+                        (i / max(total, 1)) * 100, "error",
+                        message=(
+                            f"⚠ HARDWARE FAULT: "
+                            f"{', '.join(hw_issues)}. "
+                            f"Robot stopped — aborting protocol."
+                        ),
+                    )
+                    self.stop_requested = True
+                    break
 
             # ── Plan ─────────────────────────────────────────────
             pct = (i / total) * 100
@@ -402,6 +446,28 @@ class ProtocolExecutor:
 
     # ── Helpers ──────────────────────────────────────────────────
 
+    async def _wait_safeguard_clear_all(
+        self, timeout: float = 120.0,
+    ) -> bool:
+        """Wait for all RTDE robots to exit safeguard stop.
+
+        Runs the blocking ``wait_for_safeguard_clear()`` in a thread
+        so the asyncio event loop stays responsive (e.g. for
+        WebSocket keep-alive).
+        """
+        loop = asyncio.get_event_loop()
+        for rn, rtde in self._executor._rtde.items():
+            if rtde.is_safeguard_stopped():
+                cleared = await loop.run_in_executor(
+                    None,
+                    lambda r=rtde: r.wait_for_safeguard_clear(
+                        timeout=timeout, logger=self._log,
+                    ),
+                )
+                if not cleared:
+                    return False
+        return True
+
     async def _home_if_needed(self, robot_name, cfg, mode):
         """Move the robot home if needed.
 
@@ -445,21 +511,31 @@ class ProtocolExecutor:
         return (True, "")
 
     def _detect_hardware_issues(self):
+        """Detect hardware faults on all RTDE-controlled robots.
+
+        Returns a list of issues.  Safeguard stops are reported but
+        are NOT treated as fatal — the caller decides whether to
+        pause or abort.
+        """
         issues = []
         mode = getattr(self._node, '_current_mode', 'simulation')
         if mode in ("real", "both"):
-            # In RTDE mode we bypass the ROS2 UR driver, so
-            # _robot_program_running is irrelevant.  Check RTDE
-            # controllers directly for safety faults.
             for rn, rtde in self._executor._rtde.items():
-                if rtde.is_protective_stopped():
+                if rtde.is_safeguard_stopped():
+                    issues.append(f"{rn}:SAFEGUARD_STOP")
+                elif rtde.is_protective_stopped():
                     issues.append(f"{rn}:PROTECTIVE_STOP")
                 elif rtde.is_emergency_stopped():
                     issues.append(f"{rn}:EMERGENCY_STOP")
                 elif rtde.last_error:
-                    # Truncate the error to fit in the JSON result
                     issues.append(f"{rn}:{rtde.last_error[:80]}")
         return issues
+
+    def _has_fatal_hardware_issue(self, issues: list) -> bool:
+        """Return True if any issue is NOT a recoverable safeguard stop."""
+        return any(
+            not issue.endswith(":SAFEGUARD_STOP") for issue in issues
+        )
 
     async def _send_feedback(
         self, client, request_id, pose_idx, total, progress, status,
