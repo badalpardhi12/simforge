@@ -195,9 +195,7 @@ class ProtocolExecutor:
                         ),
                     )
                     # Wait for all safeguard-stopped robots to clear
-                    all_clear = await self._wait_safeguard_clear_all(
-                        timeout=120.0,
-                    )
+                    all_clear = await self._wait_safeguard_clear_all()
                     if not all_clear:
                         hw_abort = True
                         self._log.error(
@@ -302,6 +300,46 @@ class ProtocolExecutor:
             ok = await self._executor.execute(
                 robot_name, ros_traj, timeout=exec_timeout,
             )
+
+            # ── Safeguard-aware retry ────────────────────────────
+            # If execution failed and the robot is in (or was just
+            # in) a safeguard stop, wait for clearance and retry
+            # the same trajectory once rather than counting it as
+            # a permanent failure.
+            if not ok and RTDE_AVAILABLE:
+                rtde = self._executor._rtde.get(robot_name)
+                if rtde is not None and rtde.is_safeguard_stopped():
+                    self._log.warn(
+                        f"  [{i+1}/{total}] exec interrupted by "
+                        f"safeguard stop on {pose_name} — "
+                        f"waiting for clearance…"
+                    )
+                    await self._send_feedback(
+                        client, request_id, i, total, pct,
+                        "paused",
+                        message=(
+                            f"⏸ Safeguard stop during {pose_name} "
+                            f"— waiting for area to clear…"
+                        ),
+                    )
+                    all_clear = await self._wait_safeguard_clear_all()
+                    if all_clear:
+                        self._log.info(
+                            f"  [{i+1}/{total}] safeguard cleared "
+                            f"— retrying {pose_name}"
+                        )
+                        await self._send_feedback(
+                            client, request_id, i, total, pct,
+                            "moving",
+                            message=(
+                                f"▶ Retrying {pose_name} after "
+                                f"safeguard clear"
+                            ),
+                            current_pose_name=pose_name,
+                        )
+                        ok = await self._executor.execute(
+                            robot_name, ros_traj, timeout=exec_timeout,
+                        )
 
             if ok:
                 completed += 1
@@ -447,13 +485,14 @@ class ProtocolExecutor:
     # ── Helpers ──────────────────────────────────────────────────
 
     async def _wait_safeguard_clear_all(
-        self, timeout: float = 120.0,
+        self, timeout: float = float('inf'),
     ) -> bool:
         """Wait for all RTDE robots to exit safeguard stop.
 
-        Runs the blocking ``wait_for_safeguard_clear()`` in a thread
-        so the asyncio event loop stays responsive (e.g. for
-        WebSocket keep-alive).
+        The default timeout is infinite — the system waits as long as
+        the safety zone is occupied.  Runs the blocking
+        ``wait_for_safeguard_clear()`` in a thread so the asyncio
+        event loop stays responsive (e.g. for WebSocket keep-alive).
         """
         loop = asyncio.get_event_loop()
         for rn, rtde in self._executor._rtde.items():

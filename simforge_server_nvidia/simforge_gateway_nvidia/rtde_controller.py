@@ -425,9 +425,16 @@ class URRTDEController:
           1=NORMAL, 2=REDUCED, 3=PROTECTIVE_STOP, 4=RECOVERY,
           5=SAFEGUARD_STOP, 6=SYS_ESTOP, 7=ROBOT_ESTOP,
           8=VIOLATION, 9=FAULT, 12=AUTO_SAFEGUARD_STOP
+
+        NOTE: This intentionally does **not** gate on ``_recv_healthy``.
+        During servoJ streaming ``_recv_healthy`` is set to False to
+        suppress joint-state publishing, but the recv interface is
+        still alive and can read safety registers.  Gating on
+        ``_recv_healthy`` would make safety checks blind during
+        trajectory execution — exactly when they matter most.
         """
         try:
-            if self._recv is not None and self._recv_healthy:
+            if self._recv is not None:
                 return self._recv.getSafetyMode()
         except Exception:
             pass
@@ -465,11 +472,15 @@ class URRTDEController:
 
     def wait_for_safeguard_clear(
         self,
-        timeout: float = 120.0,
+        timeout: float = float('inf'),
         poll_interval: float = 0.25,
         logger=None,
     ) -> bool:
         """Block until the safeguard stop clears or *timeout* expires.
+
+        The default timeout is infinite — the robot waits as long as
+        needed for the safety zone to clear.  Pass a finite value
+        to cap the wait.
 
         Returns True if the robot returned to NORMAL/REDUCED mode
         within the timeout, False otherwise.
@@ -508,10 +519,14 @@ class URRTDEController:
                 return False
 
             if not logged_once and log:
+                timeout_str = (
+                    f"{timeout:.0f}s" if timeout < 1e9
+                    else "indefinitely"
+                )
                 log.warn(
                     f"Safeguard stop active on {self.robot_name} "
-                    f"(safety_mode={sm}) — waiting up to "
-                    f"{timeout:.0f}s for clearance…"
+                    f"(safety_mode={sm}) — waiting "
+                    f"{timeout_str} for clearance…"
                 )
                 logged_once = True
 
@@ -776,7 +791,6 @@ class URRTDEController:
                         self.reconnect_receive()
 
                         cleared = self.wait_for_safeguard_clear(
-                            timeout=120.0,
                             poll_interval=0.25,
                             logger=logger,
                         )
@@ -878,7 +892,6 @@ class URRTDEController:
 
                                 # Block until safeguard clears
                                 cleared = self.wait_for_safeguard_clear(
-                                    timeout=120.0,
                                     poll_interval=0.25,
                                     logger=logger,
                                 )
@@ -1028,7 +1041,7 @@ class URRTDEController:
                         self.reconnect_receive()
 
                         cleared = self.wait_for_safeguard_clear(
-                            timeout=120.0, logger=logger,
+                            logger=logger,
                         )
                         if not cleared:
                             self.last_error = (
@@ -1101,7 +1114,7 @@ class URRTDEController:
                         self.reconnect_receive()
 
                         cleared = self.wait_for_safeguard_clear(
-                            timeout=120.0, logger=logger,
+                            logger=logger,
                         )
                         if not cleared:
                             msg = (
