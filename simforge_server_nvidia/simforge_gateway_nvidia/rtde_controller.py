@@ -33,6 +33,11 @@ class URRTDEController:
         self._recv_healthy = False  # tracks receive interface health
         self.last_error: str = ""  # last error for callers to inspect
 
+        # Position verification — populated after each trajectory
+        self.last_target_q: Optional[List[float]] = None
+        self.last_actual_q_post_exec: Optional[List[float]] = None
+        self.last_position_error_rad: Optional[List[float]] = None
+
     # ── Connection ───────────────────────────────────────────────
 
     def connect(self, timeout: float = 10.0) -> bool:
@@ -1232,6 +1237,52 @@ class URRTDEController:
             self._teardown_ctrl()
             self.reconnect_receive()
             self.last_error = ""
+
+            # ── Position verification ───────────────────────────────
+            # Read the robot's actual joint positions after trajectory
+            # completion and compare to the planned final waypoint.
+            # This detects positional error from servoJ dynamics
+            # (lookahead smoothing, deceleration, timing).
+            target_final = list(positions[-1])
+            self.last_target_q = target_final
+            self.last_actual_q_post_exec = None
+            self.last_position_error_rad = None
+
+            actual_q = self.get_actual_q()
+            if actual_q is not None:
+                self.last_actual_q_post_exec = actual_q
+                errors = [actual_q[j] - target_final[j]
+                          for j in range(len(target_final))]
+                self.last_position_error_rad = errors
+                rss_deg = (
+                    sum(e ** 2 for e in errors) ** 0.5
+                ) * 180.0 / 3.141592653589793
+                max_err_deg = max(
+                    abs(e) for e in errors
+                ) * 180.0 / 3.141592653589793
+                if logger:
+                    err_mdeg = [
+                        round(e * 180000.0 / 3.141592653589793, 1)
+                        for e in errors
+                    ]
+                    logger.info(
+                        f"Position verification [{self.robot_name}]: "
+                        f"error per joint (mDeg): {err_mdeg}  "
+                        f"RSS={rss_deg*1000:.1f}mDeg  "
+                        f"max={max_err_deg*1000:.1f}mDeg"
+                    )
+                    if rss_deg > 0.5:
+                        logger.warn(
+                            f"⚠ LARGE position error on "
+                            f"{self.robot_name}: {rss_deg:.2f}° — "
+                            f"jumps expected at next trajectory start"
+                        )
+            elif logger:
+                logger.warn(
+                    f"Could not read actual position on "
+                    f"{self.robot_name} after trajectory — "
+                    f"recv interface not healthy"
+                )
 
             # ── Timing summary ──────────────────────────────────────
             wall_total = _time.monotonic() - wall_start

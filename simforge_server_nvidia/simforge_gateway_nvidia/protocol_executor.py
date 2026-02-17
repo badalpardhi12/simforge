@@ -11,6 +11,7 @@ Orchestrates:
 
 import asyncio
 import json
+import math
 import time
 import traceback
 from typing import Optional
@@ -161,6 +162,7 @@ class ProtocolExecutor:
         completed = 0
         ik_failed = 0
         exec_failed = 0
+        position_errors = []  # RSS position error (deg) per pose
 
         current_joints = (
             self._js_mgr.robot_states[robot_name].joint_positions
@@ -275,9 +277,9 @@ class ProtocolExecutor:
                 ik_failed += 1
                 continue
 
-            # Update start joints for next segment
+            # Planned final position (fallback if actual read fails)
             last_pt = ros_traj.joint_trajectory.points[-1]
-            current_joints = list(last_pt.positions)
+            planned_final = list(last_pt.positions)
 
             self._log.info(
                 f"  [{i+1}/{total}] planned "
@@ -343,6 +345,43 @@ class ProtocolExecutor:
 
             if ok:
                 completed += 1
+
+                # ── Position verification & current_joints update ─
+                # Use the robot's ACTUAL post-execution position as
+                # the start for the next trajectory, eliminating the
+                # jump caused by planning from the (imprecise) last
+                # planned waypoint.
+                actual_q = self._executor.get_actual_position(
+                    robot_name,
+                )
+                if actual_q is not None:
+                    current_joints = list(actual_q)
+                    # Log error between planned and actual
+                    errors_deg = [
+                        (actual_q[j] - planned_final[j])
+                        * 180.0 / math.pi
+                        for j in range(len(planned_final))
+                    ]
+                    rss_deg = math.sqrt(
+                        sum(e ** 2 for e in errors_deg)
+                    )
+                    position_errors.append(rss_deg)
+                    self._log.info(
+                        f"  [{i+1}/{total}] position error "
+                        f"{pose_name}: "
+                        f"RSS={rss_deg*1000:.0f}mDeg  "
+                        f"per-joint(mDeg)="
+                        f"{[round(e*1000,1) for e in errors_deg]}"
+                    )
+                else:
+                    # Fallback: use planned final (old behaviour)
+                    current_joints = list(planned_final)
+                    self._log.warn(
+                        f"  [{i+1}/{total}] could not read actual "
+                        f"position — using planned final as start "
+                        f"for next segment"
+                    )
+
                 self._log.info(
                     f"  [{i+1}/{total}] \u2713 {pose_name}"
                 )
@@ -360,6 +399,14 @@ class ProtocolExecutor:
                     f"  [{i+1}/{total}] \u2717 exec failed "
                     f"{pose_name}"
                 )
+                # Even on failure, update current_joints from actual
+                # position so the next pose starts from the right
+                # place (the robot may have partially executed).
+                actual_q = self._executor.get_actual_position(
+                    robot_name,
+                )
+                if actual_q is not None:
+                    current_joints = list(actual_q)
 
         # ── Optional home-after ──────────────────────────────────
         if go_home_after and completed > 0 and not self.stop_requested:
@@ -382,6 +429,23 @@ class ProtocolExecutor:
             summary_parts.append(f"{ik_failed} IK/plan failed")
         if exec_failed:
             summary_parts.append(f"{exec_failed} execution failed")
+
+        # Position accuracy stats
+        if position_errors:
+            avg_err = sum(position_errors) / len(position_errors)
+            max_err = max(position_errors)
+            summary_parts.append(
+                f"accuracy: avg={avg_err*1000:.0f}mDeg "
+                f"max={max_err*1000:.0f}mDeg"
+            )
+            self._log.info(
+                f"Position accuracy summary for {robot_name}: "
+                f"{len(position_errors)} measurements, "
+                f"avg RSS error={avg_err*1000:.1f}mDeg, "
+                f"max RSS error={max_err*1000:.1f}mDeg, "
+                f"all errors(mDeg)="
+                f"{[round(e*1000,1) for e in position_errors]}"
+            )
 
         hardware_issues = self._detect_hardware_issues()
         if hardware_issues:

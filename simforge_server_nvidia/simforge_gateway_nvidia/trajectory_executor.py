@@ -282,7 +282,33 @@ class TrajectoryExecutor:
             ),
         )
 
+        # After successful servoJ, publish the robot's ACTUAL final
+        # position to /joint_states so the sim model snaps to the
+        # real-world position (eliminating visual jumps).
+        if result and self._js_mgr is not None:
+            actual_q = rtde.last_actual_q_post_exec
+            if actual_q is not None:
+                self._js_mgr.publish_positions(robot_name, actual_q)
+                self._log.info(
+                    f"Published actual post-exec position for "
+                    f"{robot_name} to /joint_states"
+                )
+
         return result
+
+    # ── Actual position after execution ──────────────────────────
+
+    def get_actual_position(self, robot_name: str):
+        """Return the actual joint position after last RTDE execution.
+
+        Returns None if RTDE not available or position not read.
+        """
+        if not RTDE_AVAILABLE:
+            return None
+        rtde = self._rtde.get(robot_name)
+        if rtde is None:
+            return None
+        return rtde.last_actual_q_post_exec
 
     # ── ROS2 FollowJointTrajectory execution ─────────────────────
 
