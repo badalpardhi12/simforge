@@ -59,6 +59,17 @@ class URRTDEController:
                 f"(timeout {timeout}s)..."
             )
 
+        # Dispose of any previous (dead) receive interface before
+        # creating a fresh one.  The C++ destructor can segfault on
+        # a corrupted object, so disconnect first and leak if needed.
+        if self._recv is not None:
+            try:
+                self._recv.disconnect()
+            except Exception:
+                pass
+            self._recv = None
+            self._recv_healthy = False
+
         # RTDEReceiveInterface() blocks on TCP connect with no
         # timeout parameter.  Run it in a daemon thread so we can
         # enforce our own deadline and avoid hanging the gateway
@@ -222,10 +233,16 @@ class URRTDEController:
 
     @property
     def is_connected(self) -> bool:
-        return (
-            self._connected
-            and self._recv is not None
-        )
+        if not self._connected or self._recv is None:
+            return False
+        try:
+            if not self._recv.isConnected():
+                self._recv_healthy = False
+                return False
+        except Exception:
+            self._recv_healthy = False
+            return False
+        return True
 
     def _teardown_ctrl(self) -> None:
         """Forcibly tear down the RTDE control interface.
@@ -281,6 +298,26 @@ class URRTDEController:
         # Pre-check: refuse if robot is not in a safe state.
         # The recv interface may have died (common after mode switch),
         # so try to reconnect it first for the safety check.
+        #
+        # Active liveness probe: the C++ background recv thread sets
+        # isConnected()=false on "End of file", but our Python
+        # _recv_healthy flag stays True because getActualQ() returns
+        # stale cached data without throwing.  Explicitly check the
+        # C++ flag so we don't skip the reconnect and proceed with
+        # stale safety data.
+        if self._recv is not None and self._recv_healthy:
+            try:
+                if not self._recv.isConnected():
+                    if self.logger:
+                        self.logger.warning(
+                            f"RTDE recv for {self.robot_name} reports "
+                            f"disconnected (C++ isConnected=false) "
+                            f"— forcing reconnect"
+                        )
+                    self._recv_healthy = False
+            except Exception:
+                self._recv_healthy = False
+
         if self._recv is not None and not self._recv_healthy:
             self.reconnect_receive()
 
@@ -384,34 +421,52 @@ class URRTDEController:
         # rate to 21-56 Hz.  With FLAG_NO_WAIT, servoJ() returns
         # immediately and our Python timing loop handles pacing.
         # moveJ() still blocks correctly via its own isSteady() loop.
-        try:
-            _flags = (
-                rtde_control.RTDEControlInterface.FLAG_UPLOAD_SCRIPT
-                | rtde_control.RTDEControlInterface.FLAG_NO_WAIT
-            )
-            self._ctrl = rtde_control.RTDEControlInterface(
-                self.ip, frequency=-1.0, flags=_flags,
-            )
-            # Clear any stale error from previous failures so
-            # pre-flight checks and _detect_hardware_issues() don't
-            # report a false positive on the next protocol run.
-            self.last_error = ""
-            if self.logger:
-                self.logger.info(
-                    f"RTDE control interface created for "
-                    f"{self.robot_name} (FLAG_NO_WAIT)"
+        #
+        # Retry once after a brief delay: the RTDEControlInterface
+        # constructor can fail transiently ("Failed to start control
+        # script") when the robot's RTDE server is recovering from a
+        # dropped connection.  A single retry after 2 s handles this
+        # common race without masking genuine configuration errors.
+        _flags = (
+            rtde_control.RTDEControlInterface.FLAG_UPLOAD_SCRIPT
+            | rtde_control.RTDEControlInterface.FLAG_NO_WAIT
+        )
+        last_err = None
+        for attempt in range(2):
+            try:
+                self._ctrl = rtde_control.RTDEControlInterface(
+                    self.ip, frequency=-1.0, flags=_flags,
                 )
-            return True
-        except Exception as e:
-            self._ctrl = None
-            msg = (
-                f"Failed to create RTDE control interface "
-                f"for {self.robot_name}: {e}"
-            )
-            self.last_error = msg
-            if self.logger:
-                self.logger.error(msg)
-            return False
+                # Clear any stale error from previous failures so
+                # pre-flight checks and _detect_hardware_issues() don't
+                # report a false positive on the next protocol run.
+                self.last_error = ""
+                if self.logger:
+                    self.logger.info(
+                        f"RTDE control interface created for "
+                        f"{self.robot_name} (FLAG_NO_WAIT)"
+                    )
+                return True
+            except Exception as e:
+                self._ctrl = None
+                last_err = e
+                if attempt == 0:
+                    if self.logger:
+                        self.logger.warning(
+                            f"RTDE control interface attempt 1 "
+                            f"failed for {self.robot_name}: {e} "
+                            f"— retrying in 2 s"
+                        )
+                    _time.sleep(2.0)
+
+        msg = (
+            f"Failed to create RTDE control interface "
+            f"for {self.robot_name}: {last_err}"
+        )
+        self.last_error = msg
+        if self.logger:
+            self.logger.error(msg)
+        return False
 
     # ── Safety state ─────────────────────────────────────────────
 
@@ -444,6 +499,9 @@ class URRTDEController:
         """
         try:
             if self._recv is not None:
+                if not self._recv.isConnected():
+                    self._recv_healthy = False
+                    return -1
                 return self._recv.getSafetyMode()
         except Exception:
             pass
@@ -453,6 +511,9 @@ class URRTDEController:
         """Check if the robot is in a protective stop state."""
         try:
             if self._recv is not None and self._recv_healthy:
+                if not self._recv.isConnected():
+                    self._recv_healthy = False
+                    return False
                 return self._recv.isProtectiveStopped()
         except Exception:
             pass
@@ -474,6 +535,9 @@ class URRTDEController:
         """Check if the robot is in an emergency stop state."""
         try:
             if self._recv is not None and self._recv_healthy:
+                if not self._recv.isConnected():
+                    self._recv_healthy = False
+                    return False
                 return self._recv.isEmergencyStopped()
         except Exception:
             pass
@@ -555,6 +619,9 @@ class URRTDEController:
         """
         try:
             if self._recv is not None and self._recv_healthy:
+                if not self._recv.isConnected():
+                    self._recv_healthy = False
+                    return -1
                 return self._recv.getRobotMode()
         except Exception:
             pass
@@ -566,6 +633,13 @@ class URRTDEController:
         """Return current joint positions (radians) or None."""
         try:
             if self._recv is not None and self._recv_healthy:
+                # The C++ background thread sets isConnected()=false
+                # on "End of file", but getActualQ() still returns
+                # stale cached data without throwing.  Check the C++
+                # connection flag to catch this silently-dead state.
+                if not self._recv.isConnected():
+                    self._recv_healthy = False
+                    return None
                 q = list(self._recv.getActualQ())
                 return q
         except Exception:
@@ -581,6 +655,9 @@ class URRTDEController:
         """
         try:
             if self._recv is not None and self._recv_healthy:
+                if not self._recv.isConnected():
+                    self._recv_healthy = False
+                    return None
                 return list(self._recv.getActualTCPPose())
         except Exception:
             self._recv_healthy = False
@@ -590,6 +667,9 @@ class URRTDEController:
         """Return current joint velocities (rad/s) or None."""
         try:
             if self._recv is not None and self._recv_healthy:
+                if not self._recv.isConnected():
+                    self._recv_healthy = False
+                    return None
                 return list(self._recv.getActualQd())
         except Exception:
             self._recv_healthy = False
