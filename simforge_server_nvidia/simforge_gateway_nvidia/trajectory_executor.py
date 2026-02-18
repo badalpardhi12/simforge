@@ -163,6 +163,10 @@ class TrajectoryExecutor:
         if is_real and RTDE_AVAILABLE and robot_name in self._rtde:
             rtde = self._rtde[robot_name]
             if not rtde.is_connected:
+                self._log.info(
+                    f"RTDE not connected for {robot_name} "
+                    f"— connecting for home moveJ fallback…"
+                )
                 rtde.connect()
             if rtde.is_connected:
                 self._log.warn(
@@ -192,6 +196,18 @@ class TrajectoryExecutor:
                             f"(attempt {attempt + 1}/3), retrying..."
                         )
                 return ok
+            else:
+                self._log.warn(
+                    f"RTDE moveJ fallback skipped for {robot_name} "
+                    f"— is_connected=False after connect attempt"
+                )
+        else:
+            self._log.info(
+                f"Home moveJ fallback not available for "
+                f"{robot_name}: is_real={is_real}, "
+                f"RTDE_AVAILABLE={RTDE_AVAILABLE}, "
+                f"in_rtde={robot_name in self._rtde}"
+            )
         # Sim fallback handled by caller (needs planner)
         return False
 

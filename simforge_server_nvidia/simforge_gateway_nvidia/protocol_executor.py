@@ -132,6 +132,40 @@ class ProtocolExecutor:
             f"home_after={go_home_after})"
         )
 
+        # ── Ensure the node's _current_mode matches the protocol's ──
+        # The trajectory executor and hardware-fault detection read
+        # self._node._current_mode to decide whether to use RTDE or
+        # ROS2 actions.  After a container restart _current_mode
+        # defaults to "simulation" even if the client sends
+        # mode="both".  Without this, execute() dispatches to the
+        # ROS2 FollowJointTrajectory action instead of RTDE servoJ,
+        # and the moveJ fallback in execute_home() is skipped.
+        prev_mode = getattr(self._node, '_current_mode', 'simulation')
+        if prev_mode != mode:
+            self._log.info(
+                f"Updating node _current_mode: "
+                f"{prev_mode!r} → {mode!r}"
+            )
+            self._node._current_mode = mode
+
+        # ── Ensure RTDE is connected when mode requires real ─────
+        if mode in ("real", "both") and RTDE_AVAILABLE:
+            rtde = self._executor._rtde.get(robot_name)
+            if rtde is not None and not rtde.is_connected:
+                self._log.info(
+                    f"Connecting RTDE to {robot_name} "
+                    f"(protocol requires mode={mode})…"
+                )
+                loop = asyncio.get_event_loop()
+                ok = await loop.run_in_executor(
+                    None, rtde.connect,
+                )
+                if not ok:
+                    self._log.warn(
+                        f"RTDE connect failed for {robot_name} "
+                        f"— will retry in pre-flight"
+                    )
+
         # ── Optional home-before ─────────────────────────────────
         if go_home_before:
             home_ok, home_err = await self._home_if_needed(
