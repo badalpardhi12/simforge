@@ -976,16 +976,47 @@ class ProtocolExecutor:
                 robot_mode = -1
 
             if robot_mode == 7:
-                # Robot is RUNNING again!
-                # Clear the stale last_error so it doesn't trigger
-                # false positives in _detect_hardware_issues()
-                rtde.last_error = ""
-                self._log.info(
-                    f"Recovery [{robot_name}]: robot mode = 7 "
-                    f"(RUNNING) — recovery successful "
-                    f"(attempt {attempt})"
-                )
-                return True
+                # Robot mode is RUNNING — now also verify the
+                # safety controller has cleared.  The UR can
+                # report mode 7 while the safety system is still
+                # in PROTECTIVE_STOP (different registers).
+                sm = rtde.get_safety_mode()
+                if sm in (
+                    rtde.SAFETY_MODE_NORMAL,
+                    rtde.SAFETY_MODE_REDUCED,
+                ):
+                    # Fully recovered — clear stale errors
+                    rtde.last_error = ""
+                    self._log.info(
+                        f"Recovery [{robot_name}]: robot mode=7, "
+                        f"safety_mode={sm} (NORMAL/REDUCED) — "
+                        f"recovery successful (attempt {attempt})"
+                    )
+                    return True
+                else:
+                    # Mode is 7 but safety hasn't cleared yet.
+                    # Common: UR briefly shows mode 7 while
+                    # still in protective stop.
+                    now = time.monotonic()
+                    if now - last_feedback >= feedback_interval:
+                        last_feedback = now
+                        sm_names = {
+                            1: "NORMAL", 2: "REDUCED",
+                            3: "PROTECTIVE_STOP", 4: "RECOVERY",
+                            5: "SAFEGUARD_STOP",
+                            6: "SYS_ESTOP", 7: "ROBOT_ESTOP",
+                            8: "VIOLATION", 9: "FAULT",
+                            12: "AUTO_SAFEGUARD",
+                        }
+                        sm_str = sm_names.get(
+                            sm, f"UNKNOWN({sm})"
+                        )
+                        self._log.info(
+                            f"Recovery [{robot_name}]: mode=7 "
+                            f"but safety_mode={sm_str} — "
+                            f"still waiting (attempt {attempt})"
+                        )
+                    continue  # keep polling
 
             # Not yet recovered — send periodic updates
             now = time.monotonic()
@@ -1064,19 +1095,40 @@ class ProtocolExecutor:
         Returns a list of issues.  Safeguard stops are reported but
         are NOT treated as fatal — the caller decides whether to
         pause or abort.
+
+        Uses ``get_safety_mode()`` for ALL checks because it does
+        NOT gate on ``_recv_healthy`` — during and after servoJ the
+        recv interface is alive but healthy-flag is False, so the
+        per-method checks (isProtectiveStopped, isEmergencyStopped)
+        would silently return False and miss real faults.
+
+        Does NOT use ``last_error`` — that reflects RTDE API state
+        (e.g. previous _ensure_ctrl failure), not the robot's live
+        safety state. Using it caused false-positive recovery loops
+        on every IK-failed pose.
         """
         issues = []
         mode = getattr(self._node, '_current_mode', 'simulation')
         if mode in ("real", "both"):
             for rn, rtde in self._executor._rtde.items():
-                if rtde.is_safeguard_stopped():
+                sm = rtde.get_safety_mode()
+                if sm in (
+                    rtde.SAFETY_MODE_SAFEGUARD_STOP,
+                    rtde.SAFETY_MODE_AUTO_SAFEGUARD_STOP,
+                ):
                     issues.append(f"{rn}:SAFEGUARD_STOP")
-                elif rtde.is_protective_stopped():
+                elif sm == rtde.SAFETY_MODE_PROTECTIVE_STOP:
                     issues.append(f"{rn}:PROTECTIVE_STOP")
-                elif rtde.is_emergency_stopped():
+                elif sm in (
+                    rtde.SAFETY_MODE_SYSTEM_EMERGENCY_STOP,
+                    rtde.SAFETY_MODE_ROBOT_EMERGENCY_STOP,
+                ):
                     issues.append(f"{rn}:EMERGENCY_STOP")
-                elif rtde.last_error:
-                    issues.append(f"{rn}:{rtde.last_error[:80]}")
+                elif sm == rtde.SAFETY_MODE_VIOLATION:
+                    issues.append(f"{rn}:SAFETY_VIOLATION")
+                elif sm == rtde.SAFETY_MODE_FAULT:
+                    issues.append(f"{rn}:SAFETY_FAULT")
+                # sm == NORMAL/REDUCED/-1/RECOVERY → no issue
         return issues
 
     def _has_fatal_hardware_issue(self, issues: list) -> bool:
