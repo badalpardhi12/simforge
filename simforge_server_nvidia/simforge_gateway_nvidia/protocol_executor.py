@@ -152,18 +152,46 @@ class ProtocolExecutor:
         # ── Pre-flight: check robot is controllable ──────────────
         if mode in ("real", "both") and RTDE_AVAILABLE:
             rtde = self._executor._rtde.get(robot_name)
-            if rtde is not None and rtde.last_error:
-                err = rtde.last_error
-                self._log.error(
-                    f"RTDE pre-flight failed for {robot_name}: {err}"
-                )
-                await self._send_error(
-                    client, request_id,
-                    f"Robot {robot_name} is not controllable: {err}. "
-                    f"Ensure the robot program is running on the "
-                    f"teach pendant."
-                )
-                return
+            if rtde is not None:
+                # Clear stale errors from any previous protocol run
+                # so we check the *current* robot state, not a cached
+                # failure message from a prior session.
+                rtde.last_error = ""
+
+                # Reconnect the receive interface if it's dead — it
+                # may have broken during a previous fault or servoJ.
+                if not rtde.is_connected:
+                    self._log.info(
+                        f"RTDE recv down for {robot_name} "
+                        f"— reconnecting for pre-flight…"
+                    )
+                    rtde.reconnect_receive()
+
+                # Live robot mode check (mode 7 = RUNNING)
+                try:
+                    robot_mode = (
+                        rtde._recv.getRobotMode()
+                        if rtde._recv else -1
+                    )
+                except Exception:
+                    robot_mode = -1
+
+                if robot_mode != 7 and robot_mode != -1:
+                    err = (
+                        f"Robot mode is {robot_mode} "
+                        f"(need 7/RUNNING). Start the robot "
+                        f"program on the teach pendant first."
+                    )
+                    self._log.error(
+                        f"RTDE pre-flight failed for "
+                        f"{robot_name}: {err}"
+                    )
+                    await self._send_error(
+                        client, request_id,
+                        f"Robot {robot_name} is not "
+                        f"controllable: {err}",
+                    )
+                    return
 
         # ── Ensure robot ready ───────────────────────────────────
         ready = await self._executor.ensure_robot_ready(
@@ -255,23 +283,70 @@ class ProtocolExecutor:
                         message="✓ Safeguard cleared — resuming…",
                     )
                 else:
-                    # Fatal (protective/emergency stop) — abort
-                    hw_abort = True
+                    # Fatal (protective/emergency stop, mode not
+                    # RUNNING, etc.) — pause and wait for the user
+                    # to reset the robot & put it back in remote
+                    # control, rather than aborting immediately.
                     self._log.error(
-                        f"Hardware fault: {', '.join(hw_issues)} "
-                        f"— aborting"
+                        f"Hardware fault at pose {i+1}: "
+                        f"{', '.join(hw_issues)} — pausing for "
+                        f"recovery (press Stop to abort)"
                     )
                     await self._send_feedback(
                         client, request_id, i, total,
-                        (i / max(total, 1)) * 100, "error",
+                        (i / max(total, 1)) * 100, "fault_paused",
                         message=(
-                            f"⚠ HARDWARE FAULT: "
-                            f"{', '.join(hw_issues)}. "
-                            f"Robot stopped — aborting protocol."
+                            f"⚠ HARDWARE FAULT at pose {i+1}/"
+                            f"{total}: {', '.join(hw_issues)}. "
+                            f"Reset the robot and put it back in "
+                            f"remote control — the protocol will "
+                            f"resume automatically. "
+                            f"Press Stop to abort."
                         ),
                     )
-                    self.stop_requested = True
-                    break
+
+                    recovered = await self._wait_for_robot_recovery(
+                        robot_name, client, request_id, i, total,
+                    )
+
+                    if recovered and not self.stop_requested:
+                        self._log.info(
+                            f"Robot {robot_name} recovered — "
+                            f"resuming protocol from pose "
+                            f"{i+1}/{total}"
+                        )
+                        await self._send_feedback(
+                            client, request_id, i, total,
+                            (i / max(total, 1)) * 100, "resuming",
+                            message=(
+                                f"✓ Robot recovered — resuming "
+                                f"from pose {i+1}/{total}…"
+                            ),
+                        )
+                        # Fall through to the planning step for
+                        # the current pose (do NOT break or skip)
+                    else:
+                        hw_abort = True
+                        reason = (
+                            "user stopped"
+                            if self.stop_requested
+                            else "recovery timed out"
+                        )
+                        self._log.error(
+                            f"Recovery failed ({reason}) — "
+                            f"aborting protocol at pose "
+                            f"{i+1}/{total}"
+                        )
+                        await self._send_feedback(
+                            client, request_id, i, total,
+                            (i / max(total, 1)) * 100, "error",
+                            message=(
+                                f"⚠ Protocol aborted at pose "
+                                f"{i+1}/{total}: {reason}."
+                            ),
+                        )
+                        self.stop_requested = True
+                        break
 
             # ── Plan ─────────────────────────────────────────────
             pct = (i / total) * 100
@@ -520,6 +595,95 @@ class ProtocolExecutor:
                 if idle_time > 0 and i < len(poses) - 1:
                     await asyncio.sleep(idle_time)
             else:
+                # ── Fault-aware recovery after exec failure ──────
+                # If execution failed due to a hardware fault (robot
+                # mode not RUNNING, protective stop, etc.), pause and
+                # wait for the user to reset the robot rather than
+                # just skipping this pose and letting the next
+                # iteration's hardware check abort the protocol.
+                if RTDE_AVAILABLE and not self.stop_requested:
+                    post_hw = self._detect_hardware_issues()
+                    if post_hw and self._has_fatal_hardware_issue(
+                        post_hw,
+                    ):
+                        self._log.error(
+                            f"  [{i+1}/{total}] exec failed "
+                            f"{pose_name} due to hardware fault: "
+                            f"{', '.join(post_hw)} — pausing for "
+                            f"recovery"
+                        )
+                        await self._send_feedback(
+                            client, request_id, i, total,
+                            (i / max(total, 1)) * 100,
+                            "fault_paused",
+                            message=(
+                                f"⚠ HARDWARE FAULT during pose "
+                                f"{i+1}/{total} ({pose_name}): "
+                                f"{', '.join(post_hw)}. "
+                                f"Reset the robot and put it back "
+                                f"in remote control — will retry "
+                                f"this pose automatically. "
+                                f"Press Stop to abort."
+                            ),
+                        )
+                        recovered = (
+                            await self._wait_for_robot_recovery(
+                                robot_name, client, request_id,
+                                i, total,
+                            )
+                        )
+                        if recovered and not self.stop_requested:
+                            self._log.info(
+                                f"Robot recovered — retrying pose "
+                                f"{i+1} ({pose_name})"
+                            )
+                            await self._send_feedback(
+                                client, request_id, i, total,
+                                (i / max(total, 1)) * 100,
+                                "resuming",
+                                message=(
+                                    f"✓ Robot recovered — retrying "
+                                    f"pose {i+1}/{total}…"
+                                ),
+                            )
+                            # Retry execution of the same trajectory
+                            ok = await self._executor.execute(
+                                robot_name, ros_traj,
+                                timeout=exec_timeout,
+                            )
+                            if ok:
+                                completed += 1
+                                actual_q = (
+                                    self._executor.get_actual_position(
+                                        robot_name,
+                                    )
+                                )
+                                if actual_q is not None:
+                                    current_joints = list(actual_q)
+                                else:
+                                    current_joints = list(
+                                        planned_final
+                                    )
+                                self._log.info(
+                                    f"  [{i+1}/{total}] ✓ "
+                                    f"{pose_name} (after recovery)"
+                                )
+                                await self._send_feedback(
+                                    client, request_id, i, total,
+                                    ((i + 1) / total) * 100,
+                                    "reached",
+                                    current_pose_name=pose_name,
+                                )
+                                if (idle_time > 0
+                                        and i < len(poses) - 1):
+                                    await asyncio.sleep(idle_time)
+                                continue  # next pose
+                            # Retry also failed — fall through
+                        else:
+                            hw_abort = True
+                            self.stop_requested = True
+                            break
+
                 exec_failed += 1
                 self._log.error(
                     f"  [{i+1}/{total}] \u2717 exec failed "
@@ -738,6 +902,119 @@ class ProtocolExecutor:
                 if not cleared:
                     return False
         return True
+
+    async def _wait_for_robot_recovery(
+        self,
+        robot_name: str,
+        client,
+        request_id: str,
+        pose_idx: int,
+        total: int,
+        poll_interval: float = 3.0,
+        feedback_interval: float = 15.0,
+    ) -> bool:
+        """Wait for the robot to recover from a hardware fault.
+
+        Polls the RTDE receive interface to detect when the robot
+        returns to mode 7 (RUNNING).  The user must:
+          1. Clear the fault on the teach pendant
+          2. Restart the robot program (put in remote control)
+
+        While waiting, periodic ``fault_paused`` feedback is sent to
+        the client so the WebSocket stays alive and the user sees
+        that the server is still listening.
+
+        Returns
+        -------
+        True  — robot recovered (mode 7, RTDE reconnected)
+        False — ``stop_requested`` was set or recovery failed
+        """
+        rtde = self._executor._rtde.get(robot_name)
+        if rtde is None:
+            return False
+
+        last_feedback = time.monotonic()
+        attempt = 0
+
+        while not self.stop_requested:
+            attempt += 1
+            await asyncio.sleep(poll_interval)
+
+            if self.stop_requested:
+                return False
+
+            # Try to reconnect the receive interface if it's dead
+            if not rtde.is_connected:
+                self._log.info(
+                    f"Recovery [{robot_name}]: RTDE recv down — "
+                    f"attempting reconnect (attempt {attempt})…"
+                )
+                ok = await asyncio.get_event_loop().run_in_executor(
+                    None, rtde.reconnect_receive,
+                )
+                if not ok:
+                    # Send periodic feedback so client stays alive
+                    now = time.monotonic()
+                    if now - last_feedback >= feedback_interval:
+                        last_feedback = now
+                        await self._send_feedback(
+                            client, request_id, pose_idx, total,
+                            (pose_idx / max(total, 1)) * 100,
+                            "fault_paused",
+                            message=(
+                                f"⏳ Waiting for {robot_name} to "
+                                f"come back online… (attempt "
+                                f"{attempt}, RTDE reconnect failed)"
+                            ),
+                        )
+                    continue
+
+            # Recv is connected — check robot mode
+            try:
+                robot_mode = rtde._recv.getRobotMode()
+            except Exception:
+                robot_mode = -1
+
+            if robot_mode == 7:
+                # Robot is RUNNING again!
+                # Clear the stale last_error so it doesn't trigger
+                # false positives in _detect_hardware_issues()
+                rtde.last_error = ""
+                self._log.info(
+                    f"Recovery [{robot_name}]: robot mode = 7 "
+                    f"(RUNNING) — recovery successful "
+                    f"(attempt {attempt})"
+                )
+                return True
+
+            # Not yet recovered — send periodic updates
+            now = time.monotonic()
+            if now - last_feedback >= feedback_interval:
+                last_feedback = now
+                mode_names = {
+                    0: "DISCONNECTED", 1: "CONFIRM_SAFETY",
+                    2: "BOOTING", 3: "POWER_OFF",
+                    4: "POWER_ON", 5: "IDLE",
+                    6: "BACKDRIVE", 7: "RUNNING",
+                }
+                mode_str = mode_names.get(robot_mode, f"UNKNOWN({robot_mode})")
+                self._log.info(
+                    f"Recovery [{robot_name}]: waiting… "
+                    f"robot_mode={mode_str} (attempt {attempt})"
+                )
+                await self._send_feedback(
+                    client, request_id, pose_idx, total,
+                    (pose_idx / max(total, 1)) * 100,
+                    "fault_paused",
+                    message=(
+                        f"⏳ Waiting for {robot_name} to recover: "
+                        f"mode={mode_str}. Reset the robot, start "
+                        f"the program, and put in remote control. "
+                        f"(attempt {attempt})"
+                    ),
+                )
+
+        return False  # stop_requested
 
     async def _home_if_needed(self, robot_name, cfg, mode):
         """Move the robot home if needed.

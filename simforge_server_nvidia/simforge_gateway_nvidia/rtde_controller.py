@@ -392,6 +392,10 @@ class URRTDEController:
             self._ctrl = rtde_control.RTDEControlInterface(
                 self.ip, frequency=-1.0, flags=_flags,
             )
+            # Clear any stale error from previous failures so
+            # pre-flight checks and _detect_hardware_issues() don't
+            # report a false positive on the next protocol run.
+            self.last_error = ""
             if self.logger:
                 self.logger.info(
                     f"RTDE control interface created for "

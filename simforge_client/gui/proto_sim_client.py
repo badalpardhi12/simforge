@@ -1133,6 +1133,8 @@ class ProtoSimClientFrame(wx.Frame):
 
                 if status == "paused":
                     label = message or "⏸ Safeguard stop — waiting…"
+                elif status == "fault_paused":
+                    label = message or "⚠ Hardware fault — waiting for recovery…"
                 elif status == "resuming":
                     label = message or "▶ Resuming…"
                 elif status == "planning":
@@ -1150,7 +1152,7 @@ class ProtoSimClientFrame(wx.Frame):
                 wx.CallAfter(self.progress_label.SetLabel, label)
 
                 # Log significant events
-                if status in ("paused", "resuming", "error"):
+                if status in ("paused", "fault_paused", "resuming", "error"):
                     self._log(label)
             
             # ── Decide: inline send vs chunked upload ────────────
@@ -1304,23 +1306,64 @@ class ProtoSimClientFrame(wx.Frame):
                         ).ShowModal()
                     wx.CallAfter(_show_sg_error)
                 else:
-                    # Fatal fault (protective/emergency stop)
-                    self._log("  ⛔ Protocol ABORTED due to hardware fault!")
-                    def _show_hw_error(issues=hw_issues, msg=response.get("message", "")):
+                    # Fatal fault — protocol either recovered and
+                    # continued, or was aborted after the user
+                    # pressed Stop during the recovery wait.
+                    completed = response.get('completed', 0)
+                    total_p = response.get('total', total_poses)
+                    stopped = response.get('stopped', False)
+
+                    if stopped:
+                        self._log(
+                            f"  ⛔ Protocol STOPPED after hardware "
+                            f"fault at {completed}/{total_p} poses"
+                        )
+                    else:
+                        self._log(
+                            f"  ⚠ Protocol completed with hardware "
+                            f"fault recovery: {completed}/{total_p}"
+                        )
+
+                    def _show_hw_error(
+                        issues=hw_issues,
+                        msg=response.get("message", ""),
+                        _completed=completed,
+                        _total=total_p,
+                        _stopped=stopped,
+                    ):
+                        if _stopped:
+                            title = "Robot Hardware Fault — Protocol Stopped"
+                            icon = wx.ICON_ERROR
+                            action = (
+                                f"The protocol was stopped at pose "
+                                f"{_completed}/{_total}.\n\n"
+                                "To resume from where you left off, "
+                                "reset the robot, put it back in remote "
+                                "control, and re-run the protocol.\n\n"
+                                "The server will automatically pause and "
+                                "wait for recovery if a fault occurs "
+                                "during execution."
+                            )
+                        else:
+                            title = "Hardware Fault Recovered"
+                            icon = wx.ICON_WARNING
+                            action = (
+                                f"The robot recovered automatically "
+                                f"and completed {_completed}/{_total} "
+                                f"poses."
+                            )
                         detail = (
-                            "The robot hit a protective stop or emergency "
-                            "stop during protocol execution.\n\n"
+                            "A hardware fault occurred during protocol "
+                            "execution.\n\n"
                             "Hardware faults:\n"
                             + "\n".join(f"  • {iss}" for iss in issues)
                             + "\n\n"
                             f"Server message:\n  {msg}\n\n"
-                            "Please check the robot teach pendant, clear "
-                            "the fault, and try again."
+                            + action
                         )
                         wx.MessageDialog(
-                            self, detail,
-                            "Robot Hardware Fault — Protocol Aborted",
-                            wx.OK | wx.ICON_ERROR,
+                            self, detail, title,
+                            wx.OK | icon,
                         ).ShowModal()
                     wx.CallAfter(_show_hw_error)
             elif response.get("stopped"):
