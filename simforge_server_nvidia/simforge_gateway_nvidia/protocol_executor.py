@@ -916,6 +916,12 @@ class ProtocolExecutor:
 
         last_feedback = time.monotonic()
         attempt = 0
+        # How many consecutive polls returned the same non-NORMAL
+        # safety mode despite the recv "being connected".  After a
+        # few identical stale reads, we force a reconnect to get
+        # fresh data from the UR controller.
+        stale_count = 0
+        last_sm = None
 
         while not self.stop_requested:
             attempt += 1
@@ -924,17 +930,40 @@ class ProtocolExecutor:
             if self.stop_requested:
                 return False
 
-            # Try to reconnect the receive interface if it's dead
-            if not rtde.is_connected:
+            loop = asyncio.get_event_loop()
+
+            # ── Ensure recv is alive ─────────────────────────────
+            # The ur_rtde C++ library caches register values
+            # internally.  After a recv disconnect the C++ object
+            # can return STALE cached data (e.g. safety_mode=3)
+            # instead of throwing, so `is_connected` stays True
+            # and the recovery loop never sees the real state.
+            #
+            # Fix: actively probe with getActualQ() — if it fails
+            # (returns None / throws), the recv is dead and we
+            # must reconnect to get fresh register data.
+            need_reconnect = not rtde.is_connected
+            if not need_reconnect:
+                # Probe: try a live read to detect stale C++ object
+                try:
+                    probe = await loop.run_in_executor(
+                        None, rtde.get_actual_q,
+                    )
+                    if probe is None:
+                        need_reconnect = True
+                except Exception:
+                    need_reconnect = True
+
+            if need_reconnect:
                 self._log.info(
-                    f"Recovery [{robot_name}]: RTDE recv down — "
-                    f"attempting reconnect (attempt {attempt})…"
+                    f"Recovery [{robot_name}]: RTDE recv "
+                    f"dead/stale — reconnecting "
+                    f"(attempt {attempt})…"
                 )
-                ok = await asyncio.get_event_loop().run_in_executor(
+                ok = await loop.run_in_executor(
                     None, rtde.reconnect_receive,
                 )
                 if not ok:
-                    # Send periodic feedback so client stays alive
                     now = time.monotonic()
                     if now - last_feedback >= feedback_interval:
                         last_feedback = now
@@ -949,70 +978,90 @@ class ProtocolExecutor:
                             ),
                         )
                     continue
+                # After reconnect, reset stale detection
+                stale_count = 0
+                last_sm = None
 
-            # Recv is connected — check robot mode
+            # ── Read robot state from (fresh) recv ───────────────
             try:
                 robot_mode = rtde._recv.getRobotMode()
             except Exception:
                 robot_mode = -1
 
-            if robot_mode == 7:
-                # Robot mode is RUNNING — now also verify the
-                # safety controller has cleared.  The UR can
-                # report mode 7 while the safety system is still
-                # in PROTECTIVE_STOP (different registers).
-                sm = rtde.get_safety_mode()
-                if sm in (
-                    rtde.SAFETY_MODE_NORMAL,
-                    rtde.SAFETY_MODE_REDUCED,
-                ):
-                    # Fully recovered — clear stale errors
-                    rtde.last_error = ""
-                    self._log.info(
-                        f"Recovery [{robot_name}]: robot mode=7, "
-                        f"safety_mode={sm} (NORMAL/REDUCED) — "
-                        f"recovery successful (attempt {attempt})"
-                    )
-                    return True
+            sm = rtde.get_safety_mode()
+
+            # Detect stale reads: if the safety mode is stuck at
+            # the same non-NORMAL value for several consecutive
+            # polls, force a reconnect.  The user has likely
+            # cleared the fault by now, but the dead C++ object
+            # keeps returning the old cached value.
+            if sm not in (
+                rtde.SAFETY_MODE_NORMAL,
+                rtde.SAFETY_MODE_REDUCED,
+            ):
+                if sm == last_sm:
+                    stale_count += 1
                 else:
-                    # Mode is 7 but safety hasn't cleared yet.
-                    # Common: UR briefly shows mode 7 while
-                    # still in protective stop.
-                    now = time.monotonic()
-                    if now - last_feedback >= feedback_interval:
-                        last_feedback = now
-                        sm_names = {
-                            1: "NORMAL", 2: "REDUCED",
-                            3: "PROTECTIVE_STOP", 4: "RECOVERY",
-                            5: "SAFEGUARD_STOP",
-                            6: "SYS_ESTOP", 7: "ROBOT_ESTOP",
-                            8: "VIOLATION", 9: "FAULT",
-                            12: "AUTO_SAFEGUARD",
-                        }
-                        sm_str = sm_names.get(
-                            sm, f"UNKNOWN({sm})"
-                        )
-                        self._log.info(
-                            f"Recovery [{robot_name}]: mode=7 "
-                            f"but safety_mode={sm_str} — "
-                            f"still waiting (attempt {attempt})"
-                        )
-                    continue  # keep polling
+                    stale_count = 1
+                    last_sm = sm
+
+                # After 3 identical non-NORMAL reads (~9 s), the
+                # value is likely stale — force a fresh connection.
+                if stale_count >= 3:
+                    self._log.info(
+                        f"Recovery [{robot_name}]: safety_mode "
+                        f"stuck at {sm} for {stale_count} reads "
+                        f"— forcing recv reconnect"
+                    )
+                    await loop.run_in_executor(
+                        None, rtde.reconnect_receive,
+                    )
+                    stale_count = 0
+                    continue  # re-read with fresh connection
+            else:
+                stale_count = 0
+                last_sm = None
+
+            if robot_mode == 7 and sm in (
+                rtde.SAFETY_MODE_NORMAL,
+                rtde.SAFETY_MODE_REDUCED,
+            ):
+                # Fully recovered — clear stale errors
+                rtde.last_error = ""
+                self._log.info(
+                    f"Recovery [{robot_name}]: robot mode=7, "
+                    f"safety_mode={sm} (NORMAL/REDUCED) — "
+                    f"recovery successful (attempt {attempt})"
+                )
+                return True
 
             # Not yet recovered — send periodic updates
             now = time.monotonic()
             if now - last_feedback >= feedback_interval:
                 last_feedback = now
+                sm_names = {
+                    1: "NORMAL", 2: "REDUCED",
+                    3: "PROTECTIVE_STOP", 4: "RECOVERY",
+                    5: "SAFEGUARD_STOP",
+                    6: "SYS_ESTOP", 7: "ROBOT_ESTOP",
+                    8: "VIOLATION", 9: "FAULT",
+                    12: "AUTO_SAFEGUARD",
+                }
+                sm_str = sm_names.get(sm, f"UNKNOWN({sm})")
                 mode_names = {
                     0: "DISCONNECTED", 1: "CONFIRM_SAFETY",
                     2: "BOOTING", 3: "POWER_OFF",
                     4: "POWER_ON", 5: "IDLE",
                     6: "BACKDRIVE", 7: "RUNNING",
                 }
-                mode_str = mode_names.get(robot_mode, f"UNKNOWN({robot_mode})")
+                mode_str = mode_names.get(
+                    robot_mode, f"UNKNOWN({robot_mode})"
+                )
                 self._log.info(
                     f"Recovery [{robot_name}]: waiting… "
-                    f"robot_mode={mode_str} (attempt {attempt})"
+                    f"robot_mode={mode_str}, "
+                    f"safety_mode={sm_str} "
+                    f"(attempt {attempt})"
                 )
                 await self._send_feedback(
                     client, request_id, pose_idx, total,
@@ -1020,9 +1069,9 @@ class ProtocolExecutor:
                     "fault_paused",
                     message=(
                         f"⏳ Waiting for {robot_name} to recover: "
-                        f"mode={mode_str}. Reset the robot, start "
-                        f"the program, and put in remote control. "
-                        f"(attempt {attempt})"
+                        f"mode={mode_str}, safety={sm_str}. "
+                        f"Reset the robot and put it back in "
+                        f"remote control. (attempt {attempt})"
                     ),
                 )
 
