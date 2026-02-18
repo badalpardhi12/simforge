@@ -1153,17 +1153,94 @@ class ProtoSimClientFrame(wx.Frame):
                 if status in ("paused", "resuming", "error"):
                     self._log(label)
             
-            # Send pre-computed poses to server
-            response = await self._client.call_rpc("run_proto_sim", {
+            # ── Decide: inline send vs chunked upload ────────────
+            # For small protocols (≤500 poses, ≈140 KiB) send inline
+            # in a single RPC.  For large protocols use the chunked
+            # upload flow to stay well within WebSocket frame limits
+            # and to show upload progress to the user.
+            CHUNK_THRESHOLD = 500   # poses
+            CHUNK_SIZE      = 500   # poses per chunk
+
+            common_params = {
                 "robot_name": robot,
-                "poses": poses_data,  # Pre-computed poses in base_link frame
                 "idle_time": params.idle_time,
                 "mode": mode,
                 "move_speed": move_speed,
                 "go_home_before": True,
                 "go_home_after": True,
-            }, inactivity_timeout=INACTIVITY_TIMEOUT,
-               feedback_callback=_on_feedback)
+            }
+
+            if total_poses <= CHUNK_THRESHOLD:
+                # ── Small protocol: single RPC ───────────────────
+                response = await self._client.call_rpc("run_proto_sim", {
+                    **common_params,
+                    "poses": poses_data,
+                }, inactivity_timeout=INACTIVITY_TIMEOUT,
+                   feedback_callback=_on_feedback)
+            else:
+                # ── Large protocol: chunked upload ───────────────
+                self._log(
+                    f"Large protocol ({total_poses} poses) — "
+                    f"using chunked upload ({CHUNK_SIZE} poses/chunk)"
+                )
+                wx.CallAfter(
+                    self.progress_label.SetLabel,
+                    f"Uploading poses… 0/{total_poses}",
+                )
+
+                # 1. Initialise upload session
+                init_resp = await self._client.call_rpc(
+                    "proto_upload_init",
+                    {**common_params, "total_poses": total_poses},
+                    timeout=30.0,
+                )
+                if not init_resp.get("success"):
+                    raise RuntimeError(
+                        f"Upload init failed: "
+                        f"{init_resp.get('error', init_resp.get('message', '?'))}"
+                    )
+                upload_id = init_resp["upload_id"]
+                self._log(f"Upload session {upload_id} created")
+
+                # 2. Send pose chunks
+                for chunk_start in range(0, total_poses, CHUNK_SIZE):
+                    chunk_end = min(chunk_start + CHUNK_SIZE, total_poses)
+                    chunk = poses_data[chunk_start:chunk_end]
+
+                    chunk_resp = await self._client.call_rpc(
+                        "proto_upload_chunk",
+                        {"upload_id": upload_id, "poses": chunk},
+                        timeout=30.0,
+                    )
+                    if not chunk_resp.get("success"):
+                        raise RuntimeError(
+                            f"Upload chunk failed: "
+                            f"{chunk_resp.get('error', '?')}"
+                        )
+                    received = chunk_resp.get("received", chunk_end)
+                    pct = chunk_resp.get("progress_percent", 0)
+                    wx.CallAfter(
+                        self.progress_label.SetLabel,
+                        f"Uploading poses… {received}/{total_poses} "
+                        f"({pct:.0f}%)",
+                    )
+
+                self._log(
+                    f"All {total_poses} poses uploaded — "
+                    f"starting execution"
+                )
+                wx.CallAfter(
+                    self.progress_label.SetLabel,
+                    "Upload complete — starting execution…",
+                )
+
+                # 3. Execute the uploaded protocol
+                response = await self._client.call_rpc(
+                    "proto_upload_execute",
+                    {"upload_id": upload_id},
+                    inactivity_timeout=INACTIVITY_TIMEOUT,
+                    feedback_callback=_on_feedback,
+                )
             
             if response.get("success"):
                 completed = response.get('completed', 0)

@@ -243,6 +243,7 @@ class CommandGatewayNode(Node):
         self.ws_server = await serve(
             self._handle_client, self.ws_host, self.ws_port,
             ping_interval=30, ping_timeout=300,
+            max_size=2**26,  # 64 MiB — large protocol uploads
         )
         self.get_logger().info("WebSocket server started")
 

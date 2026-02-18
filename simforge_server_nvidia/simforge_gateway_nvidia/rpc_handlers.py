@@ -9,6 +9,7 @@ import json
 import os
 import time
 import traceback
+import uuid
 from typing import Any, Dict, Optional
 
 import rclpy
@@ -46,6 +47,9 @@ class RPCHandlers:
         self._proto = proto_exec
         self._js_mgr = js_mgr
 
+        # Pending chunked uploads: upload_id -> {poses, settings, ...}
+        self._pending_uploads: Dict[str, Dict] = {}
+
     # ── Dispatch ─────────────────────────────────────────────────
 
     async def dispatch(self, client, msg: dict):
@@ -70,6 +74,15 @@ class RPCHandlers:
             elif method == "stop_proto_sim":
                 self._proto.stop_requested = True
                 result = {"success": True, "message": "Stop requested"}
+            elif method == "proto_upload_init":
+                result = self.proto_upload_init(client, params)
+            elif method == "proto_upload_chunk":
+                result = self.proto_upload_chunk(client, params)
+            elif method == "proto_upload_execute":
+                asyncio.ensure_future(
+                    self.proto_upload_execute(client, rid, params)
+                )
+                return  # result sent asynchronously
             elif method == "move_home":
                 result = await self.move_home(params)
             elif method == "check_collision":
@@ -252,6 +265,117 @@ class RPCHandlers:
                 "message": "Simulation mode ready (cuRobo backend)",
                 "can_retry": False,
             }
+
+    # ── Chunked upload protocol ───────────────────────────────
+
+    def proto_upload_init(self, client, params) -> dict:
+        """Initialise a chunked pose upload session.
+
+        The client calls this before sending pose chunks for large
+        protocols that would exceed the WebSocket message-size limit
+        if sent in a single RPC.
+
+        Returns an ``upload_id`` that the client includes in each
+        subsequent ``proto_upload_chunk`` and ``proto_upload_execute``
+        call.
+        """
+        upload_id = uuid.uuid4().hex[:12]
+        total_poses = params.get("total_poses", 0)
+        self._pending_uploads[upload_id] = {
+            "client_id": client.client_id,
+            "robot_name": params.get("robot_name", list(ROBOT_CONFIG.keys())[0]),
+            "total_poses": total_poses,
+            "idle_time": params.get("idle_time", 2.0),
+            "mode": params.get("mode", "simulation"),
+            "move_speed": params.get("move_speed", self._node.max_velocity_scaling),
+            "go_home_before": params.get("go_home_before", False),
+            "go_home_after": params.get("go_home_after", False),
+            "poses": [],
+            "received": 0,
+            "created_at": time.monotonic(),
+        }
+        self._log.info(
+            f"Chunked upload {upload_id} initialised: "
+            f"{total_poses} poses for "
+            f"{self._pending_uploads[upload_id]['robot_name']}"
+        )
+        return {
+            "success": True,
+            "upload_id": upload_id,
+            "message": f"Upload session created for {total_poses} poses",
+        }
+
+    def proto_upload_chunk(self, client, params) -> dict:
+        """Receive a chunk of poses for a pending upload session."""
+        upload_id = params.get("upload_id", "")
+        upload = self._pending_uploads.get(upload_id)
+        if upload is None:
+            return {"success": False, "error": f"Unknown upload_id: {upload_id}"}
+        if upload["client_id"] != client.client_id:
+            return {"success": False, "error": "Upload belongs to another client"}
+
+        poses = params.get("poses", [])
+        upload["poses"].extend(poses)
+        upload["received"] += len(poses)
+
+        total = upload["total_poses"]
+        received = upload["received"]
+        pct = (received / total * 100) if total else 0
+        self._log.info(
+            f"Chunk upload {upload_id}: "
+            f"{received}/{total} poses ({pct:.0f}%)"
+        )
+        return {
+            "success": True,
+            "received": received,
+            "total": total,
+            "progress_percent": round(pct, 1),
+        }
+
+    async def proto_upload_execute(self, client, request_id, params):
+        """Execute a previously uploaded protocol.
+
+        Assembles all uploaded pose chunks and delegates to
+        :meth:`run_proto_sim` with the assembled pose list.
+        """
+        upload_id = params.get("upload_id", "")
+        upload = self._pending_uploads.pop(upload_id, None)
+        if upload is None:
+            await self._send_error(
+                client, request_id,
+                f"Unknown or expired upload_id: {upload_id}",
+            )
+            return
+        if upload["client_id"] != client.client_id:
+            await self._send_error(
+                client, request_id, "Upload belongs to another client",
+            )
+            return
+
+        total = upload["total_poses"]
+        received = upload["received"]
+        if received != total:
+            self._log.warn(
+                f"Upload {upload_id}: expected {total} poses, "
+                f"received {received} — proceeding with {received}"
+            )
+
+        self._log.info(
+            f"Executing chunked upload {upload_id}: "
+            f"{received} poses for {upload['robot_name']}"
+        )
+
+        # Build a synthetic params dict matching run_proto_sim format
+        assembled_params = {
+            "robot_name": upload["robot_name"],
+            "poses": upload["poses"],
+            "idle_time": upload["idle_time"],
+            "mode": upload["mode"],
+            "move_speed": upload["move_speed"],
+            "go_home_before": upload["go_home_before"],
+            "go_home_after": upload["go_home_after"],
+        }
+        await self.run_proto_sim(client, request_id, assembled_params)
 
     # ── run_proto_sim ────────────────────────────────────────────
 

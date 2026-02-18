@@ -223,14 +223,21 @@ class SimforgeClient:
             try:
                 # Try with ping parameters (websockets 10.x style)
                 # Use long ping_timeout to handle slow MoveIt planning operations
+                # max_size=64 MiB to accept large server responses
                 self._ws = await asyncio.wait_for(
-                    ws_connect(self.server_uri, ping_interval=30, ping_timeout=300, **connect_kwargs),
+                    ws_connect(
+                        self.server_uri,
+                        ping_interval=30,
+                        ping_timeout=300,
+                        max_size=2**26,
+                        **connect_kwargs,
+                    ),
                     timeout=self.config.connection_timeout_sec
                 )
             except TypeError:
                 # Fall back to basic connection (older or newer API)
                 self._ws = await asyncio.wait_for(
-                    ws_connect(self.server_uri, **connect_kwargs),
+                    ws_connect(self.server_uri, max_size=2**26, **connect_kwargs),
                     timeout=self.config.connection_timeout_sec
                 )
             
