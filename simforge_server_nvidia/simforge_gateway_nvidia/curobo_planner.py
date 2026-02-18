@@ -243,10 +243,11 @@ class CuroboPlanner:
                 joint_names=cfg["joints"],
             )
             kin_state = mg.compute_kinematics(js)
-            # kin_state.ee_pos_seq: shape (batch, traj_pts, 3)
-            # kin_state.ee_quat_seq: shape (batch, traj_pts, 4) — [w,x,y,z]
-            pos = kin_state.ee_pos_seq[0, 0].cpu().tolist()
-            quat = kin_state.ee_quat_seq[0, 0].cpu().tolist()
+            # ee_pos_seq may be (batch, 3) or (batch, traj_pts, 3)
+            # depending on cuRobo version / call path.  Flatten to
+            # be safe and take the first 3 / 4 elements.
+            pos = kin_state.ee_pos_seq.reshape(-1)[:3].cpu().tolist()
+            quat = kin_state.ee_quat_seq.reshape(-1)[:4].cpu().tolist()
             return pos, quat
         except Exception as e:
             self._log.error(
