@@ -243,10 +243,10 @@ class CuroboPlanner:
                 joint_names=cfg["joints"],
             )
             kin_state = mg.compute_kinematics(js)
-            # kin_state.ee_position: shape (1, 3)
-            # kin_state.ee_quaternion: shape (1, 4) — [qw, qx, qy, qz]
-            pos = kin_state.ee_position[0].cpu().tolist()
-            quat = kin_state.ee_quaternion[0].cpu().tolist()
+            # kin_state.ee_pos_seq: shape (batch, traj_pts, 3)
+            # kin_state.ee_quat_seq: shape (batch, traj_pts, 4) — [w,x,y,z]
+            pos = kin_state.ee_pos_seq[0, 0].cpu().tolist()
+            quat = kin_state.ee_quat_seq[0, 0].cpu().tolist()
             return pos, quat
         except Exception as e:
             self._log.error(
@@ -622,7 +622,63 @@ class CuroboPlanner:
         return wrapper, pose_times, valid_indices
 
 
-# ── World-frame transform helper ─────────────────────────────────
+# ── Frame transform helpers ──────────────────────────────────────
+
+# Mount parameters per robot for base↔world conversions
+_MOUNT_PARAMS = {
+    "nakul_ur5e": {
+        "pos": np.array([-0.6758, 0.0, 1.03]),
+        "yaw": -math.pi / 2,
+    },
+    "sahadev_ur5e": {
+        "pos": np.array([0.6758, 0.0, 1.03]),
+        "yaw": math.pi / 2,
+    },
+}
+
+
+def base_to_world_pose(
+    robot_name: str,
+    pos_base: list,
+    quat_base_wxyz: list,
+) -> tuple:
+    """Transform a pose from robot-base frame to world frame.
+
+    Args:
+        robot_name: Robot name (must be in _MOUNT_PARAMS).
+        pos_base: [x, y, z] in robot base frame.
+        quat_base_wxyz: [qw, qx, qy, qz] in robot base frame.
+
+    Returns:
+        (pos_world, quat_world_wxyz) or (pos_base, quat_base_wxyz)
+        unchanged if robot has no mount offset.
+    """
+    params = _MOUNT_PARAMS.get(robot_name)
+    if params is None:
+        return pos_base, quat_base_wxyz
+
+    mount_pos = params["pos"]
+    mount_yaw = params["yaw"]
+    cos_y = math.cos(mount_yaw)
+    sin_y = math.sin(mount_yaw)
+
+    # Rotate base-frame position by mount_yaw and add mount offset
+    bx, by, bz = pos_base[0], pos_base[1], pos_base[2]
+    wx = cos_y * bx - sin_y * by + mount_pos[0]
+    wy = sin_y * bx + cos_y * by + mount_pos[1]
+    wz = bz + mount_pos[2]
+
+    # Rotate quaternion by mount yaw (Z-axis rotation)
+    mount_qw = math.cos(mount_yaw / 2)
+    mount_qz = math.sin(mount_yaw / 2)
+    # q_world = q_mount * q_base  (Hamilton product, mount is pure Z)
+    bw, bx_q, by_q, bz_q = quat_base_wxyz
+    ww = mount_qw * bw - mount_qz * bz_q
+    wx_q = mount_qw * bx_q + mount_qz * by_q
+    wy_q = mount_qw * by_q - mount_qz * bx_q
+    wz_q = mount_qw * bz_q + mount_qz * bw
+
+    return [wx, wy, wz], [ww, wx_q, wy_q, wz_q]
 
 
 def _transform_world_to_robot_frame(

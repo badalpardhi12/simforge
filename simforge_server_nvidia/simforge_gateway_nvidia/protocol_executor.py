@@ -432,6 +432,7 @@ class ProtocolExecutor:
                     actual_quat = _axis_angle_to_quat(*actual_tcp[3:6])
 
                     # Target pose used for planning this segment
+                    # (client sends in WORLD frame)
                     target_pos = position     # [x, y, z] metres
                     target_quat_xyzw = orientation  # [qx,qy,qz,qw]
                     target_quat = [
@@ -441,14 +442,10 @@ class ProtocolExecutor:
                         target_quat_xyzw[2],
                     ]  # → [qw, qx, qy, qz]
 
-                    # Note: RTDE TCP is in robot-base frame.
-                    # The target pose may be in world frame if the
-                    # robot is mounted with an offset.  For
-                    # meaningful comparison, compute FK from actual
-                    # joints (which IS in robot-base frame) and
-                    # compare that with RTDE TCP — this validates
-                    # FK model consistency.  Then compare FK result
-                    # with target pose for the overall accuracy.
+                    # RTDE TCP and cuRobo FK are both in robot-base
+                    # frame.  The target pose is in WORLD frame.
+                    # We must transform the achieved pose from base
+                    # → world before comparing.
 
                     # FK from actual joints (robot base frame)
                     fk_result = None
@@ -458,6 +455,7 @@ class ProtocolExecutor:
                         )
 
                     # --- Report 1: RTDE TCP vs FK (model check) ---
+                    # Both in robot-base frame — direct comparison.
                     if fk_result is not None:
                         fk_pos, fk_quat = fk_result
                         fk_vs_rtde_mm, fk_vs_rtde_xyz = (
@@ -473,15 +471,20 @@ class ProtocolExecutor:
                             f"orient={fk_vs_rtde_deg:.2f}°"
                         )
 
-                    # --- Report 2: FK vs Target (accuracy) --------
-                    # Use FK result for comparison since it's in the
-                    # same frame as the cuRobo planner target.
-                    compare_pos = (
-                        fk_result[0] if fk_result else actual_pos
-                    )
-                    compare_quat = (
-                        fk_result[1] if fk_result else actual_quat
-                    )
+                    # --- Report 2: Achieved vs Target (accuracy) ---
+                    # Transform achieved pose from base→world frame
+                    # so it can be compared against the world-frame
+                    # target pose.
+                    from .curobo_planner import base_to_world_pose
+
+                    if fk_result is not None:
+                        compare_pos, compare_quat = base_to_world_pose(
+                            robot_name, fk_result[0], fk_result[1],
+                        )
+                    else:
+                        compare_pos, compare_quat = base_to_world_pose(
+                            robot_name, actual_pos, actual_quat,
+                        )
                     pos_err_mm, pos_xyz_mm = _position_error_mm(
                         compare_pos, target_pos,
                     )
