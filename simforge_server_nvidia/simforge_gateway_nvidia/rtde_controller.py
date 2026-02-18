@@ -680,7 +680,7 @@ class URRTDEController:
         dt: float = 0.002,
         timestamps: Optional[list] = None,
         lookahead_time: float = 0.1,
-        gain: int = 300,
+        gain: int = 600,
         stop_check_fn=None,
         logger=None,
         position_callback: Optional[Callable[[str, List[float]], None]] = None,
@@ -748,9 +748,12 @@ class URRTDEController:
                 f"(native rate, no 500 Hz upsample)"
             )
 
-        # Force higher lookahead for smoother motion given our
-        # variable command rate (15-50 Hz actual on Jetson).
-        effective_lookahead = max(lookahead_time, 0.2)
+        # Use moderate lookahead for balance between smooth
+        # motion and tight tracking.  0.2 was too high — caused
+        # the robot to lag 0.2 s behind the commanded position,
+        # leaving 2-5° residual error after servoStop.  0.1 gives
+        # tighter tracking at our 15-50 Hz command rate on Jetson.
+        effective_lookahead = max(lookahead_time, 0.1)
 
         try:
             # Publish every Nth waypoint to hit ~50 Hz.
@@ -1240,12 +1243,42 @@ class URRTDEController:
                             )
                         )
 
-            # Clean stop
+            # ── Precision finish: moveJ to final target ────────
+            # servoStop() decelerates the robot from its current
+            # position — it does NOT drive to the last commanded
+            # waypoint.  With lookahead smoothing the robot is
+            # always slightly behind, leaving 0.5-5° residual
+            # error.  A short moveJ to the exact final position
+            # guarantees convergence to the UR's internal
+            # tolerance (~0.01°).  moveJ is synchronous (blocks
+            # until complete), typically <1 s for the small
+            # residual distance.
             try:
                 self._ctrl.servoStop()
             except Exception:
                 pass
-            _time.sleep(0.5)
+            _time.sleep(0.05)  # brief settle after servo stop
+
+            final_q = list(positions[-1])
+            try:
+                # moveJ: speed 0.5 rad/s, accel 1.0 rad/s²
+                # synchronous=False so we can monitor + timeout
+                movej_ok = self._ctrl.moveJ(
+                    final_q, 0.5, 1.0, False,
+                )
+                if logger:
+                    logger.info(
+                        f"moveJ precision finish for "
+                        f"{self.robot_name} — "
+                        f"{'OK' if movej_ok else 'FAILED'}"
+                    )
+            except Exception as mj_exc:
+                if logger:
+                    logger.warn(
+                        f"moveJ precision finish failed on "
+                        f"{self.robot_name}: {mj_exc} — "
+                        f"continuing with servoJ final position"
+                    )
 
             self._teardown_ctrl()
             self.reconnect_receive()

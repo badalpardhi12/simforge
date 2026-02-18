@@ -472,19 +472,19 @@ class ProtocolExecutor:
                         )
 
                     # --- Report 2: Achieved vs Target (accuracy) ---
-                    # Transform achieved pose from base→world frame
-                    # so it can be compared against the world-frame
-                    # target pose.
-                    from .curobo_planner import base_to_world_pose
+                    # FK, RTDE TCP, and target are ALL in base_link
+                    # frame (client generates poses in base_link via
+                    # transform_pose_to_world which uses TF lookup
+                    # relative to base_link; cuRobo config uses
+                    # base_link as kinematic root).  Direct comparison
+                    # is correct — no frame transform needed.
 
                     if fk_result is not None:
-                        compare_pos, compare_quat = base_to_world_pose(
-                            robot_name, fk_result[0], fk_result[1],
-                        )
+                        compare_pos = fk_result[0]
+                        compare_quat = fk_result[1]
                     else:
-                        compare_pos, compare_quat = base_to_world_pose(
-                            robot_name, actual_pos, actual_quat,
-                        )
+                        compare_pos = actual_pos
+                        compare_quat = actual_quat
                     pos_err_mm, pos_xyz_mm = _position_error_mm(
                         compare_pos, target_pos,
                     )
