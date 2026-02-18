@@ -498,16 +498,40 @@ class ProtocolExecutor:
                 #      the UR controller
                 #   2. cuRobo FK on the actual joints — verifies
                 #      model consistency
-                actual_tcp = self._executor.get_actual_tcp_pose(
-                    robot_name,
-                )
-                if actual_tcp is not None:
-                    # actual_tcp is [x, y, z, rx, ry, rz] axis-angle
-                    actual_pos = actual_tcp[:3]
-                    actual_quat = _axis_angle_to_quat(*actual_tcp[3:6])
+                #
+                # FRAME NOTE:
+                #   • Client sends target poses in the robot's
+                #     base_link frame.
+                #   • cuRobo's MotionGen interprets goal poses in
+                #     its own "world" frame, which — for a multi-
+                #     robot cell — includes the world→base_link
+                #     transform from the URDF.  So the target
+                #     pose (base_link) and cuRobo FK output
+                #     (cuRobo world) are in the SAME frame only
+                #     if that transform is identity.
+                #   • RTDE getActualTCPPose() returns TCP in the
+                #     robot's base_link frame — different from
+                #     cuRobo's world frame when the base is offset
+                #     (e.g. nakul_ur5e at [-0.6758, 0, 1.03]).
+                #
+                # Therefore:
+                #   • FK vs target: both in cuRobo world frame →
+                #     direct comparison is correct.
+                #   • RTDE TCP vs target: different frames when
+                #     base is offset → DO NOT compare directly.
+                #   • FK vs RTDE TCP: different frames → removed.
 
-                    # Target pose used for planning this segment
-                    # (client sends in WORLD frame)
+                # FK from actual joints (cuRobo world frame)
+                fk_result = None
+                if actual_q is not None and self._planner is not None:
+                    fk_result = self._planner.compute_fk(
+                        robot_name, actual_q,
+                    )
+
+                if fk_result is not None:
+                    fk_pos, fk_quat = fk_result
+
+                    # Target pose (base_link / cuRobo world frame)
                     target_pos = position     # [x, y, z] metres
                     target_quat_xyzw = orientation  # [qx,qy,qz,qw]
                     target_quat = [
@@ -517,54 +541,11 @@ class ProtocolExecutor:
                         target_quat_xyzw[2],
                     ]  # → [qw, qx, qy, qz]
 
-                    # RTDE TCP and cuRobo FK are both in robot-base
-                    # frame.  The target pose is in WORLD frame.
-                    # We must transform the achieved pose from base
-                    # → world before comparing.
-
-                    # FK from actual joints (robot base frame)
-                    fk_result = None
-                    if actual_q is not None:
-                        fk_result = self._planner.compute_fk(
-                            robot_name, actual_q,
-                        )
-
-                    # --- Report 1: RTDE TCP vs FK (model check) ---
-                    # Both in robot-base frame — direct comparison.
-                    if fk_result is not None:
-                        fk_pos, fk_quat = fk_result
-                        fk_vs_rtde_mm, fk_vs_rtde_xyz = (
-                            _position_error_mm(actual_pos, fk_pos)
-                        )
-                        fk_vs_rtde_deg = _quat_angular_distance(
-                            actual_quat, fk_quat,
-                        )
-                        self._log.info(
-                            f"  [{i+1}/{total}] FK vs RTDE TCP "
-                            f"({pose_name}): "
-                            f"pos={fk_vs_rtde_mm:.1f}mm "
-                            f"orient={fk_vs_rtde_deg:.2f}°"
-                        )
-
-                    # --- Report 2: Achieved vs Target (accuracy) ---
-                    # FK, RTDE TCP, and target are ALL in base_link
-                    # frame (client generates poses in base_link via
-                    # transform_pose_to_world which uses TF lookup
-                    # relative to base_link; cuRobo config uses
-                    # base_link as kinematic root).  Direct comparison
-                    # is correct — no frame transform needed.
-
-                    if fk_result is not None:
-                        compare_pos = fk_result[0]
-                        compare_quat = fk_result[1]
-                    else:
-                        compare_pos = actual_pos
-                        compare_quat = actual_quat
                     pos_err_mm, pos_xyz_mm = _position_error_mm(
-                        compare_pos, target_pos,
+                        fk_pos, target_pos,
                     )
                     orient_err_deg = _quat_angular_distance(
-                        compare_quat, target_quat,
+                        fk_quat, target_quat,
                     )
                     cartesian_errors.append((pos_err_mm, orient_err_deg))
 
