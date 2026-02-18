@@ -569,6 +569,19 @@ class URRTDEController:
             self._recv_healthy = False
         return None
 
+    def get_actual_tcp_pose(self) -> Optional[List[float]]:
+        """Return current TCP pose [x, y, z, rx, ry, rz] or None.
+
+        Position in metres, orientation as axis-angle (rotation vector
+        whose magnitude is the angle in radians).
+        """
+        try:
+            if self._recv is not None and self._recv_healthy:
+                return list(self._recv.getActualTCPPose())
+        except Exception:
+            self._recv_healthy = False
+        return None
+
     def get_actual_qd(self) -> Optional[List[float]]:
         """Return current joint velocities (rad/s) or None."""
         try:

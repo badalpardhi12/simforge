@@ -220,6 +220,40 @@ class CuroboPlanner:
             f"{len(self._motion_gens)} robot(s) ready"
         )
 
+    # ── Forward Kinematics ────────────────────────────────────────
+
+    def compute_fk(
+        self, robot_name: str, joint_positions: List[float],
+    ) -> Optional[tuple]:
+        """Compute forward kinematics for the given joint positions.
+
+        Returns ``(position, quaternion)`` where:
+          - position: [x, y, z] in metres (robot base frame)
+          - quaternion: [qw, qx, qy, qz]
+        Returns ``None`` if cuRobo is not initialised for this robot.
+        """
+        mg = self._motion_gens.get(robot_name)
+        if mg is None:
+            return None
+
+        try:
+            cfg = ROBOT_CONFIG[robot_name]
+            js = CuJointState.from_position(
+                torch.tensor([joint_positions], dtype=torch.float32).cuda(),
+                joint_names=cfg["joints"],
+            )
+            kin_state = mg.compute_kinematics(js)
+            # kin_state.ee_position: shape (1, 3)
+            # kin_state.ee_quaternion: shape (1, 4) — [qw, qx, qy, qz]
+            pos = kin_state.ee_position[0].cpu().tolist()
+            quat = kin_state.ee_quaternion[0].cpu().tolist()
+            return pos, quat
+        except Exception as e:
+            self._log.error(
+                f"FK computation failed for {robot_name}: {e}"
+            )
+            return None
+
     # ── Planning ─────────────────────────────────────────────────
 
     def _plan_to_pose_sync(

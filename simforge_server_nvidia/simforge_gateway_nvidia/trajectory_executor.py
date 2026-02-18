@@ -310,6 +310,19 @@ class TrajectoryExecutor:
             return None
         return rtde.last_actual_q_post_exec
 
+    def get_actual_tcp_pose(self, robot_name: str):
+        """Return actual TCP pose [x,y,z,rx,ry,rz] after last execution.
+
+        Uses RTDE getActualTCPPose().  Position in metres, orientation
+        as axis-angle rotation vector.  Returns None if unavailable.
+        """
+        if not RTDE_AVAILABLE:
+            return None
+        rtde = self._rtde.get(robot_name)
+        if rtde is None:
+            return None
+        return rtde.get_actual_tcp_pose()
+
     # ── ROS2 FollowJointTrajectory execution ─────────────────────
 
     async def _execute_ros2(

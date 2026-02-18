@@ -14,11 +14,43 @@ import json
 import math
 import time
 import traceback
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import websockets
 
 from .config import ROBOT_CONFIG, RTDE_AVAILABLE, RobotStateInfo
+
+
+# ── Pose-comparison helpers ──────────────────────────────────────
+
+
+def _axis_angle_to_quat(rx: float, ry: float, rz: float) -> List[float]:
+    """Convert axis-angle rotation vector to [qw, qx, qy, qz]."""
+    angle = math.sqrt(rx * rx + ry * ry + rz * rz)
+    if angle < 1e-10:
+        return [1.0, 0.0, 0.0, 0.0]
+    half = angle / 2.0
+    s = math.sin(half) / angle
+    return [math.cos(half), rx * s, ry * s, rz * s]
+
+
+def _quat_angular_distance(q1: List[float], q2: List[float]) -> float:
+    """Return the angular difference (degrees) between two quaternions.
+
+    Both quaternions are [qw, qx, qy, qz].
+    """
+    dot = sum(a * b for a, b in zip(q1, q2))
+    dot = max(-1.0, min(1.0, abs(dot)))  # abs handles double-cover
+    return 2.0 * math.acos(dot) * 180.0 / math.pi
+
+
+def _position_error_mm(
+    actual: List[float], target: List[float],
+) -> Tuple[float, List[float]]:
+    """Return (RSS error in mm, [dx, dy, dz] in mm)."""
+    errs = [(a - t) * 1000.0 for a, t in zip(actual[:3], target[:3])]
+    rss = math.sqrt(sum(e * e for e in errs))
+    return rss, errs
 
 
 class ProtocolExecutor:
@@ -162,7 +194,8 @@ class ProtocolExecutor:
         completed = 0
         ik_failed = 0
         exec_failed = 0
-        position_errors = []  # RSS position error (deg) per pose
+        position_errors = []    # RSS joint-space error (deg) per pose
+        cartesian_errors = []   # (pos_mm, orient_deg) per pose
 
         current_joints = (
             self._js_mgr.robot_states[robot_name].joint_positions
@@ -356,7 +389,7 @@ class ProtocolExecutor:
                 )
                 if actual_q is not None:
                     current_joints = list(actual_q)
-                    # Log error between planned and actual
+                    # Log joint-space error (planned vs actual)
                     errors_deg = [
                         (actual_q[j] - planned_final[j])
                         * 180.0 / math.pi
@@ -367,7 +400,7 @@ class ProtocolExecutor:
                     )
                     position_errors.append(rss_deg)
                     self._log.info(
-                        f"  [{i+1}/{total}] position error "
+                        f"  [{i+1}/{total}] joint error "
                         f"{pose_name}: "
                         f"RSS={rss_deg*1000:.0f}mDeg  "
                         f"per-joint(mDeg)="
@@ -381,6 +414,96 @@ class ProtocolExecutor:
                         f"position — using planned final as start "
                         f"for next segment"
                     )
+
+                # ── Cartesian pose verification ──────────────────
+                # Compare the target Cartesian pose (what we asked
+                # the planner to reach) with the actual TCP pose
+                # from two sources:
+                #   1. RTDE getActualTCPPose() — ground truth from
+                #      the UR controller
+                #   2. cuRobo FK on the actual joints — verifies
+                #      model consistency
+                actual_tcp = self._executor.get_actual_tcp_pose(
+                    robot_name,
+                )
+                if actual_tcp is not None:
+                    # actual_tcp is [x, y, z, rx, ry, rz] axis-angle
+                    actual_pos = actual_tcp[:3]
+                    actual_quat = _axis_angle_to_quat(*actual_tcp[3:6])
+
+                    # Target pose used for planning this segment
+                    target_pos = position     # [x, y, z] metres
+                    target_quat_xyzw = orientation  # [qx,qy,qz,qw]
+                    target_quat = [
+                        target_quat_xyzw[3],
+                        target_quat_xyzw[0],
+                        target_quat_xyzw[1],
+                        target_quat_xyzw[2],
+                    ]  # → [qw, qx, qy, qz]
+
+                    # Note: RTDE TCP is in robot-base frame.
+                    # The target pose may be in world frame if the
+                    # robot is mounted with an offset.  For
+                    # meaningful comparison, compute FK from actual
+                    # joints (which IS in robot-base frame) and
+                    # compare that with RTDE TCP — this validates
+                    # FK model consistency.  Then compare FK result
+                    # with target pose for the overall accuracy.
+
+                    # FK from actual joints (robot base frame)
+                    fk_result = None
+                    if actual_q is not None:
+                        fk_result = self._planner.compute_fk(
+                            robot_name, actual_q,
+                        )
+
+                    # --- Report 1: RTDE TCP vs FK (model check) ---
+                    if fk_result is not None:
+                        fk_pos, fk_quat = fk_result
+                        fk_vs_rtde_mm, fk_vs_rtde_xyz = (
+                            _position_error_mm(actual_pos, fk_pos)
+                        )
+                        fk_vs_rtde_deg = _quat_angular_distance(
+                            actual_quat, fk_quat,
+                        )
+                        self._log.info(
+                            f"  [{i+1}/{total}] FK vs RTDE TCP "
+                            f"({pose_name}): "
+                            f"pos={fk_vs_rtde_mm:.1f}mm "
+                            f"orient={fk_vs_rtde_deg:.2f}°"
+                        )
+
+                    # --- Report 2: FK vs Target (accuracy) --------
+                    # Use FK result for comparison since it's in the
+                    # same frame as the cuRobo planner target.
+                    compare_pos = (
+                        fk_result[0] if fk_result else actual_pos
+                    )
+                    compare_quat = (
+                        fk_result[1] if fk_result else actual_quat
+                    )
+                    pos_err_mm, pos_xyz_mm = _position_error_mm(
+                        compare_pos, target_pos,
+                    )
+                    orient_err_deg = _quat_angular_distance(
+                        compare_quat, target_quat,
+                    )
+                    cartesian_errors.append((pos_err_mm, orient_err_deg))
+
+                    self._log.info(
+                        f"  [{i+1}/{total}] CARTESIAN ERROR "
+                        f"({pose_name}): "
+                        f"pos={pos_err_mm:.2f}mm "
+                        f"[dx={pos_xyz_mm[0]:.2f}, "
+                        f"dy={pos_xyz_mm[1]:.2f}, "
+                        f"dz={pos_xyz_mm[2]:.2f}]mm  "
+                        f"orient={orient_err_deg:.3f}°"
+                    )
+                    if pos_err_mm > 5.0:
+                        self._log.warn(
+                            f"  ⚠ LARGE Cartesian error on "
+                            f"{robot_name}: {pos_err_mm:.1f}mm"
+                        )
 
                 self._log.info(
                     f"  [{i+1}/{total}] \u2713 {pose_name}"
@@ -447,6 +570,34 @@ class ProtocolExecutor:
                 f"{[round(e*1000,1) for e in position_errors]}"
             )
 
+        # Cartesian accuracy stats
+        if cartesian_errors:
+            pos_errs = [e[0] for e in cartesian_errors]
+            orient_errs = [e[1] for e in cartesian_errors]
+            avg_pos = sum(pos_errs) / len(pos_errs)
+            max_pos = max(pos_errs)
+            avg_orient = sum(orient_errs) / len(orient_errs)
+            max_orient = max(orient_errs)
+            summary_parts.append(
+                f"pose: avg={avg_pos:.1f}mm/{avg_orient:.2f}° "
+                f"max={max_pos:.1f}mm/{max_orient:.2f}°"
+            )
+            self._log.info(
+                f"Cartesian accuracy summary for {robot_name}: "
+                f"{len(cartesian_errors)} measurements, "
+                f"position: avg={avg_pos:.2f}mm max={max_pos:.2f}mm, "
+                f"orientation: avg={avg_orient:.3f}° "
+                f"max={max_orient:.3f}°"
+            )
+            self._log.info(
+                f"  per-pose pos(mm): "
+                f"{[round(e[0], 2) for e in cartesian_errors]}"
+            )
+            self._log.info(
+                f"  per-pose orient(deg): "
+                f"{[round(e[1], 3) for e in cartesian_errors]}"
+            )
+
         hardware_issues = self._detect_hardware_issues()
         if hardware_issues:
             summary_parts.append(
@@ -469,6 +620,20 @@ class ProtocolExecutor:
             "stopped": self.stop_requested,
             "hardware_issues": hardware_issues,
             "hardware_abort": hw_abort,
+            "accuracy": {
+                "joint_errors_mdeg": (
+                    [round(e * 1000, 1) for e in position_errors]
+                    if position_errors else []
+                ),
+                "cartesian_pos_mm": (
+                    [round(e[0], 2) for e in cartesian_errors]
+                    if cartesian_errors else []
+                ),
+                "cartesian_orient_deg": (
+                    [round(e[1], 3) for e in cartesian_errors]
+                    if cartesian_errors else []
+                ),
+            },
         }))
 
 
