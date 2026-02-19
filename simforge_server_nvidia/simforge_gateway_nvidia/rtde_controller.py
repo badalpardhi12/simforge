@@ -1346,10 +1346,24 @@ class URRTDEController:
             final_q = list(positions[-1])
             try:
                 # moveJ: speed 0.5 rad/s, accel 1.0 rad/s²
-                # synchronous=False so we can monitor + timeout
+                # asynchronous=False → synchronous (blocks until
+                # the robot reaches the target position or fails).
                 movej_ok = self._ctrl.moveJ(
                     final_q, 0.5, 1.0, False,
                 )
+                # Wait for robot to be fully at rest (isSteady)
+                # after moveJ completes.  moveJ blocks until the
+                # trajectory finishes but the robot may still have
+                # micro-vibrations.  A brief isSteady poll ensures
+                # the position read is accurate.
+                settle_deadline = _time.monotonic() + 2.0
+                while _time.monotonic() < settle_deadline:
+                    try:
+                        if self._ctrl.isSteady():
+                            break
+                    except Exception:
+                        break
+                    _time.sleep(0.01)
                 if logger:
                     logger.info(
                         f"moveJ precision finish for "
@@ -1364,11 +1378,20 @@ class URRTDEController:
                         f"continuing with servoJ final position"
                     )
 
+            # Publish final exact position to sim before 50 Hz
+            # publisher resumes — prevents visible jump between the
+            # last servoJ-commanded position and actual joint state.
+            if position_callback:
+                try:
+                    position_callback(self.robot_name, final_q)
+                except Exception:
+                    pass
+
             self._teardown_ctrl()
             self.reconnect_receive()
             self.last_error = ""
 
-            # ── Position verification ───────────────────────────────
+            # ── Position verification (joint space) ─────────────────
             # Read the robot's actual joint positions after trajectory
             # completion and compare to the planned final waypoint.
             # This detects positional error from servoJ dynamics
@@ -1403,13 +1426,84 @@ class URRTDEController:
                     )
                     if rss_deg > 0.5:
                         logger.warn(
-                            f"⚠ LARGE position error on "
+                            f"⚠ LARGE joint position error on "
                             f"{self.robot_name}: {rss_deg:.2f}° — "
                             f"jumps expected at next trajectory start"
                         )
             elif logger:
                 logger.warn(
-                    f"Could not read actual position on "
+                    f"Could not read actual joint positions on "
+                    f"{self.robot_name} after trajectory — "
+                    f"recv interface not healthy"
+                )
+
+            # ── TCP pose verification ───────────────────────────────
+            # Read actual TCP pose from RTDE and compare to the
+            # target TCP pose (what the controller was driving to).
+            # Logs translation error in mm and orientation error.
+            actual_tcp = self.get_actual_tcp_pose()
+            target_tcp = None
+            try:
+                if self._recv is not None and self._recv_healthy:
+                    if self._recv.isConnected():
+                        target_tcp = list(
+                            self._recv.getTargetTCPPose()
+                        )
+            except Exception:
+                pass
+
+            if actual_tcp is not None and logger:
+                tcp_str = (
+                    f"x={actual_tcp[0]*1000:.1f}mm "
+                    f"y={actual_tcp[1]*1000:.1f}mm "
+                    f"z={actual_tcp[2]*1000:.1f}mm "
+                    f"rx={actual_tcp[3]:.4f} "
+                    f"ry={actual_tcp[4]:.4f} "
+                    f"rz={actual_tcp[5]:.4f}"
+                )
+                logger.info(
+                    f"TCP pose [{self.robot_name}]: {tcp_str}"
+                )
+
+            if (actual_tcp is not None and target_tcp is not None
+                    and logger):
+                # Translation error (Euclidean, mm)
+                dx = actual_tcp[0] - target_tcp[0]
+                dy = actual_tcp[1] - target_tcp[1]
+                dz = actual_tcp[2] - target_tcp[2]
+                pos_err_mm = (
+                    (dx**2 + dy**2 + dz**2) ** 0.5
+                ) * 1000.0
+                # Orientation error: angle between rotation
+                # vectors (axis-angle repr).  The difference
+                # vector's magnitude is the orientation error
+                # in radians (small-angle approx).
+                drx = actual_tcp[3] - target_tcp[3]
+                dry = actual_tcp[4] - target_tcp[4]
+                drz = actual_tcp[5] - target_tcp[5]
+                orient_err_deg = (
+                    (drx**2 + dry**2 + drz**2) ** 0.5
+                ) * 180.0 / 3.141592653589793
+                logger.info(
+                    f"TCP error [{self.robot_name}]: "
+                    f"position={pos_err_mm:.2f}mm  "
+                    f"orientation={orient_err_deg*1000:.1f}mDeg"
+                )
+                if pos_err_mm > 2.0:
+                    logger.warn(
+                        f"⚠ LARGE TCP position error on "
+                        f"{self.robot_name}: "
+                        f"{pos_err_mm:.2f}mm"
+                    )
+                if orient_err_deg > 0.5:
+                    logger.warn(
+                        f"⚠ LARGE TCP orientation error on "
+                        f"{self.robot_name}: "
+                        f"{orient_err_deg:.2f}°"
+                    )
+            elif actual_tcp is None and logger:
+                logger.warn(
+                    f"Could not read actual TCP pose on "
                     f"{self.robot_name} after trajectory — "
                     f"recv interface not healthy"
                 )
