@@ -18,7 +18,18 @@ from typing import List, Optional, Tuple
 
 import websockets
 
+from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import Header, ColorRGBA
+from geometry_msgs.msg import Point, Pose, Quaternion, Vector3
+from builtin_interfaces.msg import Time as TimeMsg
+
 from .config import ROBOT_CONFIG, RTDE_AVAILABLE, RobotStateInfo
+
+
+# ── Pose result status constants ─────────────────────────────────
+POSE_SUCCESS = "success"
+POSE_IK_FAIL = "ik_fail"
+POSE_EXEC_FAIL = "exec_fail"
 
 
 # ── Pose-comparison helpers ──────────────────────────────────────
@@ -74,6 +85,84 @@ class ProtocolExecutor:
         # Flags — set by node-level stop / estop handlers
         self.running = False
         self.stop_requested = False
+
+        # ── Marker publisher for Foxglove visualization ──────────
+        self._marker_pub = node.create_publisher(
+            MarkerArray, "/proto_sim/pose_markers", 10,
+        )
+        # Accumulated pose results for the current protocol run.
+        # Each entry: (pose_name, position, orientation, status, frame_id)
+        self._pose_results: List[tuple] = []
+
+    # ── Marker visualization helpers ─────────────────────────────
+
+    def _status_color(self, status: str) -> ColorRGBA:
+        """Return RGBA color for a pose result status."""
+        if status == POSE_SUCCESS:
+            return ColorRGBA(r=0.0, g=0.85, b=0.0, a=1.0)     # green
+        elif status == POSE_IK_FAIL:
+            return ColorRGBA(r=0.9, g=0.0, b=0.0, a=1.0)      # red
+        elif status == POSE_EXEC_FAIL:
+            return ColorRGBA(r=1.0, g=0.55, b=0.0, a=1.0)     # orange
+        return ColorRGBA(r=0.5, g=0.5, b=0.5, a=1.0)          # grey
+
+    def _build_marker_array(self) -> MarkerArray:
+        """Build a MarkerArray from all accumulated pose results."""
+        now = self._node.get_clock().now().to_msg()
+        markers = []
+        for idx, (name, pos, orient, status, frame_id) in enumerate(
+            self._pose_results,
+        ):
+            m = Marker()
+            m.header = Header(stamp=now, frame_id=frame_id)
+            m.ns = "proto_sim_poses"
+            m.id = idx
+            m.type = Marker.ARROW
+            m.action = Marker.ADD
+
+            # Pose: position [x,y,z] in metres, orient [qx,qy,qz,qw]
+            m.pose = Pose()
+            m.pose.position = Point(
+                x=float(pos[0]),
+                y=float(pos[1]),
+                z=float(pos[2]),
+            )
+            m.pose.orientation = Quaternion(
+                x=float(orient[0]),
+                y=float(orient[1]),
+                z=float(orient[2]),
+                w=float(orient[3]),
+            )
+
+            # Arrow scale: x=shaft length, y=shaft diameter, z=head diameter
+            m.scale = Vector3(x=0.04, y=0.006, z=0.010)
+            m.color = self._status_color(status)
+
+            # Keep markers alive until explicitly deleted
+            m.lifetime.sec = 0
+            m.lifetime.nanosec = 0
+            m.frame_locked = False
+
+            # Text for identification on click in Foxglove
+            m.text = f"{name} ({status})"
+
+            markers.append(m)
+
+        return MarkerArray(markers=markers)
+
+    def _publish_pose_markers(self):
+        """Publish current pose results as a MarkerArray."""
+        msg = self._build_marker_array()
+        self._marker_pub.publish(msg)
+
+    def _clear_pose_markers(self):
+        """Publish a DELETE_ALL to clear previous markers."""
+        delete_all = MarkerArray()
+        m = Marker()
+        m.action = Marker.DELETEALL
+        delete_all.markers = [m]
+        self._marker_pub.publish(delete_all)
+        self._pose_results.clear()
 
     # ── Entry point (called from RPC handler) ────────────────────
 
@@ -259,6 +348,10 @@ class ProtocolExecutor:
         position_errors = []    # RSS joint-space error (deg) per pose
         cartesian_errors = []   # (pos_mm, orient_deg) per pose
 
+        # ── Clear previous markers and prepare for new run ───────
+        marker_frame_id = cfg.get("base_link", "world")
+        self._clear_pose_markers()
+
         current_joints = (
             self._js_mgr.robot_states[robot_name].joint_positions
         )
@@ -406,6 +499,11 @@ class ProtocolExecutor:
 
             if result is None:
                 ik_failed += 1
+                self._pose_results.append((
+                    pose_name, position, orientation,
+                    POSE_IK_FAIL, marker_frame_id,
+                ))
+                self._publish_pose_markers()
                 self._log.warn(
                     f"  [{i+1}/{total}] \u2717 plan failed "
                     f"{pose_name} ({plan_dt:.1f}s)"
@@ -417,6 +515,11 @@ class ProtocolExecutor:
             )
             if ros_traj is None:
                 ik_failed += 1
+                self._pose_results.append((
+                    pose_name, position, orientation,
+                    POSE_IK_FAIL, marker_frame_id,
+                ))
+                self._publish_pose_markers()
                 continue
 
             # Planned final position (fallback if actual read fails)
@@ -601,6 +704,11 @@ class ProtocolExecutor:
                 self._log.info(
                     f"  [{i+1}/{total}] \u2713 {pose_name}"
                 )
+                self._pose_results.append((
+                    pose_name, position, orientation,
+                    POSE_SUCCESS, marker_frame_id,
+                ))
+                self._publish_pose_markers()
                 await self._send_feedback(
                     client, request_id, i, total,
                     ((i + 1) / total) * 100,
@@ -683,6 +791,11 @@ class ProtocolExecutor:
                                     f"  [{i+1}/{total}] ✓ "
                                     f"{pose_name} (after recovery)"
                                 )
+                                self._pose_results.append((
+                                    pose_name, position, orientation,
+                                    POSE_SUCCESS, marker_frame_id,
+                                ))
+                                self._publish_pose_markers()
                                 await self._send_feedback(
                                     client, request_id, i, total,
                                     ((i + 1) / total) * 100,
@@ -700,6 +813,11 @@ class ProtocolExecutor:
                             break
 
                 exec_failed += 1
+                self._pose_results.append((
+                    pose_name, position, orientation,
+                    POSE_EXEC_FAIL, marker_frame_id,
+                ))
+                self._publish_pose_markers()
                 self._log.error(
                     f"  [{i+1}/{total}] \u2717 exec failed "
                     f"{pose_name}"
