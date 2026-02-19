@@ -31,6 +31,28 @@ POSE_SUCCESS = "success"
 POSE_IK_FAIL = "ik_fail"
 POSE_EXEC_FAIL = "exec_fail"
 
+# Pre-computed 90° rotation around Z (rotates +X → +Y).
+# Quaternion (x, y, z, w) format for ROS:
+_ROT_X_TO_Y = (0.0, 0.0, 0.7071067811865476, 0.7071067811865476)
+
+
+def _quat_multiply_xyzw(
+    q1: tuple, q2: tuple,
+) -> tuple:
+    """Hamilton product of two quaternions in (x, y, z, w) order.
+
+    Returns q1 * q2 (apply q2 first, then q1 in world frame;
+    equivalently, apply q2 in q1's local frame).
+    """
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    return (
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    )
+
 
 # ── Pose-comparison helpers ──────────────────────────────────────
 
@@ -121,6 +143,18 @@ class ProtocolExecutor:
             m.action = Marker.ADD
 
             # Pose: position [x,y,z] in metres, orient [qx,qy,qz,qw]
+            # ROS ARROW markers point along local +X.  The camera
+            # (tool) axis on nakul is +Y, so we compose the target
+            # orientation with a 90° Z rotation to swing the arrow
+            # from +X to +Y.
+            qx, qy, qz, qw = (
+                float(orient[0]), float(orient[1]),
+                float(orient[2]), float(orient[3]),
+            )
+            ax, ay, az, aw = _quat_multiply_xyzw(
+                (qx, qy, qz, qw), _ROT_X_TO_Y,
+            )
+
             m.pose = Pose()
             m.pose.position = Point(
                 x=float(pos[0]),
@@ -128,10 +162,7 @@ class ProtocolExecutor:
                 z=float(pos[2]),
             )
             m.pose.orientation = Quaternion(
-                x=float(orient[0]),
-                y=float(orient[1]),
-                z=float(orient[2]),
-                w=float(orient[3]),
+                x=ax, y=ay, z=az, w=aw,
             )
 
             # Arrow scale: x=shaft length, y=shaft diameter, z=head diameter
@@ -220,6 +251,10 @@ class ProtocolExecutor:
             f"idle={idle_time}s, home_before={go_home_before}, "
             f"home_after={go_home_after})"
         )
+
+        # ── Clear previous markers immediately on new request ────
+        marker_frame_id = cfg.get("base_link", "world")
+        self._clear_pose_markers()
 
         # ── Ensure the node's _current_mode matches the protocol's ──
         # The trajectory executor and hardware-fault detection read
@@ -347,10 +382,6 @@ class ProtocolExecutor:
         exec_failed = 0
         position_errors = []    # RSS joint-space error (deg) per pose
         cartesian_errors = []   # (pos_mm, orient_deg) per pose
-
-        # ── Clear previous markers and prepare for new run ───────
-        marker_frame_id = cfg.get("base_link", "world")
-        self._clear_pose_markers()
 
         current_joints = (
             self._js_mgr.robot_states[robot_name].joint_positions
